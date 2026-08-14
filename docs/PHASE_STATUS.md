@@ -4,10 +4,10 @@ Tracks implementation status against the two source specs:
 - `Xamarinbot_V2_Detailed_Development_Roadmap.docx` ("Roadmap")
 - `Xamarinbot_V2_Detailed_Strategy_and_Mathematical_Model.docx` ("Strategy")
 
-This build covers **Roadmap Phases 0-10** (the foundation layers the
+This build covers **Roadmap Phases 0-11** (the foundation layers the
 roadmap itself says must exist before any predictive complexity, per its
 "Roadmap principle" and SS22.1 "Recommended immediate next sprint").
-Phases 11-14 are **not implemented** - they are listed below as explicitly
+Phases 12-14 are **not implemented** - they are listed below as explicitly
 future work, not silently dropped.
 
 ## Implemented
@@ -25,6 +25,7 @@ future work, not silently dropped.
 | Phase 8 - One-Step Semi-Controlled Optimizer | Done | [optimizer/](../src/xamarinbot/optimizer/). `CandidateAction` matches Strategy doc SS23.3's interface almost verbatim. One EV formula (`EV_after = q*delta_U + (1-q)*delta_D - delta_C`) is used for every candidate, alpha or hedge, taker or maker - it reduces exactly to SS13's `DeltaEV_U`/`DeltaEV_D` for a certain taker fill and to SS14's maker EV core term once weighted by fill probability and evaluated with `q_fill` (Phase 7's adverse-selection adjustment) instead of raw `q`, rather than several ad hoc formulas per candidate type. Hard-constraint rejection reuses Phase 3's `evaluate_constraints` directly (not reimplemented) via a real `FillSimulationResult`; maker candidates are checked against their *if-filled* portfolio, conservatively, per SS16's "projected fill would push G below G_min -> Cancel/shrink." WAIT is always present and always valid, the guaranteed fallback. **Both roadmap-named verification items are automated**: `tests/test_optimizer.py`'s Hypothesis stress test (200 random portfolio/book/q combinations) asserts the chosen candidate never has `g_after` below `g_min` (accounting for the edge case where the *starting* portfolio is already below an unreachable `g_min` - no action, including WAIT, can fix that; see the test), and `scripts/run_one_step_controller_demo.py` runs the controller against the Phase 0 baseline over an identical causal replay. |
 | Phase 9 - Proactive Maker/Taker Place-Cancel-Replace | Done | [supervisor/](../src/xamarinbot/supervisor/). `OrderSupervisor` is a thin policy layer over Phase 7's `OrderState` mechanics: it never computes EV/G itself (the caller re-evaluates each tracked order via Phase 8's `evaluate_maker_candidate` and passes the numbers in), keeping it a single, testable place implementing Strategy doc SS16's trigger table (edge failure, regime flip, risk breach, time compression, feed staleness -> cancel; book displacement -> replace, gated by a churn threshold) rather than duplicating EV math a second time. **All four roadmap-named verification scenarios are direct tests**: rapid regime flip (plus its rate-limiting counterpart - a *second* flip inside the minimum action interval must not thrash), partial fill then cancel (the partial fill survives, only the remainder is canceled), tick-size change with an open order (a `REPLACE` after a tick-size change prices on the new grid, not the stale one), and feed-stale-while-resting (cancels regardless of how good the order otherwise looks - checked first, before every other trigger). Cancel-regret analytics (`reports/supervisor_report.py`) are explicitly post-hoc-only, using a documented approximation (did the touch price cross the canceled order's price afterward) rather than a full counterfactual fill simulation. |
 | Phase 10 - Short-Horizon MPC | Done | [mpc/](../src/xamarinbot/mpc/). `MPCController` is a generalization of Phase 8's `OneStepController`, not a parallel implementation - at `horizon_steps<=1` it must (and does, exactly, bit-for-bit) reduce to a plain one-step decision. Continuation value at each hypothetical future state is estimated by recursively calling the greedy one-step policy itself (a standard rollout-policy approximation), over a small discrete scenario tree that evolves only `GapRegime` (not the full 54-state `RegimeState`) using a transition model estimated from Phase 6's own `RegimeTransition` records over a causal replay - "historical state transitions," synthetic for now. **All three roadmap-named verification items are direct tests**: degenerate-horizon equivalence (checked across several states/portfolios, not just one), timeout fallback (a zero time budget forces the plain one-step decision), and scenario-probability sanity checks (every state's next-state distribution sums to 1.0 and is bounded in [0,1], including the top-k-truncation-then-renormalize path). A real bug turned up mid-build: continuation projections initially reused the *undepleted* original book at every step, so a large taker fill's continuation value double-counted the exact liquidity it had just consumed - fixed by depleting the relevant side's book by the chosen candidate's fill before recursing, with a dedicated regression test. |
+| Phase 11 - Walk-Forward Calibration and Ablations | Done (synthetic data) | [walkforward/](../src/xamarinbot/walkforward/). `windows.py` builds rolling train/validate/test splits that are chronologically disjoint *within* each window (a smaller-than-default `step` can legitimately reuse a round as one window's test and a later window's train/validate - documented in the module and covered by a test that checks this doesn't cross a single window's own ordering); `bootstrap.py` gives resampled confidence intervals on PnL reusing Phase 2's `seeded_random` for reproducibility; `ablations.py` runs the **exact 8 mandatory ablations from Strategy doc SS20.1** over the identical causal replay harness, requiring two real additions to the optimizer that Phases 8-10 never needed: SS17 hedge-candidate generation (`generate_hedge_candidate`, gated by `enable_portfolio_repair`) and SS18's actual risk-adjusted selection objective (`lambda_g`, since pure `ev_after` ranking can *never* select a hedge - SS17 hedges have negative standalone EV by construction and always lose to WAIT at `lambda_g=0`). `sensitivity.py` sweeps one `OneStepConfig` field at a time and reports the *full* curve, not just the argmax, plus a `parameter_stability_across_windows` check (does the best value drift between walk-forward windows - instability there is itself the finding). **Both roadmap-named verification items are automated**: "no test-period tuning" is a direct test that spies on every round_id `sweep_parameter` is ever handed and asserts none belong to any window's `test_round_ids`; bootstrap CI correctness is covered by dedicated tests (point estimate = plain mean, lower<=upper, deterministic per seed key, degenerate at n<=1, widens with variance). Ablations 6-8 report **zero non-wait actions** on this synthetic dataset - two distinct, diagnosed-not-guessed findings, not bugs, pinned down by a regression test and detailed in "Notable bugs" below. |
 
 Supporting pieces built to make Phases 0-10 demonstrable end-to-end:
 - `journal/` - SS20 schema (all entities declared; market_config, feed_event,
@@ -50,11 +51,15 @@ Supporting pieces built to make Phases 0-10 demonstrable end-to-end:
   (action/reason counts, cancel regret rate).
 - `reports/mpc_report.py` - the Phase 10 controller latency benchmark
   (p50/p95/p99/max, fallback rate).
+- `reports/walkforward_report.py` - the Phase 11 ablation matrix (mean PnL +
+  bootstrap CI + fill rate per ablation) and sensitivity/stability table
+  formatting.
 - `scripts/run_baseline_replay.py`, `scripts/run_feature_engine_demo.py`,
   `scripts/run_model_training_demo.py`, `scripts/run_regime_classifier_demo.py`,
   `scripts/run_execution_simulator_demo.py`, `scripts/run_one_step_controller_demo.py`,
-  `scripts/run_order_supervisor_demo.py`, `scripts/run_mpc_controller_demo.py` -
-  wire the above into eight end-to-end causal pipelines you can run today.
+  `scripts/run_order_supervisor_demo.py`, `scripts/run_mpc_controller_demo.py`,
+  `scripts/run_walk_forward_ablation_demo.py` -
+  wire the above into nine end-to-end causal pipelines you can run today.
   `run_baseline_replay.py` still simplifies fills to same-tick-at-decision-
   price - it predates Phase 7 and was never retrofitted with
   `ExecutionSimulator`, unlike `run_one_step_controller_demo.py` and
@@ -71,6 +76,7 @@ PYTHONPATH=src python scripts/run_execution_simulator_demo.py [n_rounds]
 PYTHONPATH=src python scripts/run_one_step_controller_demo.py [n_eval_rounds]
 PYTHONPATH=src python scripts/run_order_supervisor_demo.py [n_eval_rounds]
 PYTHONPATH=src python scripts/run_mpc_controller_demo.py [n_eval_rounds]
+PYTHONPATH=src python scripts/run_walk_forward_ablation_demo.py [n_rounds]
 ```
 Tests: `PYTHONPATH=src pytest -q` (or `pip install -e .[dev]` first)
 
@@ -78,12 +84,11 @@ Tests: `PYTHONPATH=src pytest -q` (or `pip install -e .[dev]` first)
 
 | Phase | What it needs |
 |---|---|
-| Phase 11 - Walk-Forward Calibration and Ablations | Requires Phases 4-10 plus **real historical data** (see below). |
 | Phase 12 - Shadow / Paper Trading | Requires live feeds (Phase 1's real adapters, verified) running continuously. |
 | Phase 13 - Limited Live Rollout | Requires Phase 12 passing its exit gate, plus a funded, authenticated Polymarket account. **Do not attempt without explicit, deliberate operator sign-off** - this phase risks real capital. |
 | Phase 14 - Adaptive Optimization | Requires an accumulated live/shadow event log to calibrate against. |
 
-## Known reconstruction gaps (Phase 0 baseline, Phase 4 features, Phase 5 model, Phase 6 regime, Phase 7 execution, Phase 8 optimizer, Phase 9 supervisor, Phase 10 MPC)
+## Known reconstruction gaps (Phase 0 baseline, Phase 4 features, Phase 5 model, Phase 6 regime, Phase 7 execution, Phase 8 optimizer, Phase 9 supervisor, Phase 10 MPC, Phase 11 walk-forward/ablations)
 
 The source docs describe some behaviors *narratively*, not with exact
 formulas. This build's choices are documented at the point of
@@ -224,6 +229,26 @@ implementation and repeated here for visibility:
     inherited here since continuation reuses Phase 8's evaluation; the
     immediate EV used for candidate *selection* still correctly
     probability-weights the fill.
+20. **`lambda_g` is a single scalar weight on `G_after`, not SS18's full
+    `J = E[PnL_T] + lambda_G*G_T - lambda_slip*Slippage - ...` objective**
+    ([optimizer/config.py](../src/xamarinbot/optimizer/config.py)) - the
+    source doc names several other penalty terms (`Slippage`, and others
+    left unformalized) that this build doesn't have data to calibrate
+    (no real slippage history exists yet); `churn_penalty` and
+    `opportunity_cost` (Phase 8) already cover the two SS18 terms that
+    *were* formularizable. Extending `J` with the remaining terms is
+    future work once real fill data exists to fit them against, not a
+    silent omission.
+21. **Ablation feature-set assignment for #2/#3/#4** ([walkforward/ablations.py](../src/xamarinbot/walkforward/ablations.py)) -
+    SS20.1 names the three model-only ablations by description
+    ("TWAP-only," "current-BTC-only," "TWAP + current-BTC lead-lag") but
+    not by exact `FeatureSet` composition; this build maps them onto
+    Phase 5's existing `TWAP_ONLY`/`SPOT_ONLY`/`COMBINED_LEAD_LAG` sets
+    (the same three the Phase 5 model-comparison report already used) plus
+    a new `LEAD_LAG_ONLY` set (`z_gap`, `lead_gap_bp`, `tau` and their
+    `tau` interactions - deliberately excluding CLOB/OFI features so #4 is
+    a genuine "TWAP + current-BTC" ablation distinct from #5's full
+    `COMBINED_LEAD_LAG`, which also carries `z_clob`/`ofi`).
 
 None of these gaps affect the Phase 3 math kernel, which implements the
 source docs' formulas exactly.
@@ -285,7 +310,40 @@ relative to simpler baselines") exists to catch - real historical data,
 where TWAP isn't definitionally the whole story, is needed before this
 comparison means anything about real edge.
 
-## Notable bugs caught during Phase 0/4/5/7/8/9/10 build-out (fixed, worth knowing about)
+**Phase 11 demo finding worth flagging (not a bug)**: ablations 6, 7, and 8
+report zero non-wait actions across the evaluation set, versus 5 actions/
+round for ablations 2-5 on the same data. Diagnosed with two standalone
+trace scripts (candidate-table dumps and a supervisor cancel/fill counter)
+rather than assumed, since it initially looked exactly like the kind of
+scale-mismatch bug `lambda_g` had already produced twice during tuning (see
+below):
+- **Ablation 6 (taker-only)**: this dataset's taker candidates are sized
+  from real order-book depth (`taker_quantities`), which runs large enough
+  that every one of them breaches the `g_min=-100` risk floor and gets
+  rejected by Phase 3's `evaluate_constraints` - confirmed by dumping the
+  full candidate table at every decision point where TAKER was permitted:
+  every `taker_*` candidate showed `valid=False` with `g_after` in the
+  hundreds-to-thousands, while maker's small fixed `maker_quantity=20`
+  clip comfortably fits under the same floor. With `taker_only=True`
+  removing maker generation entirely, and no existing position ever
+  established (so SS17's hedge candidate never has an imbalance to
+  repair), there is nothing left to trade. This is a genuine ablation
+  finding: taker-only execution under a tight risk floor can't size itself
+  down to what book depth actually offers, unlike maker's fixed clip.
+- **Ablations 7/8 (cancel/replace, MPC - both wrap `OrderSupervisor`)**: a
+  trace counter over the same replay showed 56 maker orders registered, 55
+  cancelled via `REGIME_FLIP`, 0 resolved via TTL expiry, 0 taker fills.
+  This exactly reproduces Phase 9's own already-documented demo finding
+  (regime dwell times of 1-3s outrun any maker order's ~10s horizon) in
+  the ablation context, not a new bug - `run_walk_forward_ablation_demo.py`
+  and `test_ablation_6_taker_only_and_7_8_supervisor_variants_show_zero_actions_on_this_dataset`
+  pin this down explicitly so a future change that silently alters it gets
+  noticed either way. Real historical data with slower regime dynamics
+  would be needed before this ablation comparison says anything about
+  cancel/replace's true value versus simply reflecting this synthetic
+  generator's flip frequency.
+
+## Notable bugs caught during Phase 0/4/5/7/8/9/10/11 build-out (fixed, worth knowing about)
 
 Building each phase exercised the previous phases' pipeline far more
 heavily than their own build-out did, and surfaced real bugs versus just
@@ -364,6 +422,43 @@ reported to the user in earlier sessions:
   and "later" correctly ties in total value under zero churn cost (a
   separate, genuine finding - see "Known reconstruction gaps" and the demo
   finding above), rather than the split option being inflated.
+- **(Phase 11)** `generate_hedge_candidate`'s sizing (SS17's
+  `min_hedge_quantity`) used the raw best-ask price, but the taker
+  candidate it feeds into then charges the *actual* taker fee on top - so
+  the hedge was always sized just short of restoring `G` to `g_min`
+  (`g_after=-30.000000000000004` against a floor of `-30.0` in the
+  smoke test that caught it - a few ULPs short after the fee fix, versus
+  visibly short before it, confirming the fee omission was the real gap
+  and not just floating-point noise). Fixed by sizing against
+  `c_effective = price + fee_config.taker_fee(1.0, price)` instead of raw
+  price; a small `x_min *= 1.0001` safety margin (scoped to this function
+  only, not touching Phase 3's already-tested general constraint logic)
+  absorbs the remaining floating-point boundary case.
+- **(Phase 11)** SS18's actual objective (`J = E[PnL] + lambda_G*G - ...`)
+  needed a nonzero `lambda_g` for `enable_portfolio_repair` to ever
+  functionally matter (at `lambda_g=0` a hedge's negative standalone EV
+  always loses to WAIT), and tuning it hit the same class of scale
+  mismatch as Phase 10's `churn_penalty=5.0` finding, twice: `lambda_g=0.5`
+  made every directional candidate's selection score negative and
+  suppressed *all* trading, because `g_after` for a meaningful position
+  runs in the hundreds while `ev_after` runs in the tens (confirmed by
+  dumping the candidate table - every non-WAIT candidate scored negative).
+  Backing off to `lambda_g=0.05` fixed taker but then suppressed *maker*
+  candidates specifically, for a subtler reason: maker's `ev_after` is
+  properly fill-probability-weighted (`rho`-scaled expectation) but the
+  `g_after` used in the *same* selection score is Phase 8's deliberately
+  pessimistic if-filled value, unweighted - so the same `lambda_g`
+  penalizes maker's risk far more than its true expected contribution, an
+  inherent inconsistency between an expectation term and a conditional-
+  worst-case term added together that a deeper fix (a separate
+  probability-weighted "selection_g") would need to resolve properly.
+  Given time constraints, re-tuned to `lambda_g=0.01` instead, verified via
+  a trace script to restore the same 8 non-wait decisions per round as the
+  `lambda_g=0.0` baseline. Left as a documented, empirically-tuned
+  constant for this dataset (see `walkforward/ablations.py`'s
+  `MANDATORY_ABLATIONS` comment) rather than a formally resolved design -
+  flagging the maker EV/G inconsistency here so it isn't rediscovered from
+  scratch later.
 
 - The order book generator recomputed "the previous tick's ask price" from
   a formula that mixed the current tick's TWAP with the previous tick's
@@ -419,6 +514,11 @@ production**:
   trusting Phase 0's baseline performance report or any later phase's
   backtest - the synthetic generator only proves the pipeline runs and
   reconciles, not that any strategy has edge.
+- Re-run Phase 11's 8-ablation matrix and parameter sensitivity/stability
+  sweeps against real historical rounds before trusting any of them - the
+  ablations 6-8 "zero actions" finding and the `edge_min=0.0`/`lambda_g=0.01`
+  tuning are both dataset-specific artifacts of this synthetic generator's
+  regime-flip frequency and book-depth sizing, not general conclusions.
 - Resolve the `_map_tokens_to_sides` gap in `polymarket_clob.py`.
 - Confirm the Chainlink Data Streams auth handshake against Chainlink's own
   docs (not Polymarket's).
