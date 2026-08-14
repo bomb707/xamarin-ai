@@ -29,6 +29,22 @@ class SyntheticRoundResult:
     outcome: Side
 
 
+def _depth_levels(touch_price: float, is_ask: bool, tick_size: float, book_liquidity: float,
+                   offsets_ticks: tuple[int, ...], size_multipliers: tuple[float, ...]) -> list[tuple[float, float]]:
+    """Levels beyond the touch move in lockstep with it (same tick_size
+    offset every tick) with increasing size further from the touch - a
+    plausible, simple depth shape for depth-walking demos/tests. The touch
+    level (offset 0) is always `touch_price` unchanged, so best_bid/
+    best_ask and everything computed from them (clob_mid, Phase 4-6
+    features) are unaffected by adding these extra levels."""
+    sign = 1 if is_ask else -1
+    out = []
+    for offset, mult in zip(offsets_ticks, size_multipliers):
+        price = round(touch_price + sign * offset * tick_size, 2) if offset else touch_price
+        out.append((min(0.99, max(0.01, price)), book_liquidity * mult))
+    return out
+
+
 def populate_synthetic_round(
     store: EventStore,
     round_id: str,
@@ -45,6 +61,8 @@ def populate_synthetic_round(
     book_liquidity: float = 500.0,
     half_spread: float = 0.01,
     resnapshot_interval_s: float = 5.0,
+    depth_offsets_ticks: tuple[int, ...] = (0, 2, 4),
+    depth_size_multipliers: tuple[float, ...] = (1.0, 1.5, 2.0),
 ) -> SyntheticRoundResult:
     """Appends one synthetic round's worth of events to `store` and returns
     its ground-truth settlement outcome. Deterministic for a given
@@ -113,11 +131,17 @@ def populate_synthetic_round(
         ask_down = min(0.99, max(0.01, round((1.0 - mid) + half_spread, 2)))
         bid_down = min(0.99, max(0.01, round((1.0 - mid) - half_spread, 2)))
 
+        # Each (side, book) maps to a list of (price, size) levels: the
+        # touch level (offset 0, unchanged from the original single-level
+        # design) plus depth_offsets_ticks[1:] additional levels beyond it,
+        # for depth-walking (Phase 7). Levels move in lockstep with the
+        # touch, so best_bid/best_ask - and everything computed from them
+        # in Phases 4-6 - are unaffected by their presence.
         current_levels = {
-            (Side.UP, "asks"): ask_up,
-            (Side.UP, "bids"): bid_up,
-            (Side.DOWN, "asks"): ask_down,
-            (Side.DOWN, "bids"): bid_down,
+            (Side.UP, "asks"): _depth_levels(ask_up, True, tick_size, book_liquidity, depth_offsets_ticks, depth_size_multipliers),
+            (Side.UP, "bids"): _depth_levels(bid_up, False, tick_size, book_liquidity, depth_offsets_ticks, depth_size_multipliers),
+            (Side.DOWN, "asks"): _depth_levels(ask_down, True, tick_size, book_liquidity, depth_offsets_ticks, depth_size_multipliers),
+            (Side.DOWN, "bids"): _depth_levels(bid_down, False, tick_size, book_liquidity, depth_offsets_ticks, depth_size_multipliers),
         }
 
         due_for_resnapshot = prev_levels is None or (t - last_snapshot_t) >= resnapshot_interval_s
@@ -132,8 +156,8 @@ def populate_synthetic_round(
                 source_ts=t,
                 payload={
                     "side": Side.UP.value,
-                    "bids": [[bid_up, book_liquidity]],
-                    "asks": [[ask_up, book_liquidity]],
+                    "bids": [[p, s] for p, s in current_levels[(Side.UP, "bids")]],
+                    "asks": [[p, s] for p, s in current_levels[(Side.UP, "asks")]],
                     "book_hash": f"{round_id}-up-{i}",
                 },
             )
@@ -144,31 +168,33 @@ def populate_synthetic_round(
                 source_ts=t,
                 payload={
                     "side": Side.DOWN.value,
-                    "bids": [[bid_down, book_liquidity]],
-                    "asks": [[ask_down, book_liquidity]],
+                    "bids": [[p, s] for p, s in current_levels[(Side.DOWN, "bids")]],
+                    "asks": [[p, s] for p, s in current_levels[(Side.DOWN, "asks")]],
                     "book_hash": f"{round_id}-down-{i}",
                 },
             )
             last_snapshot_t = t
         elif prev_levels is not None:
-            # Remove/re-add against the *actual* previously-emitted price
-            # for each (side, book) level, carried over from last
-            # iteration - not recomputed from the mid formula, which would
-            # drift out of sync with what was really written and leave
-            # stale levels behind forever (best_bid/best_ask would then
-            # reflect leftover garbage instead of the current top of book).
-            for key, new_price in current_levels.items():
+            # Remove/re-add against the *actual* previously-emitted prices
+            # for each (side, book), carried over from last iteration - not
+            # recomputed from the mid formula, which would drift out of
+            # sync with what was really written and leave stale levels
+            # behind forever (best_bid/best_ask would then reflect
+            # leftover garbage instead of the current top of book).
+            for key, new_level_list in current_levels.items():
                 side, book = key
-                prev_price = prev_levels[key]
-                if new_price != prev_price:
-                    store.append(
-                        EventType.BOOK_DELTA, round_id, recv_ts=t + 0.02, source_ts=t,
-                        payload={"side": side.value, "book": book, "price": prev_price, "size": 0, "book_hash": f"{round_id}-{side.value}-{i}"},
-                    )
-                    store.append(
-                        EventType.BOOK_DELTA, round_id, recv_ts=t + 0.02, source_ts=t,
-                        payload={"side": side.value, "book": book, "price": new_price, "size": book_liquidity, "book_hash": f"{round_id}-{side.value}-{i}"},
-                    )
+                prev_level_list = prev_levels[key]
+                if new_level_list != prev_level_list:
+                    for price, _ in prev_level_list:
+                        store.append(
+                            EventType.BOOK_DELTA, round_id, recv_ts=t + 0.02, source_ts=t,
+                            payload={"side": side.value, "book": book, "price": price, "size": 0, "book_hash": f"{round_id}-{side.value}-{i}"},
+                        )
+                    for price, size in new_level_list:
+                        store.append(
+                            EventType.BOOK_DELTA, round_id, recv_ts=t + 0.02, source_ts=t,
+                            payload={"side": side.value, "book": book, "price": price, "size": size, "book_hash": f"{round_id}-{side.value}-{i}"},
+                        )
 
         prev_levels = current_levels
 

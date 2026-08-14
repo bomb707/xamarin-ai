@@ -4,9 +4,9 @@ Tracks implementation status against the two source specs:
 - `Xamarinbot_V2_Detailed_Development_Roadmap.docx` ("Roadmap")
 - `Xamarinbot_V2_Detailed_Strategy_and_Mathematical_Model.docx` ("Strategy")
 
-This build covers **Roadmap Phases 0-6** (the foundation layers the roadmap
+This build covers **Roadmap Phases 0-7** (the foundation layers the roadmap
 itself says must exist before any predictive complexity, per its "Roadmap
-principle" and SS22.1 "Recommended immediate next sprint"). Phases 7-14 are
+principle" and SS22.1 "Recommended immediate next sprint"). Phases 8-14 are
 **not implemented** - they are listed below as explicitly future work, not
 silently dropped.
 
@@ -21,16 +21,20 @@ silently dropped.
 | Phase 4 - Feature Engineering (TWAP/spot/CLOB/time) | Done | [features/](../src/xamarinbot/features/). `compute()` is a pure, stateless function of a causal event list - the same code path for live and replay by construction, and future events in the input list are filtered out internally rather than trusted from the caller. All SS5-SS7 formulas (`G_T`, `G_S`, `L`, `V_T,model`, `Z_gap`, `L_clob`, `Z_clob`, OFI) implemented; two formulas the source docs don't pin down exactly (`Z_clob`'s robust_scale estimator, realized-volatility scaling convention) are documented inline and in "Known reconstruction gaps" below. Missing/stale inputs return an explicit `InvalidFeatureState`, never a silent default. |
 | Phase 5 - Probability Model and Calibration | Done | [model/](../src/xamarinbot/model/). Pure-Python L2-regularized logistic regression (no numpy/sklearn dependency - see "Known reconstruction gaps"), fit on a chronological (not random) train split, calibrated on validation via Platt or isotonic, evaluated on a held-out test split with Brier/log-loss/accuracy. `ModelRegistry` freezes model + feature_version + training_window + metrics and gates promotion on a Brier threshold - matches the exit gate "No production use until calibration is acceptable." TWAP-only / spot-only / combined lead-lag models are all built from a single shared `FeatureVector` computation per decision point (not recomputed per model). |
 | Phase 6 - Seed Regime / Middle-Ground State Machine | Done | [regime/](../src/xamarinbot/regime/). `classify_seed_action` is a complete, exhaustively-tested 54-cell mapping (6 `GapRegime` buckets x 3 CLOB directions x 3 spot directions) extending the Strategy doc SS8 table's 5 example rows + catch-all - see "Known reconstruction gaps" for exactly how the un-named cells were filled in. `ActionPermissionMatrix` always includes WAIT alongside any directional candidate; the module has no import dependency on the portfolio math kernel or anything order-placing (Phase 6 exit gate: "no matrix entry directly bypasses EV/risk gates" - every action here is a candidate family only). `RegimeClassifier` is stateful per round, logs every transition with dwell time, and substitutes CANCEL for WAIT specifically when a prior directional thesis just lapsed. Gated by the new `FeatureFlags.use_regime_seed_policy` flag (off by default) alongside the existing baseline policy, per "keep the original baseline rule available as a separate policy." |
+| Phase 7 - Order-Book and Execution Simulator | Done | [execution/](../src/xamarinbot/execution/). `walk_depth` builds the taker cost curve over real multi-level `BookSnapshot` depth (reused from Phase 1, not reinvented) with FAK partial-fill semantics falling out naturally - whatever isn't filled by the walk simply isn't, no resting remainder. The 250ms delay model requires the *caller* to supply the book at both submission and revalidation time (from causal replay), correctly modeling "revalidation/repricing risk" without the *strategy* seeing future data - only the simulated exchange does, exactly as a real matching engine would. `OrderState` is a real lifecycle state machine (`PENDING_DELAY -> OPEN/PARTIALLY_FILLED -> FILLED/CANCELED`); a real bug here (fills were applied eagerly at submission regardless of delay, silently defeating the pending-delay-no-cancel behavior) is documented below. The maker fill-probability/adverse-selection model (`rho(p,h)`, `q_fill`) is explicitly an uncalibrated placeholder - no real fill data exists to estimate it from (Roadmap's own step: "Estimate q_fill / maker adverse selection from historical fills" - not possible yet). Stochastic maker fills reuse Phase 2's `seeded_random` for reproducibility, exactly the use case it was built for. |
 
-Supporting pieces built to make Phases 0-6 demonstrable end-to-end:
+Supporting pieces built to make Phases 0-7 demonstrable end-to-end:
 - `journal/` - SS20 schema (all entities declared; market_config, feed_event,
   portfolio_state, order_event, fill, settlement, audit, and now
   feature_state are populated).
 - `synthetic/rounds.py` - a **synthetic, clearly-labeled** regression
   dataset generator standing in for Phase 0's "200+ representative historical
-  rounds" (none were supplied with the source spec). Now emits a full book
-  (bids and asks, not asks-only) so a true CLOB midpoint is computable, and
-  periodic full resnapshots so a quiet book doesn't read as stale.
+  rounds" (none were supplied with the source spec). Emits a full book
+  (bids and asks, not asks-only), periodic full resnapshots so a quiet book
+  doesn't read as stale, and now 3 depth levels per side (the original
+  single touch level plus two more, moving in lockstep so best_bid/best_ask
+  and everything computed from them are unaffected) so depth-walking has
+  real depth to walk.
 - `reports/baseline_report.py` - the Phase 0 performance report + failure
   taxonomy.
 - `reports/leadlag_report.py` - the Phase 4 / SS22.1 empirical table: P(UP)
@@ -38,9 +42,11 @@ Supporting pieces built to make Phases 0-6 demonstrable end-to-end:
   bucket.
 - `reports/regime_report.py` - the Phase 6 transition-statistics report:
   seed-action counts, top transition pairs, average dwell time per state.
+- `reports/execution_report.py` - the Phase 7 taker slippage/delay report.
 - `scripts/run_baseline_replay.py`, `scripts/run_feature_engine_demo.py`,
-  `scripts/run_model_training_demo.py`, `scripts/run_regime_classifier_demo.py` -
-  wire the above into four end-to-end causal pipelines you can run today.
+  `scripts/run_model_training_demo.py`, `scripts/run_regime_classifier_demo.py`,
+  `scripts/run_execution_simulator_demo.py` - wire the above into five
+  end-to-end causal pipelines you can run today.
 
 Run them:
 ```
@@ -48,6 +54,7 @@ PYTHONPATH=src python scripts/run_baseline_replay.py [n_rounds]
 PYTHONPATH=src python scripts/run_feature_engine_demo.py [n_rounds]
 PYTHONPATH=src python scripts/run_model_training_demo.py [n_rounds]
 PYTHONPATH=src python scripts/run_regime_classifier_demo.py [n_rounds]
+PYTHONPATH=src python scripts/run_execution_simulator_demo.py [n_rounds]
 ```
 Tests: `PYTHONPATH=src pytest -q` (or `pip install -e .[dev]` first)
 
@@ -55,8 +62,7 @@ Tests: `PYTHONPATH=src pytest -q` (or `pip install -e .[dev]` first)
 
 | Phase | What it needs |
 |---|---|
-| Phase 7 - Order-Book and Execution Simulator | Depth walking, 250ms taker delay/revalidation, FAK partial fills, maker queue/fill model. **This is what today's Phase-0 demo simplifies away** - every fill in `run_baseline_replay.py` is assumed to execute completely at the decision-time limit price. |
-| Phase 8 - One-Step Semi-Controlled Optimizer | Candidate generation + EV/G scoring using the Phase 3 kernel, Phase 5 `q`, and Phase 6's permitted-action sets. |
+| Phase 8 - One-Step Semi-Controlled Optimizer | Candidate generation + EV/G scoring using the Phase 3 kernel, Phase 5 `q`, Phase 6's permitted-action sets, and Phase 7's execution simulator for realistic fill/cost estimates. **`run_baseline_replay.py` still simplifies fills to same-tick-at-decision-price** - it predates Phase 7 and hasn't been rewired to use `ExecutionSimulator`; that rewiring is natural Phase 8 scope, since Phase 8 is what actually chooses order price/size/timing using EV. |
 | Phase 9 - Proactive Maker/Taker Place-Cancel-Replace | `OrderSupervisor`, cancel/replace predicates, churn rate-limiting. |
 | Phase 10 - Short-Horizon MPC | Scenario tree, receding-horizon optimization, latency-bounded fallback. |
 | Phase 11 - Walk-Forward Calibration and Ablations | Requires Phases 4-10 plus **real historical data** (see below). |
@@ -64,7 +70,7 @@ Tests: `PYTHONPATH=src pytest -q` (or `pip install -e .[dev]` first)
 | Phase 13 - Limited Live Rollout | Requires Phase 12 passing its exit gate, plus a funded, authenticated Polymarket account. **Do not attempt without explicit, deliberate operator sign-off** - this phase risks real capital. |
 | Phase 14 - Adaptive Optimization | Requires an accumulated live/shadow event log to calibrate against. |
 
-## Known reconstruction gaps (Phase 0 baseline, Phase 4 features, Phase 5 model, Phase 6 regime)
+## Known reconstruction gaps (Phase 0 baseline, Phase 4 features, Phase 5 model, Phase 6 regime, Phase 7 execution)
 
 The source docs describe some behaviors *narratively*, not with exact
 formulas. This build's choices are documented at the point of
@@ -133,6 +139,26 @@ implementation and repeated here for visibility:
     named breakpoint is an actual state boundary, with the strong buckets
     behaving identically to their middle counterpart wherever SS8 doesn't
     distinguish further.
+11. **Maker fill-probability model** ([execution/maker.py](../src/xamarinbot/execution/maker.py)) -
+    Strategy doc SS14 defines `rho(p,h)` conceptually ("distance to touch,
+    queue depth, trade flow, state and time") but gives no formula, and the
+    Roadmap step to estimate it from historical fills can't be done without
+    real fill data. This build uses a constant-hazard-rate model
+    (`rho = 1 - exp(-lambda*h)`) with `lambda` decaying exponentially in
+    distance-to-touch and damped by queue-ahead - a standard, simple shape,
+    but its parameters (`base_fill_rate_per_s`, `distance_decay_per_tick`,
+    `queue_normalization_shares`) are uncalibrated placeholders. Same for
+    `adverse_selection_bp` in the `q_fill` adjustment.
+12. **Taker-order design: caller supplies both book snapshots** ([execution/taker.py](../src/xamarinbot/execution/taker.py)) -
+    `simulate_taker_order` takes `asks_at_submission` and, for delayed
+    orders, `asks_at_revalidation` as separate caller-supplied arguments
+    rather than looking either up itself. This keeps the module decoupled
+    from event-store/cursor plumbing (reusing the existing `MockBookFeed` +
+    `MockFeedCursor` pattern already established in earlier scripts), but
+    it does mean the caller - not this module - is responsible for
+    correctly querying the book at `submit_ts + delay`, which is a
+    real "the exchange sees data the strategy didn't decide with" case,
+    not a causality violation - see the module docstring.
 
 None of these gaps affect the Phase 3 math kernel, which implements the
 source docs' formulas exactly.
@@ -149,7 +175,7 @@ relative to simpler baselines") exists to catch - real historical data,
 where TWAP isn't definitionally the whole story, is needed before this
 comparison means anything about real edge.
 
-## Notable bugs caught during Phase 0/4/5 build-out (fixed, worth knowing about)
+## Notable bugs caught during Phase 0/4/5/7 build-out (fixed, worth knowing about)
 
 Building each phase exercised the previous phases' pipeline far more
 heavily than their own build-out did, and surfaced real bugs versus just
@@ -178,6 +204,18 @@ reported to the user in earlier sessions:
   issue was that near-deterministic synthetic data leaves isotonic almost
   nothing to pool, so it memorizes validation noise instead of
   generalizing. See "Known reconstruction gaps" #8.
+- **(Phase 7)** `submit_taker_order` originally called `reconcile_fill`
+  immediately at construction time regardless of `taker_delay_ms`, so a
+  delayed order was already `FILLED` the instant it was submitted. This
+  silently defeated the entire pending-delay mechanic: `can_cancel(now_ts)`
+  checks `state is PENDING_DELAY`, but the state had already moved past
+  that before any `now_ts` could be checked - the exact behavior Roadmap
+  Phase 7's "Pending-delay no-cancel test" exists to catch, and it was
+  caught by hand-testing the delayed-order path immediately after writing
+  it, before a single automated test existed for it. Fixed by leaving the
+  order in `PENDING_DELAY` at submission and adding `resolve_pending()`,
+  which only applies the fill once the caller's simulated clock reaches
+  `matched_ts`.
 
 - The order book generator recomputed "the previous tick's ask price" from
   a formula that mixed the current tick's TWAP with the previous tick's
@@ -201,6 +239,16 @@ reported to the user in earlier sessions:
   of the round - flattening one whole dimension of the Phase 4 lead-lag
   table. Lowered to 0.001 so mid stays graduated across the observed
   gap range.
+
+**Phase 7 demo limitation worth flagging (not a bug)**: `run_execution_simulator_demo.py`
+always reports 0 repriced orders. The synthetic generator emits book events
+on a 1-second tick; the 250ms delay window is entirely inside a single tick,
+so the book queried at `submit_ts` and at `submit_ts + 0.25s` is always
+identical in this dataset - there's never actually a chance for the book to
+move within the window. The repricing logic itself is verified directly in
+`tests/test_execution.py` with hand-constructed book snapshots that do
+differ between submission and revalidation. Sub-second synthetic tick
+granularity would be needed to see repricing in the demo's own output.
 
 ## Live adapter confidence (Phase 1)
 
