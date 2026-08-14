@@ -20,13 +20,21 @@ several different ad hoc formulas.
 """
 from __future__ import annotations
 
+import math
+
 from xamarinbot.execution.config import ExecutionConfig
 from xamarinbot.execution.maker import fill_probability, q_fill
 from xamarinbot.execution.taker import walk_depth
 from xamarinbot.feeds.base import BookLevel, BookSnapshot
 from xamarinbot.optimizer.config import OneStepConfig
 from xamarinbot.optimizer.types import CandidateAction, OrderMode
-from xamarinbot.portfolio.math import FillSimulationResult, OrderPurpose, RiskConstraints, evaluate_constraints
+from xamarinbot.portfolio.math import (
+    FillSimulationResult,
+    OrderPurpose,
+    RiskConstraints,
+    evaluate_constraints,
+    min_hedge_quantity,
+)
 from xamarinbot.portfolio.state import FeeConfig, Fill, LiquidityRole, PortfolioState, Side, apply_fill
 
 
@@ -94,7 +102,13 @@ def _finalize(
     violated = list(check.violated)
 
     ev_after = ev_after_raw - cfg.churn_penalty
-    if apply_edge_min and ev_after < cfg.edge_min:
+    # Hedge orders are explicitly allowed negative standalone EV in
+    # exchange for improving worst-case risk (SS17: "Hedge orders may have
+    # negative standalone EV if they efficiently improve the whole
+    # portfolio risk. They must be labeled separately in the journal and
+    # optimizer.") - edge_min is an alpha-edge floor and does not apply to
+    # them, regardless of what the caller passed.
+    if apply_edge_min and purpose is not OrderPurpose.HEDGE and ev_after < cfg.edge_min:
         violated.append("edge_min")
 
     return CandidateAction(
@@ -178,6 +192,81 @@ def evaluate_maker_candidate(
         action_id, purpose, side, OrderMode.POST_ONLY, price, qty, ttl_s=horizon_s, expected_fill=rho * qty,
         delta_U=delta_U, delta_D=delta_D, delta_C=delta_C, ev_after_raw=ev_after_raw,
         portfolio=portfolio, portfolio_after=portfolio_after_if_filled, cfg=cfg, apply_edge_min=True,
+    )
+
+
+def generate_hedge_candidate(
+    action_id: str,
+    portfolio: PortfolioState,
+    asks_up: tuple[BookLevel, ...],
+    asks_down: tuple[BookLevel, ...],
+    q: float,
+    fee_config: FeeConfig,
+    cfg: OneStepConfig,
+) -> CandidateAction | None:
+    """Portfolio-repair / hedge candidate (Strategy doc SS17, Roadmap
+    Phase 11 / SS20.1 ablation #5 "Lead-lag + CLOB without portfolio
+    repair" vs #6+ "with portfolio control"). None of Phases 8-10 ever
+    generated one of these - `portfolio/math.py`'s hedge formulas
+    (`min_hedge_quantity`, `max_hedge_quantity`, `hedge_efficiency`) have
+    existed since Phase 3 but were only ever unit-tested in isolation
+    until this function actually calls them from the candidate pipeline.
+
+    SS17 states the UP-favored case explicitly
+    (`x_min_hedge = max(0, (-L_max - Pi_DOWN) / (1 - c_D))`); the
+    DOWN-favored case here is a symmetric, undocumented-in-the-source-docs
+    mirror (buy UP to restore the floor), the same kind of extension used
+    for Phase 6's regime matrix. `L_max` (max acceptable loss) is taken as
+    `-cfg.g_min` - the same worst-case floor concept G_min already
+    represents elsewhere. `c_D`/`c_U` (all-in per-share hedge cost) uses
+    the opposite side's best ask *plus* its taker fee at that price
+    (`FeeConfig.taker_fee`, per-share) rather than the raw price alone -
+    using raw price here first, then discovering the resulting candidate's
+    actual (fee-inclusive) G_after landed just short of g_min because the
+    formula never budgeted for the fee, is what motivated computing an
+    effective cost instead.
+
+    Returns None if the portfolio is already balanced or already meets
+    the floor (`x_min_hedge <= 0` - no repair needed) or the opposite
+    side's book has no ask to hedge against.
+    """
+    if math.isclose(portfolio.Pi_U, portfolio.Pi_D):
+        return None
+
+    l_max = -cfg.g_min
+    if portfolio.Pi_U > portfolio.Pi_D:
+        # UP favored, DOWN is the worst case - hedge by buying DOWN (SS17, as stated)
+        side, asks = Side.DOWN, asks_down
+        price = asks[0].price if asks else None
+        if price is None or price >= 1.0:
+            return None
+        c_effective = price + fee_config.taker_fee(1.0, price)
+        x_min = min_hedge_quantity(l_max, portfolio.Pi_D, c_effective)
+    else:
+        # DOWN favored, UP is the worst case - symmetric mirror
+        side, asks = Side.UP, asks_up
+        price = asks[0].price if asks else None
+        if price is None or price >= 1.0:
+            return None
+        c_effective = price + fee_config.taker_fee(1.0, price)
+        x_min = min_hedge_quantity(l_max, portfolio.Pi_U, c_effective)
+
+    if x_min <= 0:
+        return None  # already at/above the floor, no repair needed
+
+    # x_min sizes the hedge to land *exactly* on the g_min boundary; chained
+    # floating-point arithmetic (division in min_hedge_quantity, then the
+    # fee formula again inside evaluate_taker_candidate) can put the actual
+    # result a few ULPs on the wrong side of that boundary, which
+    # evaluate_constraints' strict `<` then rejects for essentially no
+    # reason. A tiny relative safety margin avoids that without touching
+    # Phase 3's general (and already covered by property tests) constraint
+    # comparison.
+    x_min *= 1.0001
+
+    return evaluate_taker_candidate(
+        action_id, side, OrderPurpose.HEDGE, x_min, limit_price=1.0, asks=asks,
+        portfolio=portfolio, q=q, fee_config=fee_config, cfg=cfg,
     )
 
 

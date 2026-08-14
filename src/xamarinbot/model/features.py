@@ -58,6 +58,14 @@ def design_vector(fv: FeatureVector, feature_set: FeatureSet) -> list[float] | N
 
 TWAP_ONLY = FeatureSet("twap_only", base=("z_gap", "tau"), interactions=(("z_gap", "tau"),))
 SPOT_ONLY = FeatureSet("spot_only", base=("z_spot", "tau"), interactions=(("z_spot", "tau"),))
+# Roadmap Phase 11 / SS20.1 mandatory ablation #4: "V2 TWAP + current-BTC
+# lead-lag model" - Z_gap and L (the lead gap) only, no CLOB/OFI. Distinct
+# from COMBINED_LEAD_LAG below, which is really ablation #5's "Lead-lag +
+# CLOB" - the two are deliberately different feature sets, not the same
+# one under two names.
+LEAD_LAG_ONLY = FeatureSet(
+    "lead_lag_only", base=("z_gap", "lead_gap_bp", "tau"), interactions=(("z_gap", "tau"), ("lead_gap_bp", "tau"))
+)
 COMBINED_LEAD_LAG = FeatureSet(
     "combined_lead_lag",
     base=("z_gap", "lead_gap_bp", "z_spot", "z_clob", "ofi", "tau"),

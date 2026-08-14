@@ -16,6 +16,7 @@ from xamarinbot.feeds.base import BookSnapshot
 from xamarinbot.optimizer.candidates import (
     evaluate_maker_candidate,
     evaluate_taker_candidate,
+    generate_hedge_candidate,
     maker_price_grid,
     taker_quantities,
     wait_candidate,
@@ -83,34 +84,52 @@ class OneStepController:
                     )
                 )
 
-        if SeedAction.MAKER_UP in permitted_actions and book_up is not None and book_up.best_bid and book_up.best_ask:
-            for price, offset in maker_price_grid(book_up.best_bid.price, book_up.best_ask.price, tick_size, self.cfg.maker_price_offsets_ticks):
-                idx += 1
-                queue_ahead = book_up.best_bid.size if offset == 0 else 0.0
-                candidates.append(
-                    evaluate_maker_candidate(
-                        f"maker_up_{idx}", Side.UP, OrderPurpose.ALPHA, price, self.cfg.maker_quantity,
-                        distance_to_touch_ticks=float(offset), queue_ahead_shares=queue_ahead, horizon_s=self.cfg.maker_horizon_s,
-                        portfolio=portfolio, q=q, exec_cfg=self.exec_cfg, cfg=self.cfg,
-                    )
-                )
+        if self.cfg.enable_portfolio_repair:
+            # Hedge candidates are evaluated regardless of the regime's
+            # permitted_actions - portfolio repair (SS17) is a portfolio-
+            # level decision about existing imbalance, not a directional
+            # thesis the seed regime classifier has an opinion on.
+            asks_up = book_up.asks if book_up is not None else ()
+            asks_down = book_down.asks if book_down is not None else ()
+            hedge = generate_hedge_candidate("hedge", portfolio, asks_up, asks_down, q, self.fee_config, self.cfg)
+            if hedge is not None:
+                candidates.append(hedge)
 
-        if SeedAction.MAKER_DOWN in permitted_actions and book_down is not None and book_down.best_bid and book_down.best_ask:
-            for price, offset in maker_price_grid(book_down.best_bid.price, book_down.best_ask.price, tick_size, self.cfg.maker_price_offsets_ticks):
-                idx += 1
-                queue_ahead = book_down.best_bid.size if offset == 0 else 0.0
-                candidates.append(
-                    evaluate_maker_candidate(
-                        f"maker_down_{idx}", Side.DOWN, OrderPurpose.ALPHA, price, self.cfg.maker_quantity,
-                        distance_to_touch_ticks=float(offset), queue_ahead_shares=queue_ahead, horizon_s=self.cfg.maker_horizon_s,
-                        portfolio=portfolio, q=q, exec_cfg=self.exec_cfg, cfg=self.cfg,
+        # Roadmap Phase 11 / SS20.1 ablation #6 "taker-only execution":
+        # skip maker candidate generation entirely rather than generating
+        # and then discarding them, so the candidate table itself reflects
+        # what the ablation is testing.
+        if not self.cfg.taker_only:
+            if SeedAction.MAKER_UP in permitted_actions and book_up is not None and book_up.best_bid and book_up.best_ask:
+                for price, offset in maker_price_grid(book_up.best_bid.price, book_up.best_ask.price, tick_size, self.cfg.maker_price_offsets_ticks):
+                    idx += 1
+                    queue_ahead = book_up.best_bid.size if offset == 0 else 0.0
+                    candidates.append(
+                        evaluate_maker_candidate(
+                            f"maker_up_{idx}", Side.UP, OrderPurpose.ALPHA, price, self.cfg.maker_quantity,
+                            distance_to_touch_ticks=float(offset), queue_ahead_shares=queue_ahead, horizon_s=self.cfg.maker_horizon_s,
+                            portfolio=portfolio, q=q, exec_cfg=self.exec_cfg, cfg=self.cfg,
+                        )
                     )
-                )
+
+            if SeedAction.MAKER_DOWN in permitted_actions and book_down is not None and book_down.best_bid and book_down.best_ask:
+                for price, offset in maker_price_grid(book_down.best_bid.price, book_down.best_ask.price, tick_size, self.cfg.maker_price_offsets_ticks):
+                    idx += 1
+                    queue_ahead = book_down.best_bid.size if offset == 0 else 0.0
+                    candidates.append(
+                        evaluate_maker_candidate(
+                            f"maker_down_{idx}", Side.DOWN, OrderPurpose.ALPHA, price, self.cfg.maker_quantity,
+                            distance_to_touch_ticks=float(offset), queue_ahead_shares=queue_ahead, horizon_s=self.cfg.maker_horizon_s,
+                            portfolio=portfolio, q=q, exec_cfg=self.exec_cfg, cfg=self.cfg,
+                        )
+                    )
 
         # WAIT and CANCEL permitted-actions generate nothing beyond the
         # WAIT candidate already present - neither is a "new position"
         # proposal (CANCEL concerns existing open orders, Phase 9's job).
 
         valid = [c for c in candidates if c.is_valid]
-        chosen = max(valid, key=lambda c: c.ev_after) if valid else wait
+        # SS18: J = E[PnL_T] + lambda_G*G_T - ...; lambda_g=0 (the default)
+        # reduces this to plain ev_after ranking, identical to Phases 8-10.
+        chosen = max(valid, key=lambda c: c.ev_after + self.cfg.lambda_g * c.g_after) if valid else wait
         return OneStepDecision(round_id, decision_ts, chosen, tuple(candidates), skip_reason=None)

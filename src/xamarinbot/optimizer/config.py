@@ -35,3 +35,23 @@ class OneStepConfig:
     # non-WAIT candidate, representing the operational cost of acting.
     churn_penalty: float = 0.0
     opportunity_cost: float = 0.0
+
+    # Roadmap Phase 11 / SS20.1 ablation toggles. All three default to the
+    # pre-Phase-11 behavior (repair off, all execution modes on, lambda_g
+    # zero), so existing Phase 8/9/10 callers that never set these are
+    # unaffected; ablations turn them on/off explicitly to isolate each
+    # piece's contribution.
+    enable_portfolio_repair: bool = False  # SS17 hedge candidates (ablation #5 vs #6+)
+    taker_only: bool = False  # skip maker candidate generation entirely (ablation #6 vs #7)
+
+    # SS18's actual objective is J = E[PnL_T] + lambda_G*G_T - ... , not
+    # plain EV - selection under pure ev_after can *never* pick a hedge
+    # candidate (SS17 hedges have negative standalone EV by construction,
+    # so they always lose to WAIT at lambda_g=0), which would make
+    # enable_portfolio_repair wired in but functionally inert. lambda_g=0.0
+    # preserves Phases 8-10's exact prior ev_after-only ranking; set it
+    # above 0 to let a worse-EV, better-G candidate actually win selection.
+    # Applied only to the selection score, not to the reported ev_after
+    # field itself, so ev_after keeps meaning "expected PnL" everywhere
+    # else (journaling, reports, tests).
+    lambda_g: float = 0.0
