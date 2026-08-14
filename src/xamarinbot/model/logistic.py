@@ -66,6 +66,16 @@ def fit_logistic_regression(
 
     weights = [0.0] * d
     bias = 0.0
+    # Proximal gradient descent: an explicit gradient step on the L2 term
+    # (weights[j] -= lr * l2 * weights[j]) is only stable while
+    # lr * l2 < 2 - anything past that oscillates with growing amplitude
+    # and diverges to +-inf within a handful of iterations for no obvious
+    # reason at the call site. The proximal/shrinkage update below
+    # (`weights *= 1 / (1 + 2*lr*l2)` after the ordinary data-loss step) is
+    # the exact solution to the L2 sub-problem and is unconditionally
+    # stable for every l2 >= 0, so a caller's regularization choice can
+    # never blow up the optimizer.
+    shrink = 1.0 / (1.0 + 2.0 * lr * l2) if l2 > 0 else 1.0
     for _ in range(n_iters):
         grad_w = [0.0] * d
         grad_b = 0.0
@@ -76,11 +86,8 @@ def fit_logistic_regression(
                 grad_w[j] += err * xi[j]
             grad_b += err
         for j in range(d):
-            grad_w[j] = grad_w[j] / n + l2 * weights[j] / n
-        grad_b /= n
-        for j in range(d):
-            weights[j] -= lr * grad_w[j]
-        bias -= lr * grad_b
+            weights[j] = (weights[j] - lr * grad_w[j] / n) * shrink
+        bias -= lr * grad_b / n
 
     return LogisticModel(
         feature_set_name=feature_set_name,

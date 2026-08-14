@@ -4,9 +4,9 @@ Tracks implementation status against the two source specs:
 - `Xamarinbot_V2_Detailed_Development_Roadmap.docx` ("Roadmap")
 - `Xamarinbot_V2_Detailed_Strategy_and_Mathematical_Model.docx` ("Strategy")
 
-This build covers **Roadmap Phases 0-4** (the foundation layers the roadmap
+This build covers **Roadmap Phases 0-5** (the foundation layers the roadmap
 itself says must exist before any predictive complexity, per its "Roadmap
-principle" and SS22.1 "Recommended immediate next sprint"). Phases 5-14 are
+principle" and SS22.1 "Recommended immediate next sprint"). Phases 6-14 are
 **not implemented** - they are listed below as explicitly future work, not
 silently dropped.
 
@@ -19,8 +19,9 @@ silently dropped.
 | Phase 2 - Causal Event Store and Replay Engine | Done | [events/](../src/xamarinbot/events/). Causality, ordering-tie-break, and disconnect/resnapshot behavior covered by `tests/test_event_causality.py`. |
 | Phase 3 - Exact Portfolio Mathematics Kernel | Done | [portfolio/](../src/xamarinbot/portfolio/). 100% of Strategy-doc identities covered by property tests (`tests/test_portfolio_math.py`, Hypothesis). No dependency on predictor or exchange client (verified by import graph). |
 | Phase 4 - Feature Engineering (TWAP/spot/CLOB/time) | Done | [features/](../src/xamarinbot/features/). `compute()` is a pure, stateless function of a causal event list - the same code path for live and replay by construction, and future events in the input list are filtered out internally rather than trusted from the caller. All SS5-SS7 formulas (`G_T`, `G_S`, `L`, `V_T,model`, `Z_gap`, `L_clob`, `Z_clob`, OFI) implemented; two formulas the source docs don't pin down exactly (`Z_clob`'s robust_scale estimator, realized-volatility scaling convention) are documented inline and in "Known reconstruction gaps" below. Missing/stale inputs return an explicit `InvalidFeatureState`, never a silent default. |
+| Phase 5 - Probability Model and Calibration | Done | [model/](../src/xamarinbot/model/). Pure-Python L2-regularized logistic regression (no numpy/sklearn dependency - see "Known reconstruction gaps"), fit on a chronological (not random) train split, calibrated on validation via Platt or isotonic, evaluated on a held-out test split with Brier/log-loss/accuracy. `ModelRegistry` freezes model + feature_version + training_window + metrics and gates promotion on a Brier threshold - matches the exit gate "No production use until calibration is acceptable." TWAP-only / spot-only / combined lead-lag models are all built from a single shared `FeatureVector` computation per decision point (not recomputed per model). |
 
-Supporting pieces built to make Phases 0-4 demonstrable end-to-end:
+Supporting pieces built to make Phases 0-5 demonstrable end-to-end:
 - `journal/` - SS20 schema (all entities declared; market_config, feed_event,
   portfolio_state, order_event, fill, settlement, audit, and now
   feature_state are populated).
@@ -34,13 +35,15 @@ Supporting pieces built to make Phases 0-4 demonstrable end-to-end:
 - `reports/leadlag_report.py` - the Phase 4 / SS22.1 empirical table: P(UP)
   and realized edge by gap bucket x spot direction x CLOB direction x time
   bucket.
-- `scripts/run_baseline_replay.py`, `scripts/run_feature_engine_demo.py` -
-  wire the above into two end-to-end causal replays you can run today.
+- `scripts/run_baseline_replay.py`, `scripts/run_feature_engine_demo.py`,
+  `scripts/run_model_training_demo.py` - wire the above into three
+  end-to-end causal pipelines you can run today.
 
 Run them:
 ```
 PYTHONPATH=src python scripts/run_baseline_replay.py [n_rounds]
 PYTHONPATH=src python scripts/run_feature_engine_demo.py [n_rounds]
+PYTHONPATH=src python scripts/run_model_training_demo.py [n_rounds]
 ```
 Tests: `PYTHONPATH=src pytest -q` (or `pip install -e .[dev]` first)
 
@@ -48,7 +51,6 @@ Tests: `PYTHONPATH=src pytest -q` (or `pip install -e .[dev]` first)
 
 | Phase | What it needs |
 |---|---|
-| Phase 5 - Probability Model and Calibration | Logistic `q` model, walk-forward splits, isotonic/Platt calibration, `ModelRegistry`. |
 | Phase 6 - Seed Regime / Middle-Ground State Machine | `RegimeClassifier`, `ActionPermissionMatrix` from Strategy doc SS8's table. |
 | Phase 7 - Order-Book and Execution Simulator | Depth walking, 250ms taker delay/revalidation, FAK partial fills, maker queue/fill model. **This is what today's Phase-0 demo simplifies away** - every fill in `run_baseline_replay.py` is assumed to execute completely at the decision-time limit price. |
 | Phase 8 - One-Step Semi-Controlled Optimizer | Candidate generation + EV/G scoring using the Phase 3 kernel + Phase 5 `q`. |
@@ -59,7 +61,7 @@ Tests: `PYTHONPATH=src pytest -q` (or `pip install -e .[dev]` first)
 | Phase 13 - Limited Live Rollout | Requires Phase 12 passing its exit gate, plus a funded, authenticated Polymarket account. **Do not attempt without explicit, deliberate operator sign-off** - this phase risks real capital. |
 | Phase 14 - Adaptive Optimization | Requires an accumulated live/shadow event log to calibrate against. |
 
-## Known reconstruction gaps (Phase 0 baseline, Phase 4 features)
+## Known reconstruction gaps (Phase 0 baseline, Phase 4 features, Phase 5 model)
 
 The source docs describe some behaviors *narratively*, not with exact
 formulas. This build's choices are documented at the point of
@@ -89,16 +91,70 @@ implementation and repeated here for visibility:
    tau" but doesn't specify how. This build uses the stdev of per-tick log
    returns each divided by `sqrt(dt)` between samples, so `sigma_t * sqrt(tau)`
    is dimensionally a standard Brownian-motion scaling in seconds.
+6. **Z_spot** ([features/engine.py](../src/xamarinbot/features/engine.py)) -
+   Strategy doc SS9's logit formula names `Z_spot` but SS9 never defines
+   it (only `Z_gap` and `Z_clob` get explicit formulas elsewhere). This
+   build uses the same vol*sqrt(time) normalization convention as `Z_gap`,
+   applied to the spot log-return at `FeatureConfig.canonical_horizon_s`.
+7. **No ML library dependency** ([model/logistic.py](../src/xamarinbot/model/logistic.py)) -
+   the Roadmap doesn't mandate pure-Python, but this project has stayed
+   dependency-free outside the optional `live` extra; logistic regression
+   at this data scale (thousands of rows, under a dozen features) doesn't
+   need numpy/scikit-learn. Uses proximal-gradient (not plain gradient
+   descent) for the L2 term specifically because the naive explicit-step
+   version diverges for `lr * l2 >= 2` - see "Notable bugs" below.
+8. **Platt over isotonic in the demo script** ([scripts/run_model_training_demo.py](../scripts/run_model_training_demo.py)) -
+   both are implemented and tested, but the synthetic data is close to
+   deterministically separable, so isotonic's PAVA pools almost nothing on
+   an 888-row validation split (882 near-unique blocks observed) and
+   memorizes it instead of learning a smooth curve. Platt's 2-parameter
+   fit doesn't have that failure mode at this data scale. Real historical
+   data with more genuine label noise may make isotonic viable.
 
 None of these gaps affect the Phase 3 math kernel, which implements the
 source docs' formulas exactly.
 
-## Notable bugs caught during Phase 0/4 build-out (fixed, worth knowing about)
+**Phase 5 demo finding worth flagging**: at `n_rounds=80`, the combined
+lead-lag model does *not* beat the TWAP-only baseline out-of-sample (Brier
+0.128 vs 0.116). This isn't a bug - `gap_twap_bp` (`Z_gap`) is what the
+synthetic generator's settlement outcome is actually keyed off of (see
+`synthetic/rounds.py`), so a simpler model built on exactly that signal has
+an inherent advantage on this data, and the combined model's extra features
+mostly add estimation variance rather than information. This is precisely
+the comparison the Phase 5 exit gate ("must beat or justify complexity
+relative to simpler baselines") exists to catch - real historical data,
+where TWAP isn't definitionally the whole story, is needed before this
+comparison means anything about real edge.
 
-Building Phase 4 exercised the synthetic data pipeline far more heavily than
-Phase 0 alone did, and surfaced three real bugs versus just calibration
-issues - noted here since they affected numbers already reported to the
-user in earlier sessions:
+## Notable bugs caught during Phase 0/4/5 build-out (fixed, worth knowing about)
+
+Building each phase exercised the previous phases' pipeline far more
+heavily than their own build-out did, and surfaced real bugs versus just
+calibration issues - noted here since they affected numbers already
+reported to the user in earlier sessions:
+
+- **(Phase 5)** The L2 regularization gradient was divided by `n` twice
+  (once as part of the averaged data gradient, again explicitly on the
+  regularization term). For datasets in the thousands of rows, this made
+  effective regularization strength ~1/n of what was requested - e.g.
+  `l2=1.0` behaved like `l2=0.0004` - letting the model run to extreme,
+  overconfident weights on the near-separable synthetic data. This is what
+  caused the isotonic-calibration blowup below, not a bug in isotonic
+  itself. Fixed by not dividing the regularization term by `n`.
+- **(Phase 5)** Once the above was fixed, an *unrelated* second bug
+  surfaced: the explicit gradient-descent step on the (now correctly-
+  scaled) L2 term diverges to +-inf whenever `lr * l2 >= 2` (e.g. `l2=10`
+  with the default `lr=0.3` produced a weight of `1.25e+89`). Fixed by
+  switching to a proximal/shrinkage update for the L2 term
+  (`w *= 1/(1+2*lr*l2)`), which is unconditionally stable for any `l2 >= 0`.
+- **(Phase 5, not a bug)** Isotonic calibration fit on the validation split
+  produced a Brier score far *worse* on test (0.318) than the model's raw,
+  uncalibrated output (0.0996) - initially looked like a calibration bug,
+  but PAVA was behaving correctly (in-sample Brier improved from 0.039 to
+  0.001, exactly what pooling adjacent violators should do); the real
+  issue was that near-deterministic synthetic data leaves isotonic almost
+  nothing to pool, so it memorizes validation noise instead of
+  generalizing. See "Known reconstruction gaps" #8.
 
 - The order book generator recomputed "the previous tick's ask price" from
   a formula that mixed the current tick's TWAP with the previous tick's

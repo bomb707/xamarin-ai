@@ -25,19 +25,26 @@ class Example:
     y: int  # 1 if UP, 0 if DOWN
 
 
-def build_examples(
+def build_examples_multi(
     store: EventStore,
     results: list[SyntheticRoundResult],
     feature_cfg: FeatureConfig,
-    feature_set: FeatureSet,
+    feature_sets: list[FeatureSet],
     heartbeat_s: float = 5.0,
-) -> list[Example]:
-    """decision_ts is a globally increasing absolute timestamp across the
+) -> dict[str, list[Example]]:
+    """Computes each causal FeatureVector once per (round, decision_ts) and
+    derives a design vector for every requested feature_set from it, rather
+    than recomputing the (expensive, O(events)) FeatureVector once per
+    feature set - the naive approach is a 3x-plus slowdown for no benefit
+    since all feature sets read from the same underlying FeatureVector.
+
+    decision_ts is a globally increasing absolute timestamp across the
     whole synthetic dataset (each round's start_ts is offset past the
     previous round's end), so sorting examples by decision_ts alone gives a
     valid chronological order for walk-forward splitting without needing a
-    separate per-round anchor."""
-    examples: list[Example] = []
+    separate per-round anchor.
+    """
+    out: dict[str, list[Example]] = {fs.name: [] for fs in feature_sets}
     for result in results:
         events = store.all_events(result.round_id)
         clock = ReplayClock(store, result.round_id)
@@ -46,8 +53,9 @@ def build_examples(
             fv = compute(events, result.round_id, decision_ts, result.p0, feature_cfg)
             if not isinstance(fv, FeatureVector):
                 continue
-            vec = design_vector(fv, feature_set)
-            if vec is None:
-                continue
-            examples.append(Example(round_id=result.round_id, decision_ts=decision_ts, features=fv, x=vec, y=y))
-    return examples
+            for fs in feature_sets:
+                vec = design_vector(fv, fs)
+                if vec is None:
+                    continue
+                out[fs.name].append(Example(round_id=result.round_id, decision_ts=decision_ts, features=fv, x=vec, y=y))
+    return out
