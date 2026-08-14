@@ -100,8 +100,13 @@ def populate_synthetic_round(
         # Small noise relative to the gap-driven signal: mid should mostly
         # track the same spot-vs-TWAP pressure that drives spot/TWAP
         # direction, or unanimous-direction agreement (required for the
-        # baseline to ever trade) would be pure chance at every tick.
-        mid = 1.0 / (1.0 + math.exp(-0.15 * gap_bp)) + rng.gauss(0.0, 0.002)
+        # baseline to ever trade) would be pure chance at every tick. Slope
+        # is deliberately gentle (0.15 saturates mid to ~1.0 within the
+        # first few ticks of any biased round, at which point clob_dir is
+        # stuck at 0 for the rest of the round and stops carrying
+        # information - 0.001 keeps mid graduated across the full observed
+        # gap_bp range, roughly 0.50-0.88 from gap=0 to gap=2000bp).
+        mid = 1.0 / (1.0 + math.exp(-0.001 * gap_bp)) + rng.gauss(0.0, 0.002)
         mid = min(0.97, max(0.03, mid))
         ask_up = min(0.99, max(0.01, round(mid + half_spread, 2)))
         bid_up = min(0.99, max(0.01, round(mid - half_spread, 2)))
