@@ -4,9 +4,9 @@ Tracks implementation status against the two source specs:
 - `Xamarinbot_V2_Detailed_Development_Roadmap.docx` ("Roadmap")
 - `Xamarinbot_V2_Detailed_Strategy_and_Mathematical_Model.docx` ("Strategy")
 
-This build covers **Roadmap Phases 0-7** (the foundation layers the roadmap
+This build covers **Roadmap Phases 0-8** (the foundation layers the roadmap
 itself says must exist before any predictive complexity, per its "Roadmap
-principle" and SS22.1 "Recommended immediate next sprint"). Phases 8-14 are
+principle" and SS22.1 "Recommended immediate next sprint"). Phases 9-14 are
 **not implemented** - they are listed below as explicitly future work, not
 silently dropped.
 
@@ -22,8 +22,9 @@ silently dropped.
 | Phase 5 - Probability Model and Calibration | Done | [model/](../src/xamarinbot/model/). Pure-Python L2-regularized logistic regression (no numpy/sklearn dependency - see "Known reconstruction gaps"), fit on a chronological (not random) train split, calibrated on validation via Platt or isotonic, evaluated on a held-out test split with Brier/log-loss/accuracy. `ModelRegistry` freezes model + feature_version + training_window + metrics and gates promotion on a Brier threshold - matches the exit gate "No production use until calibration is acceptable." TWAP-only / spot-only / combined lead-lag models are all built from a single shared `FeatureVector` computation per decision point (not recomputed per model). |
 | Phase 6 - Seed Regime / Middle-Ground State Machine | Done | [regime/](../src/xamarinbot/regime/). `classify_seed_action` is a complete, exhaustively-tested 54-cell mapping (6 `GapRegime` buckets x 3 CLOB directions x 3 spot directions) extending the Strategy doc SS8 table's 5 example rows + catch-all - see "Known reconstruction gaps" for exactly how the un-named cells were filled in. `ActionPermissionMatrix` always includes WAIT alongside any directional candidate; the module has no import dependency on the portfolio math kernel or anything order-placing (Phase 6 exit gate: "no matrix entry directly bypasses EV/risk gates" - every action here is a candidate family only). `RegimeClassifier` is stateful per round, logs every transition with dwell time, and substitutes CANCEL for WAIT specifically when a prior directional thesis just lapsed. Gated by the new `FeatureFlags.use_regime_seed_policy` flag (off by default) alongside the existing baseline policy, per "keep the original baseline rule available as a separate policy." |
 | Phase 7 - Order-Book and Execution Simulator | Done | [execution/](../src/xamarinbot/execution/). `walk_depth` builds the taker cost curve over real multi-level `BookSnapshot` depth (reused from Phase 1, not reinvented) with FAK partial-fill semantics falling out naturally - whatever isn't filled by the walk simply isn't, no resting remainder. The 250ms delay model requires the *caller* to supply the book at both submission and revalidation time (from causal replay), correctly modeling "revalidation/repricing risk" without the *strategy* seeing future data - only the simulated exchange does, exactly as a real matching engine would. `OrderState` is a real lifecycle state machine (`PENDING_DELAY -> OPEN/PARTIALLY_FILLED -> FILLED/CANCELED`); a real bug here (fills were applied eagerly at submission regardless of delay, silently defeating the pending-delay-no-cancel behavior) is documented below. The maker fill-probability/adverse-selection model (`rho(p,h)`, `q_fill`) is explicitly an uncalibrated placeholder - no real fill data exists to estimate it from (Roadmap's own step: "Estimate q_fill / maker adverse selection from historical fills" - not possible yet). Stochastic maker fills reuse Phase 2's `seeded_random` for reproducibility, exactly the use case it was built for. |
+| Phase 8 - One-Step Semi-Controlled Optimizer | Done | [optimizer/](../src/xamarinbot/optimizer/). `CandidateAction` matches Strategy doc SS23.3's interface almost verbatim. One EV formula (`EV_after = q*delta_U + (1-q)*delta_D - delta_C`) is used for every candidate, alpha or hedge, taker or maker - it reduces exactly to SS13's `DeltaEV_U`/`DeltaEV_D` for a certain taker fill and to SS14's maker EV core term once weighted by fill probability and evaluated with `q_fill` (Phase 7's adverse-selection adjustment) instead of raw `q`, rather than several ad hoc formulas per candidate type. Hard-constraint rejection reuses Phase 3's `evaluate_constraints` directly (not reimplemented) via a real `FillSimulationResult`; maker candidates are checked against their *if-filled* portfolio, conservatively, per SS16's "projected fill would push G below G_min -> Cancel/shrink." WAIT is always present and always valid, the guaranteed fallback. **Both roadmap-named verification items are automated**: `tests/test_optimizer.py`'s Hypothesis stress test (200 random portfolio/book/q combinations) asserts the chosen candidate never has `g_after` below `g_min` (accounting for the edge case where the *starting* portfolio is already below an unreachable `g_min` - no action, including WAIT, can fix that; see the test), and `scripts/run_one_step_controller_demo.py` runs the controller against the Phase 0 baseline over an identical causal replay. |
 
-Supporting pieces built to make Phases 0-7 demonstrable end-to-end:
+Supporting pieces built to make Phases 0-8 demonstrable end-to-end:
 - `journal/` - SS20 schema (all entities declared; market_config, feed_event,
   portfolio_state, order_event, fill, settlement, audit, and now
   feature_state are populated).
@@ -45,8 +46,12 @@ Supporting pieces built to make Phases 0-7 demonstrable end-to-end:
 - `reports/execution_report.py` - the Phase 7 taker slippage/delay report.
 - `scripts/run_baseline_replay.py`, `scripts/run_feature_engine_demo.py`,
   `scripts/run_model_training_demo.py`, `scripts/run_regime_classifier_demo.py`,
-  `scripts/run_execution_simulator_demo.py` - wire the above into five
-  end-to-end causal pipelines you can run today.
+  `scripts/run_execution_simulator_demo.py`, `scripts/run_one_step_controller_demo.py` -
+  wire the above into six end-to-end causal pipelines you can run today.
+  `run_baseline_replay.py` still simplifies fills to same-tick-at-decision-
+  price - it predates Phase 7 and was never retrofitted with
+  `ExecutionSimulator`, unlike `run_one_step_controller_demo.py`, which
+  uses it properly for both taker depth-walking and stochastic maker fills.
 
 Run them:
 ```
@@ -55,6 +60,7 @@ PYTHONPATH=src python scripts/run_feature_engine_demo.py [n_rounds]
 PYTHONPATH=src python scripts/run_model_training_demo.py [n_rounds]
 PYTHONPATH=src python scripts/run_regime_classifier_demo.py [n_rounds]
 PYTHONPATH=src python scripts/run_execution_simulator_demo.py [n_rounds]
+PYTHONPATH=src python scripts/run_one_step_controller_demo.py [n_eval_rounds]
 ```
 Tests: `PYTHONPATH=src pytest -q` (or `pip install -e .[dev]` first)
 
@@ -62,7 +68,6 @@ Tests: `PYTHONPATH=src pytest -q` (or `pip install -e .[dev]` first)
 
 | Phase | What it needs |
 |---|---|
-| Phase 8 - One-Step Semi-Controlled Optimizer | Candidate generation + EV/G scoring using the Phase 3 kernel, Phase 5 `q`, Phase 6's permitted-action sets, and Phase 7's execution simulator for realistic fill/cost estimates. **`run_baseline_replay.py` still simplifies fills to same-tick-at-decision-price** - it predates Phase 7 and hasn't been rewired to use `ExecutionSimulator`; that rewiring is natural Phase 8 scope, since Phase 8 is what actually chooses order price/size/timing using EV. |
 | Phase 9 - Proactive Maker/Taker Place-Cancel-Replace | `OrderSupervisor`, cancel/replace predicates, churn rate-limiting. |
 | Phase 10 - Short-Horizon MPC | Scenario tree, receding-horizon optimization, latency-bounded fallback. |
 | Phase 11 - Walk-Forward Calibration and Ablations | Requires Phases 4-10 plus **real historical data** (see below). |
@@ -70,7 +75,7 @@ Tests: `PYTHONPATH=src pytest -q` (or `pip install -e .[dev]` first)
 | Phase 13 - Limited Live Rollout | Requires Phase 12 passing its exit gate, plus a funded, authenticated Polymarket account. **Do not attempt without explicit, deliberate operator sign-off** - this phase risks real capital. |
 | Phase 14 - Adaptive Optimization | Requires an accumulated live/shadow event log to calibrate against. |
 
-## Known reconstruction gaps (Phase 0 baseline, Phase 4 features, Phase 5 model, Phase 6 regime, Phase 7 execution)
+## Known reconstruction gaps (Phase 0 baseline, Phase 4 features, Phase 5 model, Phase 6 regime, Phase 7 execution, Phase 8 optimizer)
 
 The source docs describe some behaviors *narratively*, not with exact
 formulas. This build's choices are documented at the point of
@@ -159,9 +164,38 @@ implementation and repeated here for visibility:
     correctly querying the book at `submit_ts + delay`, which is a
     real "the exchange sees data the strategy didn't decide with" case,
     not a causality violation - see the module docstring.
+13. **One EV formula for every candidate** ([optimizer/candidates.py](../src/xamarinbot/optimizer/candidates.py)) -
+    SS13/SS14 give separate-looking formulas for taker alpha EV and maker
+    EV; this build uses one general delta-EV formula
+    (`q*delta_U + (1-q)*delta_D - delta_C`) that both are special cases of
+    (see the module docstring for the derivation), rather than implementing
+    them as visibly-different code paths. This is a design choice, not a
+    literal reading of the docs, made because it's provably equivalent and
+    keeps alpha/hedge/taker/maker candidates on one consistent footing.
+14. **`edge_min` and maker candidate placement** ([optimizer/config.py](../src/xamarinbot/optimizer/config.py), [optimizer/candidates.py](../src/xamarinbot/optimizer/candidates.py)) -
+    SS21 names `edge_min` without a formula; this build applies it as a
+    flat floor on `ev_after`. Maker candidates' `queue_ahead_shares` (an
+    input to Phase 7's already-uncalibrated fill-probability model) uses
+    the resting size at that price level when placing exactly at the
+    current touch, and 0 for any price the book doesn't already show a
+    level at - a simplification, not a queue model.
 
 None of these gaps affect the Phase 3 math kernel, which implements the
 source docs' formulas exactly.
+
+**Phase 8 demo finding worth flagging**: in `run_one_step_controller_demo.py`,
+the Phase 0 baseline strategy took 0 positions across the sampled rounds
+while the one-step controller took 19 actions, on an *identical* causal
+replay. This isn't a controller bug - the demo evaluates both at a 10s
+heartbeat (chosen so the O(events) `FeatureVector` computation stays
+affordable across two full controllers), and the baseline's unanimous
+3-signal requirement is starved by that cadence: CLOB direction is already
+noisy at 1s resolution (Phase 6's finding), and sampling even more sparsely
+makes three-way alignment rarer still. The one-step controller doesn't need
+three-way agreement - it optimizes EV directly - so it's far less sensitive
+to decision cadence. Real historical data and a matched, higher-frequency
+cadence for both would be needed before this comparison says anything about
+relative strategy quality, not just cadence sensitivity.
 
 **Phase 5 demo finding worth flagging**: at `n_rounds=80`, the combined
 lead-lag model does *not* beat the TWAP-only baseline out-of-sample (Brier
@@ -175,7 +209,7 @@ relative to simpler baselines") exists to catch - real historical data,
 where TWAP isn't definitionally the whole story, is needed before this
 comparison means anything about real edge.
 
-## Notable bugs caught during Phase 0/4/5/7 build-out (fixed, worth knowing about)
+## Notable bugs caught during Phase 0/4/5/7/8 build-out (fixed, worth knowing about)
 
 Building each phase exercised the previous phases' pipeline far more
 heavily than their own build-out did, and surfaced real bugs versus just
@@ -216,6 +250,19 @@ reported to the user in earlier sessions:
   order in `PENDING_DELAY` at submission and adding `resolve_pending()`,
   which only applies the fill once the caller's simulated clock reaches
   `matched_ts`.
+- **(Phase 8, test-design issue, not a controller bug)** The first version
+  of the `test_optimizer_never_violates_g_min_across_random_states`
+  Hypothesis test failed on `u=d=c=0.0, g_min=1.0`: the *chosen* candidate
+  was WAIT with `g_after=0.0 < g_min=1.0`. This isn't the optimizer
+  violating anything - WAIT never changes G, so if the starting portfolio
+  is already below an unreachable `g_min` (impossible to avoid when
+  `g_min > 0` from a flat start, since G can never exceed 0 with zero
+  exposure), no action can fix that, and WAIT is correctly the best
+  available choice. Fixed the test's invariant to compare against
+  `min(g_min, starting_G)` rather than `g_min` alone - the real guarantee
+  is "never worse than the floor or the starting point, whichever is
+  looser," not "always at or above an arbitrary configured floor
+  regardless of where you started."
 
 - The order book generator recomputed "the previous tick's ask price" from
   a formula that mixed the current tick's TWAP with the previous tick's
