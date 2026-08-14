@@ -11,6 +11,7 @@ from xamarinbot.portfolio.math import (
     CandidateFill,
     OrderPurpose,
     RiskConstraints,
+    directional_projected_g,
     evaluate_constraints,
     hedge_efficiency,
     max_directional_spend,
@@ -152,6 +153,70 @@ def test_spend_cap_is_enforced_cumulatively_across_sequential_candidates():
 
 def test_max_directional_spend_formula():
     assert max_directional_spend(g_current=10.0, g_min=2.0) == 8.0
+
+
+# --------------------------------------------------------------------------
+# Phase 12B Tranche 1.1 item 5: directional_projected_g, proven directly
+# against the existing, tested G = min(U,D) - C kernel (same method as the
+# ΔG_U/ΔG_D Addendum F-H proof) for both sides and both regimes (buying the
+# already-overrepresented side vs. buying the currently-underrepresented
+# side, where min(U,D) itself moves as x grows).
+# --------------------------------------------------------------------------
+
+
+@given(
+    st.floats(min_value=0.0, max_value=500.0, allow_nan=False),
+    st.floats(min_value=0.0, max_value=500.0, allow_nan=False),
+    st.floats(min_value=0.0, max_value=500.0, allow_nan=False),
+    st.sampled_from([Side.UP, Side.DOWN]),
+    st.floats(min_value=0.01, max_value=0.99, allow_nan=False),
+    st.floats(min_value=0.01, max_value=300.0, allow_nan=False),
+)
+def test_directional_projected_g_matches_kernel_after_real_fill(u0, d0, c0, side, price, shares):
+    fee_config = FeeConfig()
+    before = PortfolioState(U=u0, D=d0, C=c0)
+    fee = fee_config.fee_for(LiquidityRole.TAKER, shares, price)
+    k_x = shares * price + fee
+    fill = Fill(side=side, price=price, shares=shares, role=LiquidityRole.TAKER, fee=fee)
+    after = apply_fill(before, fill)
+
+    assert math.isclose(
+        directional_projected_g(u0, d0, c0, side, shares, k_x), after.G, rel_tol=1e-9, abs_tol=1e-9
+    )
+
+
+def test_directional_projected_g_matches_flat_budget_when_side_already_overrepresented():
+    """max_directional_spend's flat G_current - g_min budget is exact
+    specifically when `side` is already the non-minimum side - confirm
+    the two formulas agree in that regime."""
+    u, d, c = 100.0, 20.0, 10.0  # UP is already the overrepresented side
+    g_current = min(u, d) - c
+    x, price = 30.0, 0.4
+    k_x = x * price
+    assert math.isclose(directional_projected_g(u, d, c, Side.UP, x, k_x), g_current - k_x)
+
+
+def test_directional_projected_g_exceeds_flat_budget_when_buying_the_underrepresented_side():
+    """The regression case Phase 12B Tranche 1.1 item 5 calls out
+    explicitly: U=0, D=100, C=50, g_min=-100. The old flat budget
+    (max_directional_spend) caps feasible spend at g_current - g_min =
+    (0 - 50) - (-100) = 50, i.e. ~96.6 shares at an all-in cost of
+    ~0.5175/share. The exact side-aware formula recognizes that buying UP
+    also raises min(U,D) itself, so a full 100-share purchase (K_U(100) =
+    51.75) is still risk-feasible: G' = 100 - 101.75 = -1.75 >= -100."""
+    u, d, c, g_min = 0.0, 100.0, 50.0, -100.0
+    fee_config = FeeConfig()
+    price = 0.50
+    x = 100.0
+    k_x = x * price + fee_config.taker_fee(x, price)
+    assert math.isclose(k_x, 51.75, rel_tol=1e-9)
+
+    g_exact = directional_projected_g(u, d, c, Side.UP, x, k_x)
+    assert math.isclose(g_exact, -1.75, rel_tol=1e-9)
+    assert g_exact >= g_min  # risk-feasible under the exact formula
+
+    flat_budget = max_directional_spend(min(u, d) - c, g_min)
+    assert k_x > flat_budget, "the old flat budget would have incorrectly rejected this feasible 100-share purchase"
 
 
 def test_hedge_quantity_formulas():

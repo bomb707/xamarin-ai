@@ -80,6 +80,7 @@ class ExecutionSimulator:
         limit_price: float,
         asks_at_submission: tuple[BookLevel, ...],
         submit_ts: float,
+        revalidation_asks: tuple[BookLevel, ...] | None = None,
     ) -> tuple[OrderState, TakerOrderResult]:
         """Phase 12B audit items 13/E/L: the one common chronological
         taker execution path every backtest/ablation/shadow/baseline
@@ -87,17 +88,41 @@ class ExecutionSimulator:
         market's `taker_delay_ms` is nonzero) -> resolve at matched_ts.
         Replaces every caller's previous shortcut of directly converting
         a chosen candidate's own pre-evaluation walk estimate into a
-        `Fill` without ever actually submitting an order. At the default
-        `taker_delay_ms=0.0`, this resolves synchronously and produces
-        the identical fill a direct-apply would have (same book, same
-        walk) - the point is that the *architecture* no longer depends on
-        that coincidence: the moment a market's real delay is wired in
-        (Phase 12B Tranche 3, item 23), this same call path handles it
-        correctly with no caller changes."""
-        order, result = self.submit_taker_order(order_id, side, requested_shares, limit_price, asks_at_submission, submit_ts)
-        if result.was_delayed:
-            self.resolve_pending(order, result, result.matched_ts)
-        return order, result
+        `Fill` without ever actually submitting an order.
+
+        `revalidation_asks`, if given, is the actual causal book at
+        `matched_ts = submit_ts + self.cfg.taker_delay_ms/1000` - a
+        backtest caller can obtain this immediately (ahead of its own
+        `decision_ts` reaching that time) by querying replay data at that
+        future timestamp, since it is the *simulated exchange*, not the
+        strategy, that is allowed to know it (see
+        `execution/taker.py::simulate_taker_order`'s docstring - this does
+        not violate the strategy's own causal decision boundary, which
+        never sees anything past `submit_ts`). Ignored when
+        `taker_delay_ms<=0` (`matched_ts==submit_ts`, nothing to
+        revalidate against).
+
+        At the default `taker_delay_ms=0.0`, this resolves synchronously
+        and produces the identical fill a direct-apply would have (same
+        book, same walk).
+
+        Phase 12B Tranche 1.1 item 7: for a genuinely delayed order
+        (`result.was_delayed`), this call deliberately does NOT resolve
+        the order here, even though the eventual fill is already fully
+        computable from `revalidation_asks` - the order is returned in
+        `PENDING_DELAY` state, unfilled. The caller must call
+        `resolve_pending(order, result, now_ts)` once its own replay/event
+        clock actually reaches `result.matched_ts`, so no caller ever
+        mutates portfolio state for a fill whose `matched_ts` is still in
+        the future (this was the bug: the previous version resolved and
+        applied the fill synchronously at `submit_ts` regardless of
+        delay, which - combined with no caller ever supplying
+        `revalidation_asks` - made a delayed order behave identically to
+        an immediate one except for a `matched_ts` stamp nothing read)."""
+        return self.submit_taker_order(
+            order_id, side, requested_shares, limit_price, asks_at_submission, submit_ts,
+            asks_at_revalidation=revalidation_asks,
+        )
 
     def resolve_pending(self, order: OrderState, result: TakerOrderResult, now_ts: float) -> bool:
         """Applies a delayed taker order's fill once `now_ts` reaches

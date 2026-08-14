@@ -33,8 +33,8 @@ from xamarinbot.portfolio.math import (
     FillSimulationResult,
     OrderPurpose,
     RiskConstraints,
+    directional_projected_g,
     evaluate_constraints,
-    max_directional_spend,
     min_hedge_quantity,
 )
 from xamarinbot.portfolio.state import FeeConfig, Fill, LiquidityRole, PortfolioState, Side, apply_fill
@@ -72,32 +72,87 @@ class TakerSizing:
     p_max: float | None
 
 
+def _risk_boundary_step(
+    u: float, d: float, c: float, g_min: float, side: Side, x0: float,
+    cum_qty: float, cum_cost: float, level_size: float, c_i: float,
+) -> tuple[float, bool]:
+    """Advances the exact risk-budget-feasible quantity through one book
+    level, using `directional_projected_g` (G_U(x)=min(U+x,D)-[C+K_U(x)],
+    G_D symmetric) instead of a flat G_current-g_min budget (Phase 12B
+    Tranche 1.1 item 5). `x0` is the breakpoint where `side`'s shares
+    catch up to the other side (`max(0, D-U)` for UP, `max(0, U-D)` for
+    DOWN) - G_side(x) is non-decreasing for x<=x0 (buying still-scarcer
+    inventory raises min(U,D) itself) and non-increasing for x>x0 (once
+    `side` is no longer the minimum, buying more only adds cost), so it is
+    unimodal with its peak at x0 and, once it drops below g_min past that
+    peak, every deeper level only makes it worse - safe to stop walking.
+
+    `cum_qty`/`cum_cost` are this walk's state at the START of this level
+    (before adding it); `c_i` is this level's fee-inclusive per-share
+    cost. Returns `(feasible_qty_through_this_level, keep_walking)`.
+    """
+
+    def g_at(x: float) -> float:
+        k_x = cum_cost + (x - cum_qty) * c_i
+        return directional_projected_g(u, d, c, side, x, k_x)
+
+    level_end = cum_qty + level_size
+    kink = min(max(x0, cum_qty), level_end)  # clamp the peak into this level's own range
+
+    g_start = g_at(cum_qty)
+    if g_start < g_min - 1e-12:
+        return cum_qty, False  # already infeasible entering this level
+
+    g_kink = g_at(kink) if kink > cum_qty else g_start
+    if kink > cum_qty and g_kink < g_min:
+        # crosses within the non-decreasing sub-range (only possible if
+        # c_i > 1, a pathological book state) - interpolate linearly.
+        frac = (g_start - g_min) / (g_start - g_kink)
+        return cum_qty + frac * (kink - cum_qty), False
+
+    g_end = g_at(level_end)
+    if g_end >= g_min:
+        return level_end, True  # whole level feasible (including any kink) - keep walking
+
+    # crosses within the non-increasing sub-range [kink, level_end]
+    ref_x, ref_g = (kink, g_kink) if kink > cum_qty else (cum_qty, g_start)
+    frac = (ref_g - g_min) / (ref_g - g_end)
+    return ref_x + frac * (level_end - ref_x), False
+
+
 def taker_sizing_boundaries(
     asks: tuple[BookLevel, ...],
     q_effective: float,
     fee_config: FeeConfig,
     cfg: OneStepConfig,
     portfolio: PortfolioState,
-    side_position: float,
+    side: Side,
 ) -> TakerSizing:
     """Generates economically meaningful candidate quantities from the
     union of boundaries named in Phase 12B audit item 7: exchange minimum
     size, small quantity steps, CLOB depth boundaries, the marginal-edge
     boundary (item 10's worst-price protection), the risk-budget boundary
-    (wires in `max_directional_spend`, previously dead code - Phase 12B
-    audit "additional flaws" note), the position-limit boundary, and the
-    spend-cap boundary - including the *exact partial quantity* inside
-    whichever boundary is tightest, not just whole-level sums (so e.g. a
-    500-share first level with only 7.4 shares of feasible budget yields a
-    7.4-share candidate, not a 0- or 500-share one).
+    (the exact side-aware `directional_projected_g` walk, Phase 12B
+    Tranche 1.1 item 5 - `max_directional_spend` is exact only in the
+    special case where `side` is already the non-minimum side and is not
+    used here as a universal boundary, see its own docstring), the
+    position-limit boundary, and the spend-cap boundary - including the
+    *exact partial quantity* inside whichever boundary is tightest, not
+    just whole-level sums (so e.g. a 500-share first level with only 7.4
+    shares of feasible budget yields a 7.4-share candidate, not a 0- or
+    500-share one).
 
     `q_effective` is `q` for a UP-side walk, `1-q` for a DOWN-side walk -
     the "success probability" for whichever side `asks` belongs to.
-    `side_position` is the portfolio's current `U` (or `D`) - whichever
-    side is being sized - used for the position-capacity boundary.
+    `side` is which side of the portfolio (`U` or `D`) is being sized -
+    used for both the position-capacity boundary and the exact risk-budget
+    walk's own side-aware kernel evaluation.
     """
     if not asks:
         return TakerSizing((), None)
+
+    side_position = portfolio.U if side is Side.UP else portfolio.D
+    x0 = max(0.0, (portfolio.D - portfolio.U) if side is Side.UP else (portfolio.U - portfolio.D))
 
     cum_qty = 0.0
     cum_cost = 0.0
@@ -105,11 +160,11 @@ def taker_sizing_boundaries(
     p_max: float | None = None
 
     spend_budget = (cfg.spend_cap - portfolio.C) if cfg.spend_cap is not None else None
-    risk_budget = max_directional_spend(portfolio.G, cfg.g_min)
     position_capacity = (cfg.position_limit - side_position) if cfg.position_limit is not None else None
 
     spend_capacity_qty: float | None = None
-    risk_budget_qty: float | None = None
+    risk_budget_qty = 0.0
+    risk_walk_done = False
 
     for level in asks:
         c_i = level.price + fee_config.taker_fee(1.0, level.price)  # fee-per-share at this level's price
@@ -121,9 +176,11 @@ def taker_sizing_boundaries(
         if spend_budget is not None and spend_capacity_qty is None and cum_cost + level_cost > spend_budget:
             remaining_budget = max(0.0, spend_budget - cum_cost)
             spend_capacity_qty = cum_qty + remaining_budget / c_i
-        if risk_budget_qty is None and cum_cost + level_cost > risk_budget:
-            remaining_budget = max(0.0, risk_budget - cum_cost)
-            risk_budget_qty = cum_qty + remaining_budget / c_i
+        if not risk_walk_done:
+            risk_budget_qty, keep_going = _risk_boundary_step(
+                portfolio.U, portfolio.D, portfolio.C, cfg.g_min, side, x0, cum_qty, cum_cost, level.size, c_i
+            )
+            risk_walk_done = not keep_going
 
         p_max = level.price
         cum_qty += level.size
@@ -132,8 +189,6 @@ def taker_sizing_boundaries(
 
     if spend_budget is not None and spend_capacity_qty is None:
         spend_capacity_qty = cum_qty  # budget never exhausted within the walked (edge-acceptable) levels
-    if risk_budget_qty is None:
-        risk_budget_qty = cum_qty
 
     boundaries = [marginal_edge_qty, risk_budget_qty]
     if position_capacity is not None:

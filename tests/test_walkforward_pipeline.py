@@ -102,23 +102,45 @@ def test_end_to_end_leakage_trace_keeps_every_stage_disjoint_from_test():
         assert trace.model_fit_round_ids <= window_train_validate_ids
         assert trace.calibrator_fit_round_ids <= window_train_validate_ids
         assert trace.transition_fit_round_ids <= window_train_validate_ids
+
+        # Phase 12B Tranche 1.1 item 4: TRAIN_i/VALIDATE_i/TEST_i must be
+        # pairwise disjoint within this window, checked explicitly rather
+        # than only implied by rolling_windows()'s own slicing.
+        train_ids = set(window.train_round_ids)
+        validate_ids = set(window.validate_round_ids)
+        assert train_ids.isdisjoint(validate_ids)
+        assert train_ids.isdisjoint(window_test_ids)
+        assert validate_ids.isdisjoint(window_test_ids)
+
         any_test_eval = any_test_eval or bool(window_test_ids)
 
     assert any_test_eval, "expected at least one window with a non-empty test segment"
 
     # separately, confirm the real end-to-end entry point actually
     # evaluates every window's test rounds (aggregate check - this one
-    # can be pooled safely since it's not a leakage assertion)
-    _, trace = run_walk_forward_ablations(store, results, windows, feature_cfg, fee_config, exec_cfg, specs)
+    # can be pooled safely since it's not a leakage assertion). Phase 12B
+    # Tranche 1.1 item 4: run_walk_forward_ablations now returns one
+    # LeakageTrace per window (keyed by window_index), not one shared
+    # trace - pool only test_eval_round_ids across windows here, never
+    # the fit/calibrator/transition sets (those must stay per-window).
+    _, traces = run_walk_forward_ablations(store, results, windows, feature_cfg, fee_config, exec_cfg, specs)
     all_test_ids = {rid for w in windows for rid in w.test_round_ids}
-    assert trace.test_eval_round_ids == all_test_ids
+    pooled_test_eval_ids = {rid for t in traces.values() for rid in t.test_eval_round_ids}
+    assert pooled_test_eval_ids == all_test_ids
 
 
 def test_calibrator_fit_round_ids_are_disjoint_from_model_fit_round_ids_within_a_window():
     """Within one window's own TRAIN segment, the raw model and its
-    calibrator must be fit on genuinely different rows (Phase 5's own
-    fit-on-train/calibrate-on-validation discipline, reapplied inside
-    each window's own train_round_ids)."""
+    calibrator must be fit on genuinely different ROUNDS, not merely
+    different individual examples (Phase 12B Tranche 1.1 item 1): every
+    observation from a given 5-minute market shares one eventual
+    settlement outcome and is strongly serially correlated with every
+    other observation from that same round, so a round split partly into
+    the fit set and partly into the calibration set would leak that
+    round's label across the split. R_modelFit ∩ R_calibration = ∅ is the
+    required invariant, at round granularity - example-level overlap
+    within a shared round is exactly what must NOT happen (this test used
+    to assert the opposite before the round-disjoint split fix)."""
     store, results = _dataset(n_rounds=12)
     round_ids = [r.round_id for r in results]
     windows = rolling_windows(round_ids, n_train=6, n_validate=2, n_test=2)
@@ -127,10 +149,9 @@ def test_calibrator_fit_round_ids_are_disjoint_from_model_fit_round_ids_within_a
 
     fit_window_artifacts(windows[0], results, store, feature_cfg, [TWAP_ONLY], trace)
 
-    # round-level overlap between the two is fine (chronological example-
-    # level split within a shared round set) - what must never happen is
-    # the calibrator being fit on the *same window's test/validate rounds*,
-    # already covered by the previous test. This test instead pins that
-    # the split actually produced two non-empty, distinct example pools.
     assert trace.model_fit_round_ids
     assert trace.calibrator_fit_round_ids
+    assert trace.model_fit_round_ids.isdisjoint(trace.calibrator_fit_round_ids), (
+        "a round_id was consumed by both the raw-model fit and the calibrator fit - "
+        "R_modelFit ∩ R_calibration must be empty"
+    )

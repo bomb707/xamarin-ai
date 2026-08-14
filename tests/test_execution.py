@@ -157,6 +157,91 @@ def test_non_delayed_taker_order_is_immediately_open_or_filled():
 
 
 # --------------------------------------------------------------------------
+# Phase 12B Tranche 1.1 item 7: execute_taker's delayed chronology - the
+# eventual fill must not be applied to the order at submit_ts, and once
+# resolved it must reflect the actual causal book at matched_ts, not the
+# submission book.
+# --------------------------------------------------------------------------
+
+
+def test_execute_taker_does_not_resolve_a_delayed_order_at_submit_ts():
+    """Regression test for the exact bug this item fixes: the previous
+    execute_taker() called resolve_pending() synchronously right after
+    submit_taker_order(), regardless of delay - so a PENDING_DELAY order
+    was immediately FILLED at submit_ts, and its can_cancel()/state
+    machinery became meaningless (every delayed order behaved identically
+    to an immediate one)."""
+    exec_cfg = ExecutionConfig(taker_delay_ms=250.0)
+    sim = ExecutionSimulator("r0", FEE, exec_cfg)
+
+    order, result = sim.execute_taker("o1", Side.UP, 50.0, 0.99, ASKS, submit_ts=10.0)
+
+    assert result.was_delayed
+    assert result.matched_ts == 10.25
+    assert order.state is OrderLifecycleState.PENDING_DELAY
+    assert order.filled_shares == 0.0  # not mutated yet, even though result.walk already knows the eventual fill
+    assert not order.can_cancel(10.1)  # still inside the delay window
+
+
+def test_execute_taker_delayed_fill_uses_the_later_book_not_the_submission_book():
+    """The core repricing-risk requirement, proven through the shared
+    execute_taker/resolve_pending lifecycle (not just simulate_taker_order
+    directly, which test_delayed_order_uses_revalidation_book_not_submission_book
+    already covers in isolation): an intervening book change during the
+    delay window must be reflected in the resolved fill."""
+    exec_cfg = ExecutionConfig(taker_delay_ms=250.0)
+    sim = ExecutionSimulator("r0", FEE, exec_cfg)
+    book_at_submission = (BookLevel(0.50, 100.0),)
+    book_at_matched_ts = (BookLevel(0.60, 100.0),)  # price moved up substantially during the delay
+
+    order, result = sim.execute_taker(
+        "o1", Side.UP, 50.0, limit_price=0.55, asks_at_submission=book_at_submission, submit_ts=10.0,
+        revalidation_asks=book_at_matched_ts,
+    )
+    assert result.was_delayed
+    assert result.repriced
+    # limit_price 0.55 no longer reaches the later book's 0.60 ask - proves
+    # the *later* book determined the outcome, not the submission book
+    # (which would have filled fully at 0.50).
+    assert result.walk.filled_shares == 0.0
+    assert order.state is OrderLifecycleState.PENDING_DELAY  # still not applied - matched_ts hasn't arrived yet
+
+    resolved_too_early = sim.resolve_pending(order, result, now_ts=10.1)
+    assert not resolved_too_early
+    assert order.state is OrderLifecycleState.PENDING_DELAY
+
+    resolved = sim.resolve_pending(order, result, now_ts=10.25)
+    assert resolved
+    assert order.state is OrderLifecycleState.CANCELED  # nothing filled at the repriced book - FAK, no resting remainder
+    assert order.filled_shares == 0.0
+
+
+def test_execute_taker_delayed_fill_applies_once_matched_ts_is_reached():
+    """Contrast case: when the later book still supports a fill, resolving
+    at/after matched_ts must actually mutate the order to reflect it -
+    proving the full submit -> PENDING_DELAY -> resolve -> FILLED
+    lifecycle works end to end, using the revalidation book's price/size,
+    not the submission book's."""
+    exec_cfg = ExecutionConfig(taker_delay_ms=250.0)
+    sim = ExecutionSimulator("r0", FEE, exec_cfg)
+    book_at_submission = (BookLevel(0.40, 100.0),)  # cheaper at submission
+    book_at_matched_ts = (BookLevel(0.45, 100.0),)  # book moved, but still fillable
+
+    order, result = sim.execute_taker(
+        "o1", Side.UP, 50.0, limit_price=0.99, asks_at_submission=book_at_submission, submit_ts=10.0,
+        revalidation_asks=book_at_matched_ts,
+    )
+    assert result.repriced
+    assert order.filled_shares == 0.0  # not yet applied
+
+    resolved = sim.resolve_pending(order, result, now_ts=10.25)
+    assert resolved
+    assert order.state is OrderLifecycleState.FILLED
+    assert order.filled_shares == 50.0
+    assert math.isclose(result.walk.avg_price, 0.45)  # the later book's price, not the submission book's 0.40
+
+
+# --------------------------------------------------------------------------
 # Order-state reconciliation: partial fill then cancel remainder
 # --------------------------------------------------------------------------
 

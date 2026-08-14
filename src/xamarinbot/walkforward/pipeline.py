@@ -31,7 +31,6 @@ from xamarinbot.features.types import FeatureVector
 from xamarinbot.model.calibrated import CalibratedModel, fit_calibrated_model
 from xamarinbot.model.dataset import build_examples_multi
 from xamarinbot.model.features import FeatureSet
-from xamarinbot.model.walkforward import time_ordered_split
 from xamarinbot.mpc.scenario import TransitionModel, build_transition_model
 from xamarinbot.portfolio.state import FeeConfig
 from xamarinbot.regime.classifier import RegimeClassifier
@@ -48,19 +47,61 @@ HEARTBEAT_S = 10.0
 # separate `validate_round_ids` (which Phase 11's ablations/sensitivity
 # code already uses for parameter selection, per
 # `parameter_stability_across_windows`). Splitting the window's train
-# examples again avoids calibrating on the exact same rows the raw model
-# was fit on.
+# ROUNDS (never individual examples - see _split_rounds_for_fit_and_calibration)
+# again avoids calibrating on the exact same rows the raw model was fit on.
 _CALIBRATION_HOLDOUT_FRAC = 0.2
+
+
+def _split_rounds_for_fit_and_calibration(
+    train_round_ids: tuple[str, ...], calibration_holdout_frac: float
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Splits a window's own `train_round_ids` into a chronologically
+    earlier fit sub-range and a later calibration sub-range, at ROUND
+    granularity (Phase 12B Tranche 1.1 item 1).
+
+    Before this function existed, `fit_window_artifacts` built examples
+    from every train round and then ran `time_ordered_split()` (an
+    example-count-fraction split) over the resulting flat example list -
+    since a single round contributes many decision-point examples that
+    all share one eventual settlement outcome and are strongly serially
+    correlated, that split could and did place some of a round's own
+    examples in the raw-model fit set and the rest of that *same round*
+    in the calibration set. The required invariant is
+    `R_modelFit ∩ R_calibration = ∅` at the round level, not just at the
+    example level.
+
+    `train_round_ids` is already chronologically ordered (guaranteed by
+    `rolling_windows()` slicing `round_ids_chronological`), so a simple
+    index split preserves TRAIN_i -> VALIDATE_i chronology within the
+    window's own train segment."""
+    n = len(train_round_ids)
+    if n <= 1:
+        return train_round_ids, ()
+    n_calib = max(1, round(n * calibration_holdout_frac))
+    n_calib = min(n_calib, n - 1)  # always leave at least one round to fit on
+    n_fit = n - n_calib
+    return train_round_ids[:n_fit], train_round_ids[n_fit:]
 
 
 @dataclass
 class LeakageTrace:
-    """Records every round_id actually consumed by each pipeline stage,
-    across every window - the basis for the required end-to-end
-    no-leakage test (Phase 12B audit item 4's explicit ask: "add an
-    end-to-end leakage test that records every round_id consumed by:
-    model fit, standardizer, calibrator, transition-model fit, parameter
-    sweep, final test evaluation")."""
+    """Records every round_id actually consumed by one window's own
+    pipeline stages - the basis for the required end-to-end no-leakage
+    test (Phase 12B audit item 4's explicit ask: "add an end-to-end
+    leakage test that records every round_id consumed by: model fit,
+    standardizer, calibrator, transition-model fit, parameter sweep,
+    final test evaluation").
+
+    One `LeakageTrace` covers exactly one walk-forward window
+    (Phase 12B Tranche 1.1 item 4) - pooling traces across every window
+    into one shared set is wrong for a rolling walk-forward run, since a
+    round that was one window's TEST round is explicitly permitted to
+    become a *later* window's TRAIN/VALIDATE round (windows.py's own
+    "future data only ever appears in a later window's train, never a
+    given window's own test" docstring) - a pooled check would flag that
+    legitimate reuse as if it were leakage. See
+    `run_walk_forward_ablations`, which now returns one trace per window
+    keyed by `window_index` rather than a single shared trace."""
 
     model_fit_round_ids: set[str] = field(default_factory=set)
     calibrator_fit_round_ids: set[str] = field(default_factory=set)
@@ -112,17 +153,23 @@ def fit_window_artifacts(
     per window suffices."""
     train_rounds = _rounds_for_ids(all_rounds, window.train_round_ids)
 
+    # TRAIN_i's own internal fit/calibrate split, at ROUND granularity
+    # (Phase 12B Tranche 1.1 item 1) - never window.validate_round_ids or
+    # window.test_round_ids, only a chronologically-earlier/later
+    # partition of this window's own train_round_ids, with every example
+    # from a given round landing entirely in one side of the split.
+    fit_round_ids, calib_round_ids = _split_rounds_for_fit_and_calibration(window.train_round_ids, _CALIBRATION_HOLDOUT_FRAC)
+    fit_round_id_set, calib_round_id_set = set(fit_round_ids), set(calib_round_ids)
+
     models: dict[str, CalibratedModel | None] = {}
     for fs in feature_sets:
         by_fs = build_examples_multi(store, train_rounds, feature_cfg, [fs], heartbeat_s=HEARTBEAT_S)
         examples = by_fs[fs.name]
-        # TRAIN_i's own internal fit/calibrate split - never window.validate_round_ids
-        # or window.test_round_ids, only a chronological slice of this
-        # window's own train_round_ids.
-        split = time_ordered_split(examples, train_frac=1.0 - _CALIBRATION_HOLDOUT_FRAC - 1e-9, val_frac=_CALIBRATION_HOLDOUT_FRAC)
-        trace.model_fit_round_ids.update(e.round_id for e in split.train)
-        trace.calibrator_fit_round_ids.update(e.round_id for e in split.validation)
-        models[fs.name] = fit_calibrated_model(split.train, split.validation, fs)
+        fit_examples = [e for e in examples if e.round_id in fit_round_id_set]
+        calib_examples = [e for e in examples if e.round_id in calib_round_id_set]
+        trace.model_fit_round_ids.update(e.round_id for e in fit_examples)
+        trace.calibrator_fit_round_ids.update(e.round_id for e in calib_examples)
+        models[fs.name] = fit_calibrated_model(fit_examples, calib_examples, fs)
 
     transition_model = _train_transition_model(store, train_rounds, feature_cfg)
     trace.transition_fit_round_ids.update(r.round_id for r in train_rounds)
@@ -146,18 +193,27 @@ def run_walk_forward_ablations(
     fee_config: FeeConfig,
     exec_cfg: ExecutionConfig,
     ablation_specs: tuple[AblationSpec, ...],
-) -> tuple[list[WindowRoundResult], LeakageTrace]:
+) -> tuple[list[WindowRoundResult], dict[int, LeakageTrace]]:
     """Runs every ablation's TEST_i segment against that window's own
     frozen artifacts. `ablation_specs` with `controller == "baseline"`
     need no model (the baseline strategy is deterministic sign logic, not
-    a fitted q model) and are evaluated directly."""
+    a fitted q model) and are evaluated directly.
+
+    Returns one `LeakageTrace` per window, keyed by `window_index`
+    (Phase 12B Tranche 1.1 item 4) - never one trace shared/pooled across
+    every window, since a round that was one window's TEST round is
+    explicitly allowed to become a later window's TRAIN/VALIDATE round
+    (see `LeakageTrace`'s own docstring); leakage must be asserted
+    per-window, against that window's own fit/calibrator/transition
+    round_ids and that window's own test_round_ids only."""
     feature_sets = sorted(
         {spec.feature_set for spec in ablation_specs if spec.feature_set is not None}, key=lambda fs: fs.name
     )
-    trace = LeakageTrace()
+    traces: dict[int, LeakageTrace] = {}
     all_round_results: list[WindowRoundResult] = []
 
     for window in windows:
+        trace = LeakageTrace()
         artifacts = fit_window_artifacts(window, all_rounds, store, feature_cfg, feature_sets, trace)
         test_rounds = _rounds_for_ids(all_rounds, window.test_round_ids)
 
@@ -170,4 +226,6 @@ def run_walk_forward_ablations(
                 )
                 all_round_results.append(WindowRoundResult(window.window_index, spec.name, r.round_id, result))
 
-    return all_round_results, trace
+        traces[window.window_index] = trace
+
+    return all_round_results, traces

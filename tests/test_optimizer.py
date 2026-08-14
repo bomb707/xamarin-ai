@@ -46,7 +46,7 @@ def test_taker_sizing_produces_exact_partial_quantity_at_risk_budget_boundary():
     cfg = OneStepConfig(g_min=-risk_budget)  # G_current=0 (empty portfolio) - g_min => max_directional_spend = risk_budget
     portfolio = PortfolioState()
 
-    sizing = taker_sizing_boundaries(asks, q_effective=0.9, fee_config=fee_config, cfg=cfg, portfolio=portfolio, side_position=0.0)
+    sizing = taker_sizing_boundaries(asks, q_effective=0.9, fee_config=fee_config, cfg=cfg, portfolio=portfolio, side=Side.UP)
 
     assert sizing.p_max == 0.50
     assert any(math.isclose(q, 7.4, rel_tol=1e-6) for q in sizing.quantities), sizing.quantities
@@ -62,7 +62,7 @@ def test_taker_sizing_stops_at_last_level_with_positive_marginal_edge():
     cfg = OneStepConfig(g_min=-1_000_000.0)  # risk budget deliberately not the binding constraint here
     portfolio = PortfolioState()
 
-    sizing = taker_sizing_boundaries(asks, q_effective=0.9, fee_config=fee_config, cfg=cfg, portfolio=portfolio, side_position=0.0)
+    sizing = taker_sizing_boundaries(asks, q_effective=0.9, fee_config=fee_config, cfg=cfg, portfolio=portfolio, side=Side.UP)
 
     assert sizing.p_max == 0.50  # the 0.95 level is never walked
     assert max(sizing.quantities) <= 100.0 + 1e-6  # never offers quantity from the rejected level
@@ -74,7 +74,7 @@ def test_taker_sizing_returns_nothing_when_no_level_clears_marginal_edge():
     cfg = OneStepConfig(g_min=-1_000_000.0)
     portfolio = PortfolioState()
 
-    sizing = taker_sizing_boundaries(asks, q_effective=0.1, fee_config=fee_config, cfg=cfg, portfolio=portfolio, side_position=0.0)
+    sizing = taker_sizing_boundaries(asks, q_effective=0.1, fee_config=fee_config, cfg=cfg, portfolio=portfolio, side=Side.UP)
 
     assert sizing.p_max is None
     assert sizing.quantities == ()
@@ -86,13 +86,45 @@ def test_taker_sizing_respects_position_and_spend_caps():
     cfg = OneStepConfig(g_min=-1_000_000.0, position_limit=3.0)
     portfolio = PortfolioState()
 
-    sizing = taker_sizing_boundaries(asks, q_effective=0.9, fee_config=fee_config, cfg=cfg, portfolio=portfolio, side_position=0.0)
+    sizing = taker_sizing_boundaries(asks, q_effective=0.9, fee_config=fee_config, cfg=cfg, portfolio=portfolio, side=Side.UP)
     assert max(sizing.quantities) <= 3.0 + 1e-6
 
     cfg_spend = OneStepConfig(g_min=-1_000_000.0, spend_cap=5.0)
-    sizing_spend = taker_sizing_boundaries(asks, q_effective=0.9, fee_config=fee_config, cfg=cfg_spend, portfolio=portfolio, side_position=0.0)
+    sizing_spend = taker_sizing_boundaries(asks, q_effective=0.9, fee_config=fee_config, cfg=cfg_spend, portfolio=portfolio, side=Side.UP)
     c_1 = 0.50 + fee_config.taker_fee(1.0, 0.50)
     assert max(sizing_spend.quantities) <= (5.0 / c_1) + 1e-6
+
+
+def test_taker_sizing_uses_exact_side_aware_g_when_buying_the_underrepresented_side():
+    """Phase 12B Tranche 1.1 item 5 regression: the flat
+    max_directional_spend(g_current, g_min) budget used to cap risk-budget
+    sizing at G_current-g_min DOLLARS, which is only exact when the
+    purchased side is already the non-minimum side. Buying the currently
+    *underrepresented* side also raises min(U,D) itself, so the flat
+    budget badly under-sizes what's actually risk-feasible.
+
+    U=0, D=100, C=50, g_min=-100, c_i=0.5175 (=0.50 + taker_fee): the old
+    flat budget = (min(0,100)-50)-(-100) = 50 dollars => caps quantity at
+    50/0.5175 ~= 96.6 shares - it would reject a 100-share purchase even
+    though G'(100) = min(100,100)-(50+51.75) = -1.75 >= -100 (the exact
+    example the reviewer's prompt calls out explicitly). The TRUE
+    boundary is far higher still, since G keeps rising until x=D-U=100
+    (min(U,D) rising alongside the purchase) and only *then* starts
+    falling: G(x)=100-50-0.5175x for x>100, crossing g_min=-100 at
+    x=150/0.5175 ~= 289.86 shares - almost 3x the old (wrong) cap."""
+    asks = (BookLevel(0.50, 500.0),)  # depth well past the true risk boundary, so risk is the binding constraint
+    fee_config = FeeConfig()
+    cfg = OneStepConfig(g_min=-100.0)
+    portfolio = PortfolioState(U=0.0, D=100.0, C=50.0)
+    old_wrong_cap = 50.0 / 0.5175  # ~96.6 - what the flat max_directional_spend budget would have allowed
+    exact_boundary = 150.0 / 0.5175  # ~289.86 - the true G_U(x)>=g_min crossing point
+
+    sizing = taker_sizing_boundaries(asks, q_effective=0.9, fee_config=fee_config, cfg=cfg, portfolio=portfolio, side=Side.UP)
+
+    assert any(q >= 100.0 for q in sizing.quantities), sizing.quantities  # the prompt's explicit claim: 100 shares must be feasible
+    assert any(q > old_wrong_cap for q in sizing.quantities), sizing.quantities  # strictly more than the old (wrong) flat-budget cap
+    assert any(math.isclose(q, exact_boundary, rel_tol=1e-6) for q in sizing.quantities), sizing.quantities
+    assert max(sizing.quantities) <= exact_boundary + 1e-6  # never offers more than the exact risk-feasible boundary
 
 
 def test_taker_sizing_boundaries_are_wired_into_controller_candidate_generation():

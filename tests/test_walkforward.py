@@ -20,6 +20,7 @@ from xamarinbot.portfolio.state import FeeConfig, Side
 from xamarinbot.synthetic.rounds import generate_synthetic_dataset
 from xamarinbot.walkforward.ablations import MANDATORY_ABLATIONS, RoundResult, run_ablation_round
 from xamarinbot.walkforward.bootstrap import bootstrap_ci
+from xamarinbot.walkforward.pipeline import LeakageTrace, fit_window_artifacts
 from xamarinbot.walkforward.sensitivity import parameter_stability_across_windows, sweep_parameter
 from xamarinbot.walkforward.windows import WalkForwardWindow, rolling_windows
 
@@ -240,6 +241,41 @@ def test_ablations_6_7_8_now_trade_after_taker_sizing_fix(eval_dataset, feature_
         assert sum(r.n_actions for r in totals) > 0, f"{name} expected to trade now that taker sizing is risk/depth/marginal-edge-aware"
 
 
+def test_controller_round_resolves_delayed_taker_orders_via_matched_ts_not_submit_ts(eval_dataset, feature_cfg, fee_config, trained_model):
+    """Phase 12B Tranche 1.1 item 7 integration proof: with a nonzero
+    taker_delay_ms, _run_controller_round (reached via run_ablation_round,
+    the real walk-forward harness entry point) must route taker fills
+    through the genuine submit->PENDING_DELAY->resolve_pending lifecycle,
+    not resolve them synchronously at submit_ts. Proven by spying on
+    ExecutionSimulator.resolve_pending and asserting every call only ever
+    happens at or after that order's own matched_ts, with matched_ts
+    genuinely later than submit_ts - the exact invariant the previous
+    (buggy) execute_taker violated by resolving unconditionally inline."""
+    from unittest.mock import patch
+
+    import xamarinbot.execution.simulator as simulator_mod
+
+    store, results = eval_dataset
+    exec_cfg = ExecutionConfig(taker_delay_ms=250.0)
+    spec = next(s for s in MANDATORY_ABLATIONS if s.name == "6_portfolio_control_taker_only")
+
+    calls = []
+    real_resolve = simulator_mod.ExecutionSimulator.resolve_pending
+
+    def spy(self, order, result, now_ts):
+        calls.append((order.submit_ts, result.matched_ts, now_ts))
+        return real_resolve(self, order, result, now_ts)
+
+    with patch.object(simulator_mod.ExecutionSimulator, "resolve_pending", spy):
+        for r in results:
+            run_ablation_round(spec, store, r.round_id, r.p0, r.outcome, feature_cfg, fee_config, exec_cfg, trained_model, None)
+
+    assert calls, "expected at least one delayed taker order to be resolved via resolve_pending"
+    for submit_ts, matched_ts, now_ts in calls:
+        assert matched_ts > submit_ts  # genuinely delayed, not an immediate no-op resolve
+        assert now_ts >= matched_ts  # never resolved before its own matched_ts arrives
+
+
 def test_supervisor_receives_recomputed_economics_not_placeholders(eval_dataset, feature_cfg, fee_config, exec_cfg, trained_model):
     """Phase 12B audit item 12/18 regression: `_run_controller_round`
     previously called `supervisor.review_order` with a hardcoded
@@ -333,6 +369,14 @@ def test_parameter_stability_across_windows_uses_only_validate_rounds_never_test
     windows = rolling_windows(round_ids, n_train=1, n_validate=1, n_test=1)
     assert windows, "expected at least one window from 6 rounds at size 1/1/1"
 
+    # Phase 12B Tranche 1.1 item 3: each window sweeps using its own
+    # frozen calibrated model, not one externally-shared model - build
+    # that per-window artifact map the same way the real demo does.
+    window_artifacts = {
+        w.window_index: fit_window_artifacts(w, results, store, feature_cfg, [COMBINED_LEAD_LAG], LeakageTrace())
+        for w in windows
+    }
+
     calls: list[set[str]] = []
     real_sweep = sensitivity_mod.sweep_parameter
 
@@ -343,7 +387,10 @@ def test_parameter_stability_across_windows_uses_only_validate_rounds_never_test
     sensitivity_mod.sweep_parameter = spy
     try:
         base_cfg = OneStepConfig(g_min=-100.0, spend_cap=200.0, position_limit=200.0, edge_min=0.0)
-        parameter_stability_across_windows("edge_min", [0.0, 1.0], base_cfg, COMBINED_LEAD_LAG, windows, store, results, feature_cfg, fee_config, exec_cfg, trained_model)
+        parameter_stability_across_windows(
+            "edge_min", [0.0, 1.0], base_cfg, COMBINED_LEAD_LAG, windows, window_artifacts,
+            store, results, feature_cfg, fee_config, exec_cfg,
+        )
     finally:
         sensitivity_mod.sweep_parameter = real_sweep
 
@@ -378,8 +425,8 @@ def test_parameter_stability_reports_instability_when_argmax_differs_per_window(
         from xamarinbot.optimizer.config import OneStepConfig
 
         result = parameter_stability_across_windows(
-            "edge_min", [0.0, 1.0], OneStepConfig(g_min=-100.0), COMBINED_LEAD_LAG, windows,
-            EventStore(":memory:"), all_rounds, FeatureConfig(), FeeConfig(), ExecutionConfig(), None,
+            "edge_min", [0.0, 1.0], OneStepConfig(g_min=-100.0), COMBINED_LEAD_LAG, windows, {},
+            EventStore(":memory:"), all_rounds, FeatureConfig(), FeeConfig(), ExecutionConfig(),
         )
     assert result.window_best_values == (0.0, 1.0)
     assert result.stable is False

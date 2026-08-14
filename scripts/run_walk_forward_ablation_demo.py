@@ -59,19 +59,38 @@ def main() -> None:
 
     print(f"\nRunning {len(MANDATORY_ABLATIONS)} mandatory ablations (SS20.1) across {len(windows)} window(s)'"
           " own TEST segments, each window fitting/calibrating its own model from only its own TRAIN/VALIDATE rounds...")
-    window_round_results, trace = run_walk_forward_ablations(
+    window_round_results, traces = run_walk_forward_ablations(
         store, results, windows, feature_cfg, fee_config, exec_cfg, MANDATORY_ABLATIONS
     )
 
     # No-leakage sanity check, printed plainly rather than only asserted in
-    # tests - Phase 12B audit item 4's explicit ask.
-    all_test_ids = {rid for w in windows for rid in w.test_round_ids}
-    leakage_clean = (
-        trace.model_fit_round_ids.isdisjoint(all_test_ids)
-        and trace.calibrator_fit_round_ids.isdisjoint(all_test_ids)
-        and trace.transition_fit_round_ids.isdisjoint(all_test_ids)
-    )
-    print(f"No-leakage check (model/calibrator/transition fit never touched a TEST round_id): {'PASS' if leakage_clean else 'FAIL'}")
+    # tests - Phase 12B audit item 4's explicit ask. Checked PER WINDOW
+    # (Phase 12B Tranche 1.1 item 4): a round that was one window's TEST
+    # round is explicitly allowed to become a LATER window's TRAIN/VALIDATE
+    # round (windows.py's own documented reuse), so pooling every window's
+    # fit/calibrator/transition round_ids together and checking disjointness
+    # against every window's test round_ids pooled together would flag that
+    # legitimate reuse as a false leak. Each window's own trace is checked
+    # only against that same window's own train/validate/test round_ids.
+    leakage_clean = True
+    for window in windows:
+        trace = traces.get(window.window_index)
+        if trace is None:
+            continue
+        train_ids = set(window.train_round_ids)
+        validate_ids = set(window.validate_round_ids)
+        test_ids = set(window.test_round_ids)
+        window_clean = (
+            train_ids.isdisjoint(validate_ids)
+            and train_ids.isdisjoint(test_ids)
+            and validate_ids.isdisjoint(test_ids)
+            and trace.model_fit_round_ids.isdisjoint(test_ids)
+            and trace.calibrator_fit_round_ids.isdisjoint(test_ids)
+            and trace.transition_fit_round_ids.isdisjoint(test_ids)
+        )
+        leakage_clean = leakage_clean and window_clean
+    print(f"No-leakage check (per window: TRAIN/VALIDATE/TEST disjoint, model/calibrator/transition fit never touched "
+          f"that window's own TEST round_id): {'PASS' if leakage_clean else 'FAIL'}")
 
     by_ablation: dict[str, list] = {}
     for wr in window_round_results:
@@ -83,25 +102,30 @@ def main() -> None:
     print()
     print(format_ablation_matrix(summaries))
 
-    print("\nSweeping edge_min on ablation #5's config, evaluated on window 0's own TEST rounds "
-          "using window 0's own frozen model (not a separately-trained global one)...")
+    print("\nFitting each window's own frozen calibrated model for the edge_min sensitivity/stability analysis below "
+          "(Phase 12B Tranche 1.1 item 3 - never one externally-shared model reused across windows)...")
     base_spec = next(s for s in MANDATORY_ABLATIONS if s.name == "5_lead_lag_clob_no_repair")
-    window_0_trace = LeakageTrace()
-    window_0_artifacts = fit_window_artifacts(windows[0], results, store, feature_cfg, [base_spec.feature_set], window_0_trace)
-    window_0_model = window_0_artifacts.models_by_feature_set[base_spec.feature_set.name]
-    test_rounds_0 = [r for r in results if r.round_id in set(windows[0].test_round_ids)]
-    sens = sweep_parameter("edge_min", [0.0, 0.5, 2.0, 10.0], base_spec.one_step_cfg, base_spec.feature_set, store, test_rounds_0, feature_cfg, fee_config, exec_cfg, window_0_model)
+    window_artifacts = {}
+    for window in windows:
+        window_artifacts[window.window_index] = fit_window_artifacts(
+            window, results, store, feature_cfg, [base_spec.feature_set], LeakageTrace()
+        )
+
+    print("\nSweeping edge_min on ablation #5's config, evaluated on window 0's own VALIDATE rounds "
+          "using window 0's own frozen model (Phase 12B Tranche 1.1 item 2 - never window 0's TEST rounds; "
+          "parameters must be locked before the test segment is ever touched)...")
+    window_0_model = window_artifacts[0].models_by_feature_set[base_spec.feature_set.name]
+    validate_rounds_0 = [r for r in results if r.round_id in set(windows[0].validate_round_ids)]
+    sens = sweep_parameter("edge_min", [0.0, 0.5, 2.0, 10.0], base_spec.one_step_cfg, base_spec.feature_set, store, validate_rounds_0, feature_cfg, fee_config, exec_cfg, window_0_model)
     print()
     print(format_sensitivity(sens))
 
-    print("\nChecking parameter stability across all windows (each window's own TEST rounds, each window's own model)...")
-    # parameter_stability_across_windows evaluates on validate_round_ids
-    # by its own design (locking parameters before the test segment, per
-    # Roadmap Phase 11) - reusing window 0's model here is an approximation
-    # for this demo's stability check specifically, not a claim that every
-    # window shares one model; the ablation matrix above is what actually
-    # exercises the full per-window fit/calibrate/freeze/test cycle.
-    stab = parameter_stability_across_windows("edge_min", [0.0, 0.5, 2.0, 10.0], base_spec.one_step_cfg, base_spec.feature_set, windows, store, results, feature_cfg, fee_config, exec_cfg, window_0_model)
+    print("\nChecking parameter stability across all windows (each window's own VALIDATE rounds, each window's own "
+          "frozen calibrated model - Phase 12B Tranche 1.1 item 3)...")
+    stab = parameter_stability_across_windows(
+        "edge_min", [0.0, 0.5, 2.0, 10.0], base_spec.one_step_cfg, base_spec.feature_set, windows,
+        window_artifacts, store, results, feature_cfg, fee_config, exec_cfg,
+    )
     print()
     print(format_stability(stab))
 

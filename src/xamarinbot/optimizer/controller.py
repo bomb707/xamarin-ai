@@ -72,7 +72,7 @@ class OneStepController:
         # min_marginal_edge at all, in which case there is nothing to
         # generate for that side this decision.
         if SeedAction.TAKER_UP in permitted_actions and book_up is not None and book_up.asks:
-            sizing = taker_sizing_boundaries(book_up.asks, q, self.fee_config, self.cfg, portfolio, portfolio.U)
+            sizing = taker_sizing_boundaries(book_up.asks, q, self.fee_config, self.cfg, portfolio, Side.UP)
             if sizing.p_max is not None:
                 for qty in sizing.quantities:
                     idx += 1
@@ -84,7 +84,7 @@ class OneStepController:
                     )
 
         if SeedAction.TAKER_DOWN in permitted_actions and book_down is not None and book_down.asks:
-            sizing = taker_sizing_boundaries(book_down.asks, 1.0 - q, self.fee_config, self.cfg, portfolio, portfolio.D)
+            sizing = taker_sizing_boundaries(book_down.asks, 1.0 - q, self.fee_config, self.cfg, portfolio, Side.DOWN)
             if sizing.p_max is not None:
                 for qty in sizing.quantities:
                     idx += 1

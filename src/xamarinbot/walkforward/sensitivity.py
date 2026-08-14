@@ -24,6 +24,7 @@ from xamarinbot.model.logistic import LogisticModel
 from xamarinbot.optimizer.config import OneStepConfig
 from xamarinbot.portfolio.state import FeeConfig, Side
 from xamarinbot.walkforward.ablations import AblationSpec, RoundResult, run_ablation_round
+from xamarinbot.walkforward.pipeline import WindowArtifacts
 from xamarinbot.walkforward.windows import WalkForwardWindow
 
 
@@ -108,22 +109,34 @@ def parameter_stability_across_windows(
     base_cfg: OneStepConfig,
     feature_set: FeatureSet,
     windows: list[WalkForwardWindow],
+    window_artifacts: dict[int, WindowArtifacts],
     store: EventStore,
     all_rounds: list,  # list[SyntheticRoundResult] covering every round_id referenced by `windows`
     feature_cfg: FeatureConfig,
     fee_config: FeeConfig,
     exec_cfg: ExecutionConfig,
-    model: LogisticModel | CalibratedModel | None,
 ) -> StabilityResult:
     """Per Roadmap Phase 11: "Lock parameters before each test segment" -
     the sweep here uses each window's *validate* rounds only (never test),
     matching that discipline; `test_walkforward.py`'s "no test-period
-    tuning" check asserts this same separation holds."""
+    tuning" check asserts this same separation holds.
+
+    `window_artifacts` maps each window's own `window_index` to that
+    window's own frozen `WindowArtifacts` (from `fit_window_artifacts`) -
+    Phase 12B Tranche 1.1 item 3: this function previously took a single
+    externally-supplied `model` and reused that *one* model for every
+    window's sweep, which is not per-window parameter stability, it's one
+    model's sensitivity measured on several different data slices. Each
+    window must sweep using its own calibrated q-model, fit only from
+    that window's own TRAIN rounds and calibrated on that window's own
+    internal calibration split - never one shared global model."""
     window_best: list[float] = []
     for window in windows:
         validate_rounds = _rounds_for_ids(all_rounds, window.validate_round_ids)
         if not validate_rounds:
             continue
+        artifacts = window_artifacts.get(window.window_index)
+        model = artifacts.models_by_feature_set.get(feature_set.name) if artifacts is not None else None
         result = sweep_parameter(parameter_name, values, base_cfg, feature_set, store, validate_rounds, feature_cfg, fee_config, exec_cfg, model)
         window_best.append(result.best_value)
 

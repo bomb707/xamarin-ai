@@ -151,8 +151,49 @@ def evaluate_constraints(
 
 
 def max_directional_spend(g_current: float, g_min: float) -> float:
-    """Maximum directional risk-budget spend: K(x) <= G_current - G_min."""
+    """Maximum directional risk-budget spend: K(x) <= G_current - G_min.
+
+    Phase 12B Tranche 1.1 item 5: this is an EXACT boundary only in the
+    special case where buying more of `side` does not change
+    `min(U, D)` - i.e. `side` is already the non-minimum ("overrepresented")
+    side, so `G_side(x) = G_current - K_side(x)` collapses to this flat
+    per-dollar budget. It is NOT a universal quantity boundary: when
+    `side` is currently the *minimum* side, buying it raises `min(U, D)`
+    itself as `x` grows, and this flat formula understates how much can
+    safely be bought (see the regression case in
+    `test_taker_sizing_uses_exact_side_aware_g_when_buying_the_underrepresented_side`:
+    U=0, D=100, C=50, g_min=-100 - this formula caps spend at $100
+    although buying 100 UP shares at ~$0.5175/share all-in is actually
+    risk-feasible, since it also raises `min(U,D)` from 0 toward 100).
+    Use `directional_projected_g` for the exact, side-aware formula that
+    holds in every case; `optimizer/candidates.py::taker_sizing_boundaries`
+    is the source of truth for taker quantity feasibility and does not use
+    this function."""
     return g_current - g_min
+
+
+def directional_projected_g(u: float, d: float, c: float, side: Side, x: float, k_x: float) -> float:
+    """Exact side-aware projected worst-case settlement margin after
+    buying `x` additional shares on `side` at cumulative (fee-inclusive)
+    cost `k_x`, replacing `max_directional_spend`'s flat
+    `G_current - g_min` budget (only exact when `side` is already the
+    non-minimum side - see that function's docstring) with the general
+    formula, exact for every portfolio state (Phase 12B Tranche 1.1
+    item 5):
+
+        G_U(x) = min(U+x, D) - [C + K_U(x)]
+        G_D(x) = min(U, D+x) - [C + K_D(x)]
+
+    Proof this matches the existing, tested `G = min(U,D) - C` kernel: for
+    a one-sided UP fill, `U' = U+x`, `D' = D`, `C' = C + K_U(x)`, so
+    `G' = min(U',D') - C' = min(U+x,D) - (C+K_U(x))` exactly, by
+    definition - no new kernel, just the existing one evaluated at the
+    post-fill state (same method already used for `directional_projected_g`'s
+    one-sided BUFFER_BUILD sibling, `ΔG_U(x)`, in the Phase 12B audit's
+    Addendum F-H)."""
+    if side is Side.UP:
+        return min(u + x, d) - (c + k_x)
+    return min(u, d + x) - (c + k_x)
 
 
 def min_hedge_quantity(l_max: float, pi_down: float, c_d: float) -> float:
