@@ -4,11 +4,11 @@ Tracks implementation status against the two source specs:
 - `Xamarinbot_V2_Detailed_Development_Roadmap.docx` ("Roadmap")
 - `Xamarinbot_V2_Detailed_Strategy_and_Mathematical_Model.docx` ("Strategy")
 
-This build covers **Roadmap Phases 0-9** (the foundation layers the roadmap
-itself says must exist before any predictive complexity, per its "Roadmap
-principle" and SS22.1 "Recommended immediate next sprint"). Phases 10-14 are
-**not implemented** - they are listed below as explicitly future work, not
-silently dropped.
+This build covers **Roadmap Phases 0-10** (the foundation layers the
+roadmap itself says must exist before any predictive complexity, per its
+"Roadmap principle" and SS22.1 "Recommended immediate next sprint").
+Phases 11-14 are **not implemented** - they are listed below as explicitly
+future work, not silently dropped.
 
 ## Implemented
 
@@ -24,8 +24,9 @@ silently dropped.
 | Phase 7 - Order-Book and Execution Simulator | Done | [execution/](../src/xamarinbot/execution/). `walk_depth` builds the taker cost curve over real multi-level `BookSnapshot` depth (reused from Phase 1, not reinvented) with FAK partial-fill semantics falling out naturally - whatever isn't filled by the walk simply isn't, no resting remainder. The 250ms delay model requires the *caller* to supply the book at both submission and revalidation time (from causal replay), correctly modeling "revalidation/repricing risk" without the *strategy* seeing future data - only the simulated exchange does, exactly as a real matching engine would. `OrderState` is a real lifecycle state machine (`PENDING_DELAY -> OPEN/PARTIALLY_FILLED -> FILLED/CANCELED`); a real bug here (fills were applied eagerly at submission regardless of delay, silently defeating the pending-delay-no-cancel behavior) is documented below. The maker fill-probability/adverse-selection model (`rho(p,h)`, `q_fill`) is explicitly an uncalibrated placeholder - no real fill data exists to estimate it from (Roadmap's own step: "Estimate q_fill / maker adverse selection from historical fills" - not possible yet). Stochastic maker fills reuse Phase 2's `seeded_random` for reproducibility, exactly the use case it was built for. |
 | Phase 8 - One-Step Semi-Controlled Optimizer | Done | [optimizer/](../src/xamarinbot/optimizer/). `CandidateAction` matches Strategy doc SS23.3's interface almost verbatim. One EV formula (`EV_after = q*delta_U + (1-q)*delta_D - delta_C`) is used for every candidate, alpha or hedge, taker or maker - it reduces exactly to SS13's `DeltaEV_U`/`DeltaEV_D` for a certain taker fill and to SS14's maker EV core term once weighted by fill probability and evaluated with `q_fill` (Phase 7's adverse-selection adjustment) instead of raw `q`, rather than several ad hoc formulas per candidate type. Hard-constraint rejection reuses Phase 3's `evaluate_constraints` directly (not reimplemented) via a real `FillSimulationResult`; maker candidates are checked against their *if-filled* portfolio, conservatively, per SS16's "projected fill would push G below G_min -> Cancel/shrink." WAIT is always present and always valid, the guaranteed fallback. **Both roadmap-named verification items are automated**: `tests/test_optimizer.py`'s Hypothesis stress test (200 random portfolio/book/q combinations) asserts the chosen candidate never has `g_after` below `g_min` (accounting for the edge case where the *starting* portfolio is already below an unreachable `g_min` - no action, including WAIT, can fix that; see the test), and `scripts/run_one_step_controller_demo.py` runs the controller against the Phase 0 baseline over an identical causal replay. |
 | Phase 9 - Proactive Maker/Taker Place-Cancel-Replace | Done | [supervisor/](../src/xamarinbot/supervisor/). `OrderSupervisor` is a thin policy layer over Phase 7's `OrderState` mechanics: it never computes EV/G itself (the caller re-evaluates each tracked order via Phase 8's `evaluate_maker_candidate` and passes the numbers in), keeping it a single, testable place implementing Strategy doc SS16's trigger table (edge failure, regime flip, risk breach, time compression, feed staleness -> cancel; book displacement -> replace, gated by a churn threshold) rather than duplicating EV math a second time. **All four roadmap-named verification scenarios are direct tests**: rapid regime flip (plus its rate-limiting counterpart - a *second* flip inside the minimum action interval must not thrash), partial fill then cancel (the partial fill survives, only the remainder is canceled), tick-size change with an open order (a `REPLACE` after a tick-size change prices on the new grid, not the stale one), and feed-stale-while-resting (cancels regardless of how good the order otherwise looks - checked first, before every other trigger). Cancel-regret analytics (`reports/supervisor_report.py`) are explicitly post-hoc-only, using a documented approximation (did the touch price cross the canceled order's price afterward) rather than a full counterfactual fill simulation. |
+| Phase 10 - Short-Horizon MPC | Done | [mpc/](../src/xamarinbot/mpc/). `MPCController` is a generalization of Phase 8's `OneStepController`, not a parallel implementation - at `horizon_steps<=1` it must (and does, exactly, bit-for-bit) reduce to a plain one-step decision. Continuation value at each hypothetical future state is estimated by recursively calling the greedy one-step policy itself (a standard rollout-policy approximation), over a small discrete scenario tree that evolves only `GapRegime` (not the full 54-state `RegimeState`) using a transition model estimated from Phase 6's own `RegimeTransition` records over a causal replay - "historical state transitions," synthetic for now. **All three roadmap-named verification items are direct tests**: degenerate-horizon equivalence (checked across several states/portfolios, not just one), timeout fallback (a zero time budget forces the plain one-step decision), and scenario-probability sanity checks (every state's next-state distribution sums to 1.0 and is bounded in [0,1], including the top-k-truncation-then-renormalize path). A real bug turned up mid-build: continuation projections initially reused the *undepleted* original book at every step, so a large taker fill's continuation value double-counted the exact liquidity it had just consumed - fixed by depleting the relevant side's book by the chosen candidate's fill before recursing, with a dedicated regression test. |
 
-Supporting pieces built to make Phases 0-9 demonstrable end-to-end:
+Supporting pieces built to make Phases 0-10 demonstrable end-to-end:
 - `journal/` - SS20 schema (all entities declared; market_config, feed_event,
   portfolio_state, order_event, fill, settlement, audit, and now
   feature_state are populated).
@@ -47,11 +48,13 @@ Supporting pieces built to make Phases 0-9 demonstrable end-to-end:
 - `reports/execution_report.py` - the Phase 7 taker slippage/delay report.
 - `reports/supervisor_report.py` - the Phase 9 cancel/replace analytics
   (action/reason counts, cancel regret rate).
+- `reports/mpc_report.py` - the Phase 10 controller latency benchmark
+  (p50/p95/p99/max, fallback rate).
 - `scripts/run_baseline_replay.py`, `scripts/run_feature_engine_demo.py`,
   `scripts/run_model_training_demo.py`, `scripts/run_regime_classifier_demo.py`,
   `scripts/run_execution_simulator_demo.py`, `scripts/run_one_step_controller_demo.py`,
-  `scripts/run_order_supervisor_demo.py` - wire the above into seven
-  end-to-end causal pipelines you can run today.
+  `scripts/run_order_supervisor_demo.py`, `scripts/run_mpc_controller_demo.py` -
+  wire the above into eight end-to-end causal pipelines you can run today.
   `run_baseline_replay.py` still simplifies fills to same-tick-at-decision-
   price - it predates Phase 7 and was never retrofitted with
   `ExecutionSimulator`, unlike `run_one_step_controller_demo.py` and
@@ -67,6 +70,7 @@ PYTHONPATH=src python scripts/run_regime_classifier_demo.py [n_rounds]
 PYTHONPATH=src python scripts/run_execution_simulator_demo.py [n_rounds]
 PYTHONPATH=src python scripts/run_one_step_controller_demo.py [n_eval_rounds]
 PYTHONPATH=src python scripts/run_order_supervisor_demo.py [n_eval_rounds]
+PYTHONPATH=src python scripts/run_mpc_controller_demo.py [n_eval_rounds]
 ```
 Tests: `PYTHONPATH=src pytest -q` (or `pip install -e .[dev]` first)
 
@@ -74,13 +78,12 @@ Tests: `PYTHONPATH=src pytest -q` (or `pip install -e .[dev]` first)
 
 | Phase | What it needs |
 |---|---|
-| Phase 10 - Short-Horizon MPC | Scenario tree, receding-horizon optimization, latency-bounded fallback. |
 | Phase 11 - Walk-Forward Calibration and Ablations | Requires Phases 4-10 plus **real historical data** (see below). |
 | Phase 12 - Shadow / Paper Trading | Requires live feeds (Phase 1's real adapters, verified) running continuously. |
 | Phase 13 - Limited Live Rollout | Requires Phase 12 passing its exit gate, plus a funded, authenticated Polymarket account. **Do not attempt without explicit, deliberate operator sign-off** - this phase risks real capital. |
 | Phase 14 - Adaptive Optimization | Requires an accumulated live/shadow event log to calibrate against. |
 
-## Known reconstruction gaps (Phase 0 baseline, Phase 4 features, Phase 5 model, Phase 6 regime, Phase 7 execution, Phase 8 optimizer, Phase 9 supervisor)
+## Known reconstruction gaps (Phase 0 baseline, Phase 4 features, Phase 5 model, Phase 6 regime, Phase 7 execution, Phase 8 optimizer, Phase 9 supervisor, Phase 10 MPC)
 
 The source docs describe some behaviors *narratively*, not with exact
 formulas. This build's choices are documented at the point of
@@ -200,9 +203,44 @@ implementation and repeated here for visibility:
     answer precisely; this build approximates it as "did the touch price
     cross the canceled order's price within a lookback window afterward,"
     documented in the module docstring as a proxy, not a fill simulation.
+17. **Scenario tree evolves GapRegime only, not full state** ([mpc/scenario.py](../src/xamarinbot/mpc/scenario.py)) -
+    SS15's `X_(t+dt) = F(X_t, A_t, W_t)` is a general stochastic state
+    transition; this build's "small discrete scenario tree" (the Roadmap's
+    own phrasing) only evolves the 6-state `GapRegime`, holding CLOB/spot
+    direction, the order book's price levels, and `q` fixed across
+    continuation steps (the book's *depth* does deplete with consumption -
+    see the bug below - but its prices don't move). A full 54-state
+    `RegimeState` chain, or a book-price evolution model, would need far
+    more transition data than a dataset this size can estimate reliably.
+18. **Continuation policy is the greedy one-step policy, not a second
+    search** ([mpc/controller.py](../src/xamarinbot/mpc/controller.py)) -
+    a standard rollout-policy approximation for the "optimize a short
+    action sequence" step, not literal backward-induction dynamic
+    programming over all action sequences; explicitly what "Recommended
+    first implementation: one-step / short-horizon MPC with discrete
+    candidate actions" describes rather than a fuller search.
+19. **Maker continuation uses the if-filled portfolio** ([mpc/controller.py](../src/xamarinbot/mpc/controller.py)) -
+    same simplification as Phase 8's maker candidates (#14 above),
+    inherited here since continuation reuses Phase 8's evaluation; the
+    immediate EV used for candidate *selection* still correctly
+    probability-weights the fill.
 
 None of these gaps affect the Phase 3 math kernel, which implements the
 source docs' formulas exactly.
+
+**Phase 10 demo finding worth flagging**: in `run_mpc_controller_demo.py`,
+MPC chose differently than plain one-step in 0/888 sampled decisions. This
+isn't the mechanism being inert - unit tests directly construct scenarios
+where it changes the ranking (`test_nonzero_churn_penalty_favors_consolidating_into_fewer_actions`)
+- it's that real decision points in this dataset almost always offer
+either zero or exactly two non-WAIT alternatives (a histogram check found
+835/888 decisions had only WAIT valid, 53/888 had exactly WAIT plus two
+MAKER price offsets), and those two candidates have a monotonic EV
+relationship that a mostly-self-persisting regime (~90-95% per the
+transition model) rarely reorders. A richer candidate set - more price/
+quantity options, or real data where regimes don't correlate so strongly
+with a single dominant signal - would be needed to see organic divergence
+in the demo itself, not just in a targeted unit test.
 
 **Phase 9 demo finding worth flagging**: in `run_order_supervisor_demo.py`,
 100% of placed maker orders get canceled via `REGIME_FLIP` before ever
@@ -247,7 +285,7 @@ relative to simpler baselines") exists to catch - real historical data,
 where TWAP isn't definitionally the whole story, is needed before this
 comparison means anything about real edge.
 
-## Notable bugs caught during Phase 0/4/5/7/8/9 build-out (fixed, worth knowing about)
+## Notable bugs caught during Phase 0/4/5/7/8/9/10 build-out (fixed, worth knowing about)
 
 Building each phase exercised the previous phases' pipeline far more
 heavily than their own build-out did, and surfaced real bugs versus just
@@ -310,6 +348,22 @@ reported to the user in earlier sessions:
   `CANCEL` branch happened to pass all three positional args, so this went
   unnoticed until a test hit the one branch that didn't. Fixed by giving
   `reason` a default of `None`.
+- **(Phase 10)** Continuation rollouts re-walked the *original, undepleted*
+  order book at every step, so a large taker fill's continuation value
+  double-counted the exact liquidity it had just consumed - it looked like
+  a modeling nuance ("book held fixed across the horizon") until a smoke
+  test showed two candidates with clearly different immediate EVs (91.25
+  vs 213.15) landing on the *exact same* total sequence value (304.396):
+  the continuation step was re-buying the same cheap depth a second time,
+  as if it refilled with zero latency inside a single 1-3s horizon step -
+  precisely what Phase 7's delay/depth-walking machinery exists to rule
+  out. Fixed by depleting the relevant side's book by the chosen
+  candidate's `expected_fill` before recursing into the next level, with
+  `test_continuation_does_not_double_count_consumed_liquidity` guarding
+  against a regression. After the fix, splitting a purchase across "now"
+  and "later" correctly ties in total value under zero churn cost (a
+  separate, genuine finding - see "Known reconstruction gaps" and the demo
+  finding above), rather than the split option being inflated.
 
 - The order book generator recomputed "the previous tick's ask price" from
   a formula that mixed the current tick's TWAP with the previous tick's
