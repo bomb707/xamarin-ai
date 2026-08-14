@@ -20,18 +20,21 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from xamarinbot.baseline.config import BaselineConfig
+from xamarinbot.baseline.inputs import elapsed_t
 from xamarinbot.baseline.strategy import BaselineInputs, decide as baseline_decide
 from xamarinbot.events.replay import ReplayClock
 from xamarinbot.events.store import EventStore
+from xamarinbot.events.types import EventType
 from xamarinbot.execution.config import ExecutionConfig
 from xamarinbot.execution.simulator import ExecutionSimulator
 from xamarinbot.features.config import FeatureConfig
 from xamarinbot.features.engine import compute
 from xamarinbot.features.types import FeatureVector
-from xamarinbot.feeds.mock import MockBookFeed, MockFeedCursor
+from xamarinbot.feeds.mock import MockBookFeed, MockFeedCursor, MockSpotFeed, MockTWAPFeed
+from xamarinbot.model.calibrated import fit_calibrated_model
 from xamarinbot.model.dataset import build_examples_multi
 from xamarinbot.model.features import COMBINED_LEAD_LAG
-from xamarinbot.model.logistic import fit_logistic_regression
+from xamarinbot.model.walkforward import time_ordered_split
 from xamarinbot.optimizer.config import OneStepConfig
 from xamarinbot.optimizer.controller import OneStepController
 from xamarinbot.optimizer.types import OrderMode
@@ -44,25 +47,38 @@ N_TRAIN_ROUNDS = 15
 
 
 def train_q_model(feature_cfg: FeatureConfig):
+    # Phase 12B audit item 5/C: fit on train, calibrate (Platt) on a
+    # disjoint validation slice.
     train_store = EventStore(":memory:")
     train_results = generate_synthetic_dataset(train_store, n_rounds=N_TRAIN_ROUNDS)
     by_fs = build_examples_multi(train_store, train_results, feature_cfg, [COMBINED_LEAD_LAG], heartbeat_s=HEARTBEAT_S)
     examples = by_fs[COMBINED_LEAD_LAG.name]
-    X = [e.x for e in examples]
-    y = [e.y for e in examples]
-    return fit_logistic_regression(X, y, COMBINED_LEAD_LAG.name, COMBINED_LEAD_LAG.column_names)
+    split = time_ordered_split(examples, train_frac=0.6, val_frac=0.2)
+    return fit_calibrated_model(split.train, split.validation, COMBINED_LEAD_LAG)
 
 
-def run_baseline_round(store, round_id, p0, cfg: BaselineConfig, fee_config: FeeConfig) -> PortfolioState:
+def run_baseline_round(store, round_id, p0, cfg: BaselineConfig, fee_config: FeeConfig, exec_cfg: ExecutionConfig) -> PortfolioState:
+    """Phase 12B Tranche 1: this local copy had the exact same two bugs
+    fixed in `walkforward/ablations.py::_run_baseline_round` (spot_prev
+    always equal to spot; absolute decision_ts passed as elapsed round
+    time) plus the same full-fill-at-limit-price execution shortcut -
+    discovered while smoke-testing that fix's demo output showed this
+    script's baseline still trading zero rounds. Fixed identically here,
+    via the same shared `elapsed_t()` helper and `ExecutionSimulator.execute_taker`."""
     events = store.all_events(round_id)
     clock = ReplayClock(store, round_id)
     cursor = MockFeedCursor(store, round_id, preloaded=events)
-    from xamarinbot.feeds.mock import MockSpotFeed, MockTWAPFeed
-
     twap_feed, spot_feed, book_feed = MockTWAPFeed(cursor), MockSpotFeed(cursor), MockBookFeed(cursor)
     portfolio = PortfolioState()
-    prev_cursor = MockFeedCursor(store, round_id, preloaded=events)
-    prev_book_feed = MockBookFeed(prev_cursor)
+    prev_clob_cursor = MockFeedCursor(store, round_id, preloaded=events)
+    prev_book_feed = MockBookFeed(prev_clob_cursor)
+    prev_spot_cursor = MockFeedCursor(store, round_id, preloaded=events)
+    prev_spot_feed = MockSpotFeed(prev_spot_cursor)
+    sim = ExecutionSimulator(round_id, fee_config, exec_cfg)
+    order_seq = 0
+
+    market_config = next(e.payload for e in events if e.event_type is EventType.MARKET_CONFIG)
+    round_start_ts = market_config["start_ts"]
 
     for decision_ts in clock.decision_points(heartbeat=HEARTBEAT_S):
         cursor.advance_to(decision_ts)
@@ -73,22 +89,30 @@ def run_baseline_round(store, round_id, p0, cfg: BaselineConfig, fee_config: Fee
         book_down = book_feed.get_snapshot(round_id, Side.DOWN)
         if book_up is None or not book_up.best_bid or not book_up.best_ask:
             continue
-        prev_cursor.advance_to(decision_ts - cfg.clob_lookback_s)
+        prev_clob_cursor.advance_to(decision_ts - cfg.clob_lookback_s)
         prev_book_up = prev_book_feed.get_snapshot(round_id, Side.UP)
         mid = (book_up.best_bid.price + book_up.best_ask.price) / 2.0
         mid_prev = ((prev_book_up.best_bid.price + prev_book_up.best_ask.price) / 2.0) if prev_book_up and prev_book_up.best_bid and prev_book_up.best_ask else mid
 
+        prev_spot_cursor.advance_to(decision_ts - cfg.spot_lookback_s)
+        prev_spot_obs = prev_spot_feed.get_latest(round_id)
+        spot_prev = prev_spot_obs.value if prev_spot_obs is not None else spot_obs.value
+
         inputs = BaselineInputs(
-            t=decision_ts, p0=p0, twap=twap_obs.value, clob_mid=mid, clob_mid_prev=mid_prev,
-            spot=spot_obs.value, spot_prev=spot_obs.value,
+            t=elapsed_t(decision_ts, round_start_ts), p0=p0, twap=twap_obs.value, clob_mid=mid, clob_mid_prev=mid_prev,
+            spot=spot_obs.value, spot_prev=spot_prev,
             best_ask_up=book_up.best_ask.price, best_ask_down=book_down.best_ask.price if book_down and book_down.best_ask else None,
             is_fresh=True,
         )
         result = baseline_decide(inputs, portfolio.U, portfolio.D, portfolio.C, cfg)
         if result.order is not None:
-            fee = fee_config.fee_for(result.order.role, result.order.quantity, result.order.price)
-            fill = Fill(result.order.side, result.order.price, result.order.quantity, result.order.role, fee)
-            portfolio = apply_fill(portfolio, fill)
+            order_seq += 1
+            book = book_up if result.order.side is Side.UP else book_down
+            asks = book.asks if book is not None else ()
+            _, taker_result = sim.execute_taker(f"{round_id}-o{order_seq}", result.order.side, result.order.quantity, result.order.price, asks, decision_ts)
+            if taker_result.walk.filled_shares > 0:
+                fill = Fill(result.order.side, taker_result.walk.avg_price, taker_result.walk.filled_shares, result.order.role, taker_result.walk.total_fee)
+                portfolio = apply_fill(portfolio, fill)
     return portfolio
 
 
@@ -130,11 +154,11 @@ def run_one_step_round(store, round_id, p0, feature_cfg, model, one_step_cfg, ex
         if print_sample and not printed and len(decision.candidates) > 2:
             printed = True
             print(f"\n--- Sample candidate table: {round_id} @ t={decision_ts:.0f}s (regime={snapshot.state}, q={q:.3f}) ---")
-            print(f"{'action_id':<14}{'mode':<11}{'side':<6}{'price':>8}{'qty':>9}{'ev_after':>11}{'g_after':>11}  valid")
+            print(f"{'action_id':<14}{'mode':<11}{'side':<6}{'price':>8}{'qty':>9}{'delta_ev':>11}{'g_after':>11}  valid")
             for c in decision.candidates:
                 price_s = f"{c.price:.3f}" if c.price is not None else "-"
                 side_s = c.side.value if c.side else "-"
-                print(f"{c.action_id:<14}{c.mode.value:<11}{side_s:<6}{price_s:>8}{c.qty:>9.1f}{c.ev_after:>11.3f}{c.g_after:>11.3f}  {c.is_valid}")
+                print(f"{c.action_id:<14}{c.mode.value:<11}{side_s:<6}{price_s:>8}{c.qty:>9.1f}{c.delta_ev:>11.3f}{c.g_after:>11.3f}  {c.is_valid}")
             print(f"CHOSEN: {decision.chosen.action_id} ({decision.chosen.mode.value})")
 
         chosen = decision.chosen
@@ -168,14 +192,18 @@ def main() -> None:
 
     print(f"Evaluating baseline vs one-step controller on {n_eval_rounds} held-out rounds...")
     eval_store = EventStore(":memory:")
-    eval_results = generate_synthetic_dataset(eval_store, n_rounds=n_eval_rounds, round_length_s=300.0)
+    # id_offset=N_TRAIN_ROUNDS: genuinely disjoint from training rounds
+    # (Phase 12B audit Addendum A - generate_synthetic_dataset always
+    # restarted at index 0 before this, so "held-out" rounds were
+    # frequently identical to training rounds).
+    eval_results = generate_synthetic_dataset(eval_store, n_rounds=n_eval_rounds, round_length_s=300.0, id_offset=N_TRAIN_ROUNDS)
 
     baseline_pnls, one_step_pnls = [], []
     baseline_trades, one_step_trades = [], []
     g_min_breaches = 0
 
     for i, result in enumerate(eval_results):
-        baseline_portfolio = run_baseline_round(eval_store, result.round_id, result.p0, baseline_cfg, fee_config)
+        baseline_portfolio = run_baseline_round(eval_store, result.round_id, result.p0, baseline_cfg, fee_config, exec_cfg)
         one_step_portfolio, n_actions = run_one_step_round(
             eval_store, result.round_id, result.p0, feature_cfg, model, one_step_cfg, exec_cfg, fee_config, print_sample=(i == 0)
         )

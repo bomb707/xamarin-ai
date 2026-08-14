@@ -30,9 +30,10 @@ from xamarinbot.features.config import FeatureConfig
 from xamarinbot.features.engine import compute
 from xamarinbot.features.types import FeatureVector
 from xamarinbot.feeds.mock import MockBookFeed, MockFeedCursor
+from xamarinbot.model.calibrated import fit_calibrated_model
 from xamarinbot.model.dataset import build_examples_multi
 from xamarinbot.model.features import COMBINED_LEAD_LAG, design_vector
-from xamarinbot.model.logistic import fit_logistic_regression
+from xamarinbot.model.walkforward import time_ordered_split
 from xamarinbot.mpc.config import MPCConfig
 from xamarinbot.mpc.controller import MPCController
 from xamarinbot.mpc.scenario import build_transition_model
@@ -48,11 +49,14 @@ N_TRAIN_ROUNDS = 15
 
 
 def train_q_model(feature_cfg: FeatureConfig):
+    # Phase 12B audit item 5/C: fit on train, calibrate (Platt) on a
+    # disjoint validation slice.
     train_store = EventStore(":memory:")
     train_results = generate_synthetic_dataset(train_store, n_rounds=N_TRAIN_ROUNDS)
     by_fs = build_examples_multi(train_store, train_results, feature_cfg, [COMBINED_LEAD_LAG], heartbeat_s=HEARTBEAT_S)
     examples = by_fs[COMBINED_LEAD_LAG.name]
-    return fit_logistic_regression([e.x for e in examples], [e.y for e in examples], COMBINED_LEAD_LAG.name, COMBINED_LEAD_LAG.column_names)
+    split = time_ordered_split(examples, train_frac=0.6, val_frac=0.2)
+    return fit_calibrated_model(split.train, split.validation, COMBINED_LEAD_LAG)
 
 
 def train_transition_model(feature_cfg: FeatureConfig):
@@ -102,7 +106,10 @@ def main() -> None:
 
     print(f"\nEvaluating MPC vs one-step on {n_eval_rounds} held-out rounds...")
     eval_store = EventStore(":memory:")
-    eval_results = generate_synthetic_dataset(eval_store, n_rounds=n_eval_rounds)
+    # id_offset=N_TRAIN_ROUNDS: disjoint from both the q-model and
+    # transition-model training pools, which both span [0, N_TRAIN_ROUNDS)
+    # (Phase 12B audit Addendum A).
+    eval_results = generate_synthetic_dataset(eval_store, n_rounds=n_eval_rounds, id_offset=N_TRAIN_ROUNDS)
 
     n_decisions = 0
     n_differs = 0

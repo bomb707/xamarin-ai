@@ -41,6 +41,7 @@ from xamarinbot.features.engine import compute
 from xamarinbot.features.types import FeatureVector
 from xamarinbot.feeds.mock import MockBookFeed, MockFeedCursor
 from xamarinbot.model.features import FeatureSet, design_vector
+from xamarinbot.model.calibrated import CalibratedModel
 from xamarinbot.model.logistic import LogisticModel
 from xamarinbot.optimizer.candidates import wait_candidate
 from xamarinbot.optimizer.config import OneStepConfig
@@ -70,7 +71,7 @@ def _record_for(round_id: str, decision_ts: float, chosen: CandidateAction, elap
     return ShadowDecisionRecord(
         round_id=round_id, decision_ts=decision_ts, action_id=chosen.action_id, mode=chosen.mode.value,
         side=chosen.side.value if chosen.side is not None else None, price=chosen.price, qty=chosen.qty,
-        expected_fill=chosen.expected_fill, ev_after=chosen.ev_after, g_after=chosen.g_after,
+        expected_fill=chosen.expected_fill, delta_ev=chosen.delta_ev, g_after=chosen.g_after,
         decide_elapsed_ms=elapsed_ms, missed_deadline=missed, reconnected=reconnected,
     )
 
@@ -85,7 +86,7 @@ class ShadowRunner:
         fee_config: FeeConfig,
         exec_cfg: ExecutionConfig,
         one_step_cfg: OneStepConfig,
-        model: LogisticModel | None,
+        model: LogisticModel | CalibratedModel | None,
         feature_set: FeatureSet | None,
         cfg: ShadowConfig,
         fault: FaultInjector | None = None,
@@ -162,9 +163,16 @@ class ShadowRunner:
             records.append(_record_for(self.round_id, decision_ts, chosen, elapsed_ms, missed, pending_reconnect_ack))
             pending_reconnect_ack = False
 
-            if chosen.mode is OrderMode.FAK and chosen.expected_fill > 0:
-                fee = self.fee_config.taker_fee(chosen.expected_fill, chosen.price)
-                portfolio = apply_fill(portfolio, Fill(chosen.side, chosen.price, chosen.expected_fill, LiquidityRole.TAKER, fee))
+            if chosen.mode is OrderMode.FAK and chosen.qty > 0:
+                # Phase 12B audit items 13/E/L: real submit->resolve
+                # lifecycle, not a direct pre-evaluation-walk-to-Fill
+                # shortcut - see ExecutionSimulator.execute_taker.
+                order_seq += 1
+                asks = book_up.asks if chosen.side is Side.UP else book_down.asks
+                limit_price = chosen.max_execution_price if chosen.max_execution_price is not None else chosen.price
+                _, taker_result = sim.execute_taker(f"{self.round_id}-o{order_seq}", chosen.side, chosen.qty, limit_price, asks, decision_ts)
+                if taker_result.walk.filled_shares > 0:
+                    portfolio = apply_fill(portfolio, Fill(chosen.side, taker_result.walk.avg_price, taker_result.walk.filled_shares, LiquidityRole.TAKER, taker_result.walk.total_fee))
             elif chosen.mode is OrderMode.POST_ONLY:
                 order_seq += 1
                 order_state = sim.submit_maker_order(f"{self.round_id}-o{order_seq}", chosen.side, chosen.qty, chosen.price, decision_ts)

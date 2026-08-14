@@ -18,7 +18,7 @@ class ShadowDecisionRecord:
     price: float | None
     qty: float
     expected_fill: float
-    ev_after: float
+    delta_ev: float
     g_after: float
     decide_elapsed_ms: float
     missed_deadline: bool  # True if decide_elapsed_ms exceeded the configured deadline (SS21 Latency gate)

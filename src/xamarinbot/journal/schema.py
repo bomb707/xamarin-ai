@@ -86,7 +86,7 @@ class CandidateActionRecord:
     side: str
     price: float
     qty: float
-    ev_after: float
+    delta_ev: float
     g_after: float
     pi_u_after: float
     pi_d_after: float

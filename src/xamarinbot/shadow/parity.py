@@ -25,6 +25,7 @@ from xamarinbot.features.engine import compute
 from xamarinbot.features.types import FeatureVector
 from xamarinbot.feeds.mock import MockBookFeed, MockFeedCursor
 from xamarinbot.model.features import FeatureSet, design_vector
+from xamarinbot.model.calibrated import CalibratedModel
 from xamarinbot.model.logistic import LogisticModel
 from xamarinbot.optimizer.config import OneStepConfig
 from xamarinbot.optimizer.controller import OneStepController
@@ -60,7 +61,7 @@ class ParityReport:
 def _offline_decisions_at(
     decision_timestamps: set[float], store: EventStore, round_id: str, p0: float,
     feature_cfg: FeatureConfig, fee_config: FeeConfig, exec_cfg: ExecutionConfig,
-    one_step_cfg: OneStepConfig, model: LogisticModel | None, feature_set: FeatureSet | None,
+    one_step_cfg: OneStepConfig, model: LogisticModel | CalibratedModel | None, feature_set: FeatureSet | None,
 ) -> dict[float, str]:
     events = store.all_events(round_id)
     clock = ReplayClock(store, round_id)
@@ -95,7 +96,7 @@ def _offline_decisions_at(
 def compare_live_vs_replay(
     shadow_records: tuple[ShadowDecisionRecord, ...], store: EventStore, round_id: str, p0: float,
     feature_cfg: FeatureConfig, fee_config: FeeConfig, exec_cfg: ExecutionConfig,
-    one_step_cfg: OneStepConfig, model: LogisticModel | None, feature_set: FeatureSet | None,
+    one_step_cfg: OneStepConfig, model: LogisticModel | CalibratedModel | None, feature_set: FeatureSet | None,
 ) -> ParityReport:
     """Compares each shadow decision (already made under the true
     recv_ts-gated live view) against what the offline, event_time-gated

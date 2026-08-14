@@ -209,9 +209,23 @@ def populate_synthetic_round(
     return SyntheticRoundResult(round_id=round_id, p0=p0, final_twap=final_twap, outcome=outcome)
 
 
-def generate_synthetic_dataset(store: EventStore, n_rounds: int, round_length_s: float = 300.0) -> list[SyntheticRoundResult]:
+def generate_synthetic_dataset(
+    store: EventStore, n_rounds: int, round_length_s: float = 300.0, id_offset: int = 0
+) -> list[SyntheticRoundResult]:
+    """`id_offset` shifts the absolute round index used for `round_id`,
+    `start_ts`, and the bias pattern - every one of `round_id`,
+    `bias_bp_per_tick`, and `start_ts` is a pure function of that index
+    (via `seeded_random(round_id, ...)` for the RNG), so two calls with
+    disjoint `[id_offset, id_offset+n_rounds)` ranges are guaranteed to
+    generate disjoint, independent market paths, never the same round
+    twice under different labels. The default `id_offset=0` reproduces
+    every existing call site's behavior unchanged - callers that need a
+    genuinely held-out set (train vs. validate vs. test) must pass
+    non-overlapping ranges explicitly (see Phase 12B audit Addendum A:
+    every prior call site restarted at index 0, so "held-out" data was
+    frequently identical to training data)."""
     results = []
-    for i in range(n_rounds):
+    for i in range(id_offset, id_offset + n_rounds):
         round_id = f"synthetic-round-{i:04d}"
         # alternate/vary bias so the dataset isn't all one direction -
         # important so every baseline skip reason has a chance to fire.

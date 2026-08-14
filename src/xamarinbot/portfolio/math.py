@@ -106,7 +106,23 @@ def evaluate_constraints(
     constraints: RiskConstraints,
     favored_side: Side | None = None,
 ) -> ConstraintCheck:
-    """Reject hard-constraint violations for a simulated candidate action."""
+    """Reject hard-constraint violations for a simulated candidate action.
+
+    `spend_cap` is a round-level budget (`RiskConstraints.spend_cap`
+    docstring: "max additional spend this round"), so it must be checked
+    against *cumulative* cost this round, not one candidate's incremental
+    cost alone (Phase 12B audit item 9: comparing `result.delta_C` - a
+    single fill's own cost - against the full cap let any number of
+    individually-legal orders exceed the intended round budget in total).
+    Every caller in this codebase constructs a fresh `PortfolioState()` at
+    the start of each round and never carries one across rounds (verified
+    across every call site), so `result.portfolio_after.C` already *is*
+    cumulative round spend including this candidate - no separate
+    `round_start_C` needs to be threaded through for that invariant to
+    hold. If a future caller ever reuses one `PortfolioState` across
+    multiple rounds/markets, this check would need `C` measured relative
+    to that round's own starting `C`, not zero.
+    """
     violated: list[str] = []
     after = result.portfolio_after
 
@@ -118,8 +134,7 @@ def evaluate_constraints(
         if pi_favored < constraints.p_min:
             violated.append("p_min")
 
-    spend = result.delta_C
-    if constraints.spend_cap is not None and spend > constraints.spend_cap:
+    if constraints.spend_cap is not None and after.C > constraints.spend_cap:
         violated.append("spend_cap")
 
     if constraints.position_limit is not None:

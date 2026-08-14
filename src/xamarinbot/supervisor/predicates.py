@@ -16,10 +16,10 @@ from xamarinbot.regime.types import RegimeState
 from xamarinbot.supervisor.config import SupervisorConfig
 
 
-def edge_failure(current_ev_after: float, cfg: SupervisorConfig) -> bool:
+def edge_failure(current_delta_ev: float, cfg: SupervisorConfig) -> bool:
     """"Edge failure: Expected filled edge falls below threshold -> Cancel
     or reprice.\""""
-    return current_ev_after < cfg.edge_min
+    return current_delta_ev < cfg.edge_min
 
 
 def regime_flip(origin_state: RegimeState, current_state: RegimeState) -> bool:

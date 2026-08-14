@@ -18,6 +18,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from xamarinbot.baseline.config import BaselineConfig
+from xamarinbot.baseline.inputs import elapsed_t
 from xamarinbot.baseline.strategy import BaselineInputs, decide
 from xamarinbot.config import config_hash
 from xamarinbot.events.replay import ReplayClock
@@ -147,7 +148,7 @@ def run_round(store: EventStore, round_id: str, outcome_side, cfg: BaselineConfi
         spot_prev = spot_prev_payload["value"] if spot_prev_payload else spot_obs.value
 
         inputs = BaselineInputs(
-            t=decision_time - market_config.start_ts,
+            t=elapsed_t(decision_time, market_config.start_ts),
             p0=p0,
             twap=twap_obs.value,
             clob_mid=clob_mid,

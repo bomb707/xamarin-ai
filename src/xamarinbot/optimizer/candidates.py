@@ -21,6 +21,7 @@ several different ad hoc formulas.
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 
 from xamarinbot.execution.config import ExecutionConfig
 from xamarinbot.execution.maker import fill_probability, q_fill
@@ -33,6 +34,7 @@ from xamarinbot.portfolio.math import (
     OrderPurpose,
     RiskConstraints,
     evaluate_constraints,
+    max_directional_spend,
     min_hedge_quantity,
 )
 from xamarinbot.portfolio.state import FeeConfig, Fill, LiquidityRole, PortfolioState, Side, apply_fill
@@ -40,13 +42,133 @@ from xamarinbot.portfolio.state import FeeConfig, Fill, LiquidityRole, Portfolio
 
 def taker_quantities(levels: tuple[BookLevel, ...], max_levels: int) -> list[float]:
     """Cumulative depth at each of the first `max_levels` book levels - one
-    quantity candidate per level, per the roadmap step."""
+    quantity candidate per level, per the roadmap step. Kept as a small,
+    independently-tested building block; `taker_sizing_boundaries` below
+    is what candidate generation actually uses now (Phase 12B audit item
+    8) - raw depth-level sums alone gave the optimizer nothing to choose
+    from whenever even the first level's full size didn't fit the current
+    risk/position/spend budget."""
     out = []
     cumulative = 0.0
     for level in levels[:max_levels]:
         cumulative += level.size
         out.append(cumulative)
     return out
+
+
+@dataclass(frozen=True)
+class TakerSizing:
+    """Phase 12B audit items 8 (boundary-aware sizing) and 10 (worst-price
+    protection), computed together in one pass since both fall out of the
+    same level-by-level walk. `quantities` are the candidate order sizes
+    to evaluate (deduped, ascending); `p_max` is the derived worst
+    acceptable execution price - the price of the last book level whose
+    own marginal edge still clears `cfg.min_marginal_edge` - meant to
+    replace a hardcoded `limit_price=1.0` (which is not real worst-price
+    protection, since prices are probabilities in [0,1] and 1.0 is
+    effectively unconstraining)."""
+
+    quantities: tuple[float, ...]
+    p_max: float | None
+
+
+def taker_sizing_boundaries(
+    asks: tuple[BookLevel, ...],
+    q_effective: float,
+    fee_config: FeeConfig,
+    cfg: OneStepConfig,
+    portfolio: PortfolioState,
+    side_position: float,
+) -> TakerSizing:
+    """Generates economically meaningful candidate quantities from the
+    union of boundaries named in Phase 12B audit item 7: exchange minimum
+    size, small quantity steps, CLOB depth boundaries, the marginal-edge
+    boundary (item 10's worst-price protection), the risk-budget boundary
+    (wires in `max_directional_spend`, previously dead code - Phase 12B
+    audit "additional flaws" note), the position-limit boundary, and the
+    spend-cap boundary - including the *exact partial quantity* inside
+    whichever boundary is tightest, not just whole-level sums (so e.g. a
+    500-share first level with only 7.4 shares of feasible budget yields a
+    7.4-share candidate, not a 0- or 500-share one).
+
+    `q_effective` is `q` for a UP-side walk, `1-q` for a DOWN-side walk -
+    the "success probability" for whichever side `asks` belongs to.
+    `side_position` is the portfolio's current `U` (or `D`) - whichever
+    side is being sized - used for the position-capacity boundary.
+    """
+    if not asks:
+        return TakerSizing((), None)
+
+    cum_qty = 0.0
+    cum_cost = 0.0
+    marginal_edge_qty = 0.0
+    p_max: float | None = None
+
+    spend_budget = (cfg.spend_cap - portfolio.C) if cfg.spend_cap is not None else None
+    risk_budget = max_directional_spend(portfolio.G, cfg.g_min)
+    position_capacity = (cfg.position_limit - side_position) if cfg.position_limit is not None else None
+
+    spend_capacity_qty: float | None = None
+    risk_budget_qty: float | None = None
+
+    for level in asks:
+        c_i = level.price + fee_config.taker_fee(1.0, level.price)  # fee-per-share at this level's price
+        e_i = q_effective - c_i
+        if e_i <= cfg.min_marginal_edge:
+            break  # worst-price boundary: this and every worse (later) level isn't worth walking
+
+        level_cost = level.size * c_i
+        if spend_budget is not None and spend_capacity_qty is None and cum_cost + level_cost > spend_budget:
+            remaining_budget = max(0.0, spend_budget - cum_cost)
+            spend_capacity_qty = cum_qty + remaining_budget / c_i
+        if risk_budget_qty is None and cum_cost + level_cost > risk_budget:
+            remaining_budget = max(0.0, risk_budget - cum_cost)
+            risk_budget_qty = cum_qty + remaining_budget / c_i
+
+        p_max = level.price
+        cum_qty += level.size
+        cum_cost += level_cost
+        marginal_edge_qty = cum_qty
+
+    if spend_budget is not None and spend_capacity_qty is None:
+        spend_capacity_qty = cum_qty  # budget never exhausted within the walked (edge-acceptable) levels
+    if risk_budget_qty is None:
+        risk_budget_qty = cum_qty
+
+    boundaries = [marginal_edge_qty, risk_budget_qty]
+    if position_capacity is not None:
+        boundaries.append(max(0.0, position_capacity))
+    if spend_capacity_qty is not None:
+        boundaries.append(spend_capacity_qty)
+    max_feasible = max(0.0, min(boundaries))
+
+    quantities: set[float] = set()
+    step = max(cfg.taker_qty_step, 1e-9)
+    x = cfg.taker_min_size
+    # Bounded to `taker_qty_grid_points` steps near the minimum, not a
+    # dense grid across the whole feasible range - when the risk/spend
+    # budget is loose, max_feasible can be in the hundreds or thousands
+    # of shares, and a 1-unit-step grid across that whole range exploded
+    # candidate counts into the thousands (caught by the MPC latency
+    # tests timing out under exactly this condition). The grid's purpose
+    # is fine-grained *small*-trade sizing; larger sizes are already
+    # covered by the boundary quantities and depth-level candidates below.
+    for _ in range(cfg.taker_qty_grid_points):
+        if x >= max_feasible - 1e-9:
+            break
+        quantities.add(round(x, 6))
+        x += step
+    if max_feasible >= cfg.taker_min_size - 1e-9 and max_feasible > 1e-9:
+        quantities.add(round(max_feasible, 6))  # the exact tightest-boundary partial quantity
+
+    cum = 0.0
+    for level in asks[: cfg.max_taker_depth_levels]:
+        cum += level.size
+        capped = min(cum, max_feasible)
+        if capped >= cfg.taker_min_size - 1e-9 and capped > 1e-9:
+            quantities.add(round(capped, 6))
+
+    return TakerSizing(tuple(sorted(quantities)), p_max)
 
 
 def maker_price_grid(best_bid: float, best_ask: float, tick_size: float, offsets_ticks: tuple[int, ...]) -> list[tuple[float, int]]:
@@ -66,8 +188,22 @@ def _risk_constraints(cfg: OneStepConfig) -> RiskConstraints:
     return RiskConstraints(g_min=cfg.g_min, p_min=cfg.p_min, spend_cap=cfg.spend_cap, position_limit=cfg.position_limit)
 
 
-def _favored_side(portfolio: PortfolioState) -> Side:
-    return Side.UP if portfolio.Pi_U >= portfolio.Pi_D else Side.DOWN
+def _favored_side(q: float) -> Side:
+    """Phase 12B audit item 10/11: previously inferred from payoff
+    geometry (`Pi_U >= Pi_D`), which is arbitrary at a flat portfolio
+    (`Pi_U == Pi_D == 0` defaults to UP) and has nothing to do with
+    prediction. The favored side must instead reflect current predictive/
+    executable opportunity - `q` (calibrated `P(UP)`) is the direct driver
+    of both `DeltaEV_U ~ q*x` and `DeltaEV_D ~ (1-q)*x`, so `q >= 0.5`
+    means UP currently has the larger raw per-share edge. This is a
+    simplified first-correct step, not the fuller
+    `argmax(BestDeltaJ_U, BestDeltaJ_D)` (which would additionally weigh
+    each side's current best executable price/cost, not just q) - that
+    requires visibility into the whole candidate table, which this
+    per-candidate evaluation function doesn't have; deferred to when
+    `p_min` (still dormant everywhere in this codebase) is ever actually
+    activated for a real risk-policy reason."""
+    return Side.UP if q >= 0.5 else Side.DOWN
 
 
 def _finalize(
@@ -82,11 +218,13 @@ def _finalize(
     delta_U: float,
     delta_D: float,
     delta_C: float,
-    ev_after_raw: float,
+    delta_ev_raw: float,
     portfolio: PortfolioState,
     portfolio_after: PortfolioState,
+    q: float,
     cfg: OneStepConfig,
     apply_edge_min: bool,
+    max_execution_price: float | None = None,
 ) -> CandidateAction:
     result = FillSimulationResult(
         purpose=purpose,
@@ -97,18 +235,18 @@ def _finalize(
         portfolio_after=portfolio_after,
         risk_contribution=portfolio_after.G - portfolio.G,
     )
-    favored = _favored_side(portfolio) if cfg.p_min is not None else None
+    favored = _favored_side(q) if cfg.p_min is not None else None
     check = evaluate_constraints(result, _risk_constraints(cfg), favored_side=favored)
     violated = list(check.violated)
 
-    ev_after = ev_after_raw - cfg.churn_penalty
+    delta_ev = delta_ev_raw - cfg.churn_penalty
     # Hedge orders are explicitly allowed negative standalone EV in
     # exchange for improving worst-case risk (SS17: "Hedge orders may have
     # negative standalone EV if they efficiently improve the whole
     # portfolio risk. They must be labeled separately in the journal and
     # optimizer.") - edge_min is an alpha-edge floor and does not apply to
     # them, regardless of what the caller passed.
-    if apply_edge_min and purpose is not OrderPurpose.HEDGE and ev_after < cfg.edge_min:
+    if apply_edge_min and purpose is not OrderPurpose.HEDGE and delta_ev < cfg.edge_min:
         violated.append("edge_min")
 
     return CandidateAction(
@@ -120,11 +258,12 @@ def _finalize(
         qty=qty,
         ttl_s=ttl_s,
         expected_fill=expected_fill,
-        ev_after=ev_after,
+        delta_ev=delta_ev,
         g_after=portfolio_after.G,
         pi_u_after=portfolio_after.Pi_U,
         pi_d_after=portfolio_after.Pi_D,
         violated_constraints=tuple(violated),
+        max_execution_price=max_execution_price,
     )
 
 
@@ -147,13 +286,14 @@ def evaluate_taker_candidate(
     delta_U = portfolio_after.U - portfolio.U
     delta_D = portfolio_after.D - portfolio.D
     delta_C = portfolio_after.C - portfolio.C
-    ev_after_raw = q * delta_U + (1.0 - q) * delta_D - delta_C
+    delta_ev_raw = q * delta_U + (1.0 - q) * delta_D - delta_C
 
     return _finalize(
         action_id, purpose, side, OrderMode.FAK, walk.avg_price if walk.filled_shares > 0 else limit_price,
         requested_qty, ttl_s=0.0, expected_fill=walk.filled_shares,
-        delta_U=delta_U, delta_D=delta_D, delta_C=delta_C, ev_after_raw=ev_after_raw,
-        portfolio=portfolio, portfolio_after=portfolio_after, cfg=cfg, apply_edge_min=True,
+        delta_U=delta_U, delta_D=delta_D, delta_C=delta_C, delta_ev_raw=delta_ev_raw,
+        portfolio=portfolio, portfolio_after=portfolio_after, q=q, cfg=cfg, apply_edge_min=True,
+        max_execution_price=limit_price,
     )
 
 
@@ -186,12 +326,12 @@ def evaluate_maker_candidate(
     rho = fill_probability(distance_to_touch_ticks, queue_ahead_shares, horizon_s, exec_cfg.maker)
     qf = q_fill(q, side, exec_cfg.maker)
     ev_if_filled = qf * delta_U + (1.0 - qf) * delta_D - delta_C
-    ev_after_raw = rho * ev_if_filled - cfg.opportunity_cost
+    delta_ev_raw = rho * ev_if_filled - cfg.opportunity_cost
 
     return _finalize(
         action_id, purpose, side, OrderMode.POST_ONLY, price, qty, ttl_s=horizon_s, expected_fill=rho * qty,
-        delta_U=delta_U, delta_D=delta_D, delta_C=delta_C, ev_after_raw=ev_after_raw,
-        portfolio=portfolio, portfolio_after=portfolio_after_if_filled, cfg=cfg, apply_edge_min=True,
+        delta_U=delta_U, delta_D=delta_D, delta_C=delta_C, delta_ev_raw=delta_ev_raw,
+        portfolio=portfolio, portfolio_after=portfolio_after_if_filled, q=q, cfg=cfg, apply_edge_min=True,
     )
 
 
@@ -283,7 +423,7 @@ def wait_candidate(action_id: str, portfolio: PortfolioState) -> CandidateAction
         qty=0.0,
         ttl_s=None,
         expected_fill=0.0,
-        ev_after=0.0,
+        delta_ev=0.0,
         g_after=portfolio.G,
         pi_u_after=portfolio.Pi_U,
         pi_d_after=portfolio.Pi_D,

@@ -15,6 +15,7 @@ from xamarinbot.optimizer.candidates import (
     evaluate_taker_candidate,
     maker_price_grid,
     taker_quantities,
+    taker_sizing_boundaries,
     wait_candidate,
 )
 from xamarinbot.optimizer.config import OneStepConfig
@@ -26,6 +27,121 @@ from xamarinbot.regime.types import SeedAction
 
 FEE = FeeConfig()
 ASKS = (BookLevel(0.50, 100.0), BookLevel(0.52, 150.0), BookLevel(0.54, 200.0))
+
+
+# --------------------------------------------------------------------------
+# Phase 12B Tranche 1, items 7/8/10: marginal edge, boundary-aware taker
+# sizing, and worst-price protection (taker_sizing_boundaries)
+# --------------------------------------------------------------------------
+
+
+def test_taker_sizing_produces_exact_partial_quantity_at_risk_budget_boundary():
+    """The audit's own example: a 500-share first ask level, but only a
+    fraction of it is actually risk-feasible - the optimizer must be able
+    to choose that exact partial quantity, not just 0 or the full 500."""
+    asks = (BookLevel(0.50, 500.0),)
+    fee_config = FeeConfig()
+    c_1 = 0.50 + fee_config.taker_fee(1.0, 0.50)  # fee-per-share at this level's price
+    risk_budget = 7.4 * c_1  # engineered so the risk-budget boundary lands at exactly 7.4 shares
+    cfg = OneStepConfig(g_min=-risk_budget)  # G_current=0 (empty portfolio) - g_min => max_directional_spend = risk_budget
+    portfolio = PortfolioState()
+
+    sizing = taker_sizing_boundaries(asks, q_effective=0.9, fee_config=fee_config, cfg=cfg, portfolio=portfolio, side_position=0.0)
+
+    assert sizing.p_max == 0.50
+    assert any(math.isclose(q, 7.4, rel_tol=1e-6) for q in sizing.quantities), sizing.quantities
+    assert all(q <= 7.4 + 1e-6 for q in sizing.quantities)  # never offers more than what's risk-feasible
+
+
+def test_taker_sizing_stops_at_last_level_with_positive_marginal_edge():
+    """Worst-price protection: a second, expensive level with negative
+    marginal edge must never be walked, regardless of how loose the risk
+    budget is - this replaces the old unconditional limit_price=1.0."""
+    asks = (BookLevel(0.50, 100.0), BookLevel(0.95, 100.0))
+    fee_config = FeeConfig()
+    cfg = OneStepConfig(g_min=-1_000_000.0)  # risk budget deliberately not the binding constraint here
+    portfolio = PortfolioState()
+
+    sizing = taker_sizing_boundaries(asks, q_effective=0.9, fee_config=fee_config, cfg=cfg, portfolio=portfolio, side_position=0.0)
+
+    assert sizing.p_max == 0.50  # the 0.95 level is never walked
+    assert max(sizing.quantities) <= 100.0 + 1e-6  # never offers quantity from the rejected level
+
+
+def test_taker_sizing_returns_nothing_when_no_level_clears_marginal_edge():
+    asks = (BookLevel(0.50, 500.0),)
+    fee_config = FeeConfig()
+    cfg = OneStepConfig(g_min=-1_000_000.0)
+    portfolio = PortfolioState()
+
+    sizing = taker_sizing_boundaries(asks, q_effective=0.1, fee_config=fee_config, cfg=cfg, portfolio=portfolio, side_position=0.0)
+
+    assert sizing.p_max is None
+    assert sizing.quantities == ()
+
+
+def test_taker_sizing_respects_position_and_spend_caps():
+    asks = (BookLevel(0.50, 500.0),)
+    fee_config = FeeConfig()
+    cfg = OneStepConfig(g_min=-1_000_000.0, position_limit=3.0)
+    portfolio = PortfolioState()
+
+    sizing = taker_sizing_boundaries(asks, q_effective=0.9, fee_config=fee_config, cfg=cfg, portfolio=portfolio, side_position=0.0)
+    assert max(sizing.quantities) <= 3.0 + 1e-6
+
+    cfg_spend = OneStepConfig(g_min=-1_000_000.0, spend_cap=5.0)
+    sizing_spend = taker_sizing_boundaries(asks, q_effective=0.9, fee_config=fee_config, cfg=cfg_spend, portfolio=portfolio, side_position=0.0)
+    c_1 = 0.50 + fee_config.taker_fee(1.0, 0.50)
+    assert max(sizing_spend.quantities) <= (5.0 / c_1) + 1e-6
+
+
+def test_taker_sizing_boundaries_are_wired_into_controller_candidate_generation():
+    """End-to-end: OneStepController's taker candidates must reflect the
+    new boundary-aware sizing, not the old raw depth-level-only quantities,
+    and must never exceed the derived worst-price boundary."""
+    cfg = OneStepConfig(g_min=-1_000_000.0)
+    controller = OneStepController(cfg, ExecutionConfig(), FeeConfig())
+    portfolio = PortfolioState()
+    book_up = BookSnapshot(Side.UP, bids=(BookLevel(0.48, 500.0),), asks=(BookLevel(0.50, 500.0), BookLevel(0.98, 500.0)), ts=0.0, recv_ts=0.0)
+    book_down = BookSnapshot(Side.DOWN, bids=(), asks=(), ts=0.0, recv_ts=0.0)
+    permitted = frozenset({SeedAction.TAKER_UP, SeedAction.WAIT})
+
+    decision = controller.decide("r0", 10.0, portfolio, q=0.9, permitted_actions=permitted, book_up=book_up, book_down=book_down, tick_size=0.01, is_fresh=True)
+
+    taker_candidates = [c for c in decision.candidates if c.mode is OrderMode.FAK]
+    assert taker_candidates  # the good-edge level produced at least one candidate
+    assert all(c.price <= 0.50 + 1e-9 for c in taker_candidates)  # the 0.98 level was never used as an execution price
+
+
+# --------------------------------------------------------------------------
+# Phase 12B Tranche 1, item 11: favored-side semantics (no p_min activation)
+# --------------------------------------------------------------------------
+
+
+def test_favored_side_reflects_q_not_payoff_geometry_at_flat_portfolio():
+    """At a flat portfolio (Pi_U == Pi_D == 0), the old `_favored_side`
+    always returned UP (an arbitrary `>=` tie-break on payoff geometry).
+    With q clearly favoring DOWN, the p_min check (once activated) must
+    use DOWN as the favored side, not UP."""
+    from xamarinbot.optimizer.candidates import _favored_side
+
+    assert _favored_side(q=0.2) is Side.DOWN
+    assert _favored_side(q=0.8) is Side.UP
+
+
+def test_p_min_stays_inactive_by_default_after_favored_side_fix():
+    """Fixing _favored_side must not, by itself, activate p_min anywhere -
+    OneStepConfig.p_min stays None unless a caller explicitly sets it
+    (Phase 12B audit item I: do not introduce an artificial profit-floor
+    constraint while fixing the favored-side bug)."""
+    cfg = OneStepConfig(g_min=-100.0)
+    assert cfg.p_min is None
+    portfolio = PortfolioState()
+    candidate = evaluate_taker_candidate(
+        "taker_up_1", Side.UP, OrderPurpose.ALPHA, 50.0, limit_price=1.0, asks=ASKS,
+        portfolio=portfolio, q=0.5, fee_config=FEE, cfg=cfg,
+    )
+    assert "p_min" not in candidate.violated_constraints
 
 # --------------------------------------------------------------------------
 # Candidate generation
@@ -64,7 +180,7 @@ def test_taker_up_ev_matches_ss13_delta_ev_formula():
     expected_cost = 100.0 * 0.50
     expected_fee = FEE.taker_fee(100.0, 0.50)
     expected_ev = 0.6 * 100.0 - (expected_cost + expected_fee)
-    assert math.isclose(candidate.ev_after, expected_ev, rel_tol=1e-9)
+    assert math.isclose(candidate.delta_ev, expected_ev, rel_tol=1e-9)
 
 
 def test_taker_down_ev_matches_ss13_delta_ev_formula():
@@ -75,7 +191,7 @@ def test_taker_down_ev_matches_ss13_delta_ev_formula():
     expected_cost = 100.0 * 0.50
     expected_fee = FEE.taker_fee(100.0, 0.50)
     expected_ev = 0.4 * 100.0 - (expected_cost + expected_fee)
-    assert math.isclose(candidate.ev_after, expected_ev, rel_tol=1e-9)
+    assert math.isclose(candidate.delta_ev, expected_ev, rel_tol=1e-9)
 
 
 def test_taker_candidate_rejected_when_g_min_breached():
@@ -143,7 +259,7 @@ def test_wait_candidate_is_always_valid_and_neutral():
     portfolio = PortfolioState(U=5.0, D=3.0, C=4.0)
     candidate = wait_candidate("wait", portfolio)
     assert candidate.is_valid
-    assert candidate.ev_after == 0.0
+    assert candidate.delta_ev == 0.0
     assert candidate.g_after == portfolio.G
     assert candidate.mode is OrderMode.WAIT
 
@@ -197,7 +313,7 @@ def test_controller_selects_highest_ev_valid_candidate():
     permitted = frozenset({SeedAction.TAKER_UP, SeedAction.MAKER_UP, SeedAction.WAIT})
     decision = controller.decide("r0", 10.0, PortfolioState(), q=0.9, permitted_actions=permitted, book_up=_up_book(), book_down=_down_book(), tick_size=0.01, is_fresh=True)
     valid = [c for c in decision.candidates if c.is_valid]
-    assert decision.chosen.ev_after == max(c.ev_after for c in valid)
+    assert decision.chosen.delta_ev == max(c.delta_ev for c in valid)
 
 
 def test_controller_stale_data_forces_wait_only():

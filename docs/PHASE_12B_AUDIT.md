@@ -14,6 +14,18 @@ Classification key: **CONFIRMED BUG** / **CONFIRMED DESIGN LIMITATION** /
 **INTENTIONAL BUT UNSUITABLE FOR PRODUCTION** / **NOT A PROBLEM** /
 **NEEDS REAL DATA TO DETERMINE**.
 
+**Revision note (round 2)**: a reviewer pass over this audit found
+several additional high-severity issues (train/eval leakage, no
+per-window model retraining, uncalibrated `q`, a second baseline harness
+bug, and an execution-path inconsistency), plus a real mathematical error
+in this document's own proposed fix for items 12-13. All of it verified
+against actual code below in **Addendum A-L**, appended after the
+original 38-item audit and before the Summary section (which has been
+updated accordingly). Item 12-13's original "Proposed fix" text below is
+kept as written for the audit trail, but is **superseded** by Addendum F
+— see the note inserted at that section. **Still no implementation
+changes have been made — this remains audit-only.**
+
 ---
 
 ## 0. Project objective correction
@@ -580,17 +592,20 @@ largest architectural gap found in this audit relative to the strategy
 doc's stated design (SS17's buffer/repair economics), not a small
 oversight.
 
-**Proposed fix**: Add `BUFFER_BUILD` and `REBALANCE` to `OrderPurpose`.
-Implement the pair-buffer identity directly:
-`DeltaG_pair(x) = x - K_U(x) - K_D(x)` for acquiring `x` on the currently
-cheaper/under-represented side; generate a `BUFFER_BUILD` candidate
-whenever `DeltaG_pair(x) > 0` is achievable at some feasible `x`,
-independent of current `G` vs `g_min` — i.e. it competes on the same
-`argmax` footing as ALPHA candidates via its own `delta_ev`/`delta_g`,
-not gated behind a risk-floor breach. Evaluate this across *sequential*
-fills at different times (maintaining cumulative `U, D, C` — no
-requirement that `UP + DOWN < 1` simultaneously), not only simultaneous
-quotes, per item 13's explicit instruction.
+**Proposed fix — SUPERSEDED, kept for audit trail only, see Addendum F**:
+~~Add `BUFFER_BUILD` and `REBALANCE` to `OrderPurpose`. Implement the
+pair-buffer identity directly: `DeltaG_pair(x) = x - K_U(x) - K_D(x)` for
+acquiring `x` on the currently cheaper/under-represented side~~ — **this
+formula is mathematically wrong for a one-sided purchase.**
+`DeltaG_pair(x) = x - K_U(x) - K_D(x)` is only correct when `x` is
+acquired on **both** sides simultaneously (`U'=U+x, D'=D+x`). A
+single-sided `BUFFER_BUILD` fill (which is what "acquiring x on the
+cheaper side" actually describes) must use
+`DeltaG_U(x) = min(U+x,D) - min(U,D) - K_U(x)` instead — see Addendum F
+for the full correction and proof. The rest of this paragraph's intent
+(generate `BUFFER_BUILD` independent of a risk-floor breach, compete on
+the same `argmax` footing, evaluate across sequential fills) stands
+unchanged; only the formula was wrong.
 
 **Regression test required**: With `G` comfortably above `g_min` but a
 cheap opposite-side buffer opportunity available (`K_U(x)+K_D(x) < x` for
@@ -1137,6 +1152,488 @@ evidence to.
 
 ---
 
+# Addendum (reviewer round 2): additional findings A-L
+
+Every item below was independently re-verified against actual source in
+this pass, not accepted on the strength of the reviewer's framing alone.
+All are **confirmed**, several are more severe or wider-reaching than
+originally framed, and one original proposed fix (item 12-13) contained a
+genuine mathematical error, now corrected.
+
+## A. Train/evaluation leakage — confirmed, and wider than scoped
+
+**File**: [synthetic/rounds.py:212-221](../src/xamarinbot/synthetic/rounds.py#L212), function `generate_synthetic_dataset()`
+
+**Current behavior, verified directly**:
+```python
+def generate_synthetic_dataset(store, n_rounds, round_length_s=300.0):
+    results = []
+    for i in range(n_rounds):
+        round_id = f"synthetic-round-{i:04d}"
+        bias = [0.0, 7.0, -7.0, 0.0][i % 4]
+        result = populate_synthetic_round(
+            store, round_id, start_ts=i * (round_length_s + 60.0), round_length_s=round_length_s, bias_bp_per_tick=bias
+        )
+```
+Every call to `generate_synthetic_dataset` starts numbering at `i=0`
+regardless of what's already in the target store or in any other store.
+`round_id`, `bias`, and `start_ts` are all pure functions of `i` alone —
+nothing carries state between calls. `populate_synthetic_round` seeds its
+RNG via `seeded_random(round_id, "synthetic-round")` (deterministic on
+the string `round_id`). **Therefore two separate calls to
+`generate_synthetic_dataset` on two separate `EventStore` objects produce
+byte-identical market content for any overlapping index** — "training"
+round `synthetic-round-0000` and "evaluation" round `synthetic-round-0000`
+are not just same-ID, they are the *same simulated market path*, same
+spot ticks, same TWAP, same book, same outcome.
+
+**Confirmed at scale — this is not isolated to one script.** Grepped
+every file calling `generate_synthetic_dataset` and checked each
+train/eval pair directly:
+
+| File | Train call | Eval call | Overlap |
+|---|---|---|---|
+| `scripts/run_one_step_controller_demo.py` | `n_rounds=N_TRAIN_ROUNDS` (separate store) | `n_rounds=n_eval_rounds` (separate store) | rounds 0..min(train,eval)-1 fully overlap |
+| `scripts/run_order_supervisor_demo.py` | same pattern | same pattern | same |
+| `scripts/run_mpc_controller_demo.py` | q-model *and* transition-model each trained on a **separate** `n_rounds=N_TRAIN_ROUNDS` store (harmless redundancy — both are "train") | `n_rounds=n_eval_rounds` (third separate store) | eval overlaps both training stores |
+| `scripts/run_walk_forward_ablation_demo.py` | same double-training pattern as MPC demo | `n_rounds=n_rounds` (third store) | eval overlaps both |
+| `scripts/run_shadow_demo.py` | `n_rounds=N_TRAIN_ROUNDS=15` | `n_rounds=n_rounds` (default 6) | full overlap (rounds 0-5 identical to training rounds 0-5) |
+| `tests/test_walkforward.py` | `trained_model` fixture: `n_rounds=8` | `eval_dataset` fixture: `n_rounds=6` | full overlap (all 6 eval rounds identical to 6 of the 8 training rounds) |
+| `tests/test_shadow.py` | `trained_model` fixture: `n_rounds=8` | `eval_dataset` fixture: `n_rounds=3` | full overlap |
+
+**This means every "held-out evaluation" performed anywhere in this
+codebase since Phase 8 has actually been evaluating the model on data it
+was trained on.** This is strictly worse than the reviewer's framing
+suggested — it is not a Phase-11-specific bug, it is the standard pattern
+used by nearly every demo script and both of the test suites written in
+this and the prior session (`test_walkforward.py`, `test_shadow.py`).
+
+**Mathematical consequence**: any reported metric that compares
+train-set behavior to "eval-set" behavior (differ-rates, latency
+benchmarks computed on "held-out" rounds, walk-forward window results
+where the *rounds themselves* — not just the model — overlap between a
+window's train and test segments if the window round_ids happen to
+coincide with training round_ids) is measuring memorization, not
+generalization, to whatever extent the model has any capacity to
+memorize at all.
+
+**Trading consequence**: none of the "n_actions", "differ_rate",
+"parity_rate", or PnL numbers reported for Phases 8-12 can be trusted as
+evidence of generalization — they are at best pipeline-correctness
+checks (which was always the explicit caveat for synthetic data per item
+4) and at worst overstate how well the model transfers, because the
+"unseen" data literally was seen.
+
+**Classification**: **CONFIRMED BUG**, and the single most
+under-scoped item in the original audit — I checked only
+`run_walk_forward_ablation_demo.py` at the reviewer's prompting but
+should have generalized the check to every script using this pattern
+without being asked.
+
+**Proposed fix**: Give `generate_synthetic_dataset` an explicit
+`start_index: int = 0` parameter (or accept a `round_ids: list[str]`
+directly) so callers can request genuinely disjoint round ranges from a
+shared numbering space — e.g. `generate_synthetic_dataset(store, n_rounds=15, start_index=0)`
+for train and `generate_synthetic_dataset(store, n_rounds=6, start_index=15)`
+for eval. Audit and fix every call site in the table above, not only the
+walk-forward demo. This is a mechanical, low-risk fix (one new parameter,
+defaulting to today's behavior so nothing breaks silently, plus updating
+every call site to pass disjoint ranges) but touches ~9 files.
+
+**Regression test required**: A test asserting
+`set(train_round_ids).isdisjoint(set(eval_round_ids))` **and** that the
+underlying generated records differ (not just the IDs) — e.g. assert the
+first SPOT event's `value` differs between a training round and an
+eval round at the same relative index, proving the fix actually changes
+the underlying market path, not just the label. Also required per item B
+below: assert train/validate/test round IDs are disjoint *within every
+walk-forward window*, not only between the top-level train/eval split.
+
+## B. Phase 11 is not a true model walk-forward — confirmed
+
+**File**: [scripts/run_walk_forward_ablation_demo.py:52-57](../scripts/run_walk_forward_ablation_demo.py#L52), [walkforward/sensitivity.py](../src/xamarinbot/walkforward/sensitivity.py)
+
+**Current behavior, verified directly**: `train_q_model()` is called
+**once**, before `rolling_windows()` is ever constructed, and the
+resulting single `model` object is passed unchanged into every call to
+`run_ablation_round`, `sweep_parameter`, and
+`parameter_stability_across_windows` for every window. Checked
+`sweep_parameter`'s signature (`walkforward/sensitivity.py`) — `model:
+LogisticModel | None` is a single parameter, never rebuilt inside the
+function; `parameter_stability_across_windows` likewise takes one `model`
+and reuses it across every window's `sweep_parameter` call. There is no
+per-window `Train_i -> Fit_i -> Validate_i -> Freeze_i -> Test_i` cycle
+anywhere — feature standardization, the logistic weights, and (per item C
+below) calibration are all fit exactly once, globally, and never touch
+window boundaries at all.
+
+**Mathematical consequence**: What Phase 11 currently measures is
+"how does *strategy/execution* behavior vary across time-ordered slices
+of data, given one fixed model" — a real and useful thing to measure —
+**not** "how would a model trained only on each window's own past data
+have performed," which is what walk-forward validation is normally
+understood to mean and what the roadmap's own Phase 11 spec asks for
+("Optimize only on training/validation; lock parameters before each test
+segment" — implicitly per-window, not once globally).
+
+**Classification**: **CONFIRMED DESIGN LIMITATION** — a real gap between
+what "walk-forward" implies and what's implemented, distinct from (and
+compounding) item A's leakage.
+
+**Proposed fix**: Restructure `rolling_windows()` consumers so each
+window performs its own `TRAIN -> fit standardization -> fit q-model ->
+fit transition model (where used) -> VALIDATE -> calibrate/select
+hyperparameters -> FREEZE -> TEST (exactly once, untouched)` cycle, with
+none of train/standardization/calibration/transition-probabilities/
+strategy-parameters/execution-parameters ever fit or selected using that
+window's own test segment. This is a substantial restructuring of
+`walkforward/ablations.py` and `sensitivity.py` (they currently assume a
+single externally-supplied model), not a small patch.
+
+**Regression test required**: A no-leakage test covering the *entire*
+per-window training pipeline (standardization, model fit, calibration,
+transition model, hyperparameter selection) — not only
+`sweep_parameter()`'s round-id check (already covered by the existing
+`test_parameter_stability_across_windows_uses_only_validate_rounds_never_test`
+test, which is real but narrower than what's needed here since it only
+checks which *rounds* are passed to sweeps, not whether the *model
+itself* was fit without seeing test data).
+
+## C. Uncalibrated `q` used throughout Phase 8-12 — confirmed
+
+**File**: every `train_q_model()` function in
+`scripts/run_walk_forward_ablation_demo.py:52-57`,
+`scripts/run_shadow_demo.py:50-55`,
+`scripts/run_mpc_controller_demo.py:50-55`,
+`scripts/run_order_supervisor_demo.py:47-52`
+
+**Current behavior, verified directly** (identical pattern in all four
+files):
+```python
+def train_q_model(feature_cfg):
+    store = EventStore(":memory:")
+    results = generate_synthetic_dataset(store, n_rounds=N_TRAIN_ROUNDS)
+    by_fs = build_examples_multi(store, results, feature_cfg, [COMBINED_LEAD_LAG], heartbeat_s=HEARTBEAT_S)
+    examples = by_fs[COMBINED_LEAD_LAG.name]
+    return fit_logistic_regression([e.x for e in examples], [e.y for e in examples], ...)
+```
+This returns the **raw** `fit_logistic_regression` output directly — no
+calibration step. Confirmed by contrast with Phase 5's own reference
+demo, `scripts/run_model_training_demo.py`, which correctly does the
+full pipeline (`fit_platt(q_val_raw, y_val)` on a validation split,
+applied to test, with the calibrator explicitly chosen over isotonic and
+the reasoning documented inline). **Every phase from 8 onward diverges
+from Phase 5's own established, correct pattern** and uses raw,
+uncalibrated logistic output as `q` in every EV calculation
+(`DeltaEV_U(x) = qx - K_U(x)` and everywhere downstream).
+
+**Mathematical consequence**: An uncalibrated `q` can make
+`DeltaEV_U(x) = qx - K_U(x)` appear positive when the true (calibrated)
+probability would make it negative, or vice versa — every EV-based
+selection decision in Phases 8-12's demos and tests is running on a
+number that Phase 5's own exit gate ("No production use until calibration
+is acceptable") was specifically designed to gate against.
+
+**Classification**: **CONFIRMED BUG** (a validation/design bug, per the
+reviewer's requested classification) — this is not a "missing nice-to-have,"
+it's skipping a gate Phase 5 itself already implemented and enforces via
+`ModelRegistry`, just not through these particular call sites.
+
+**Proposed fix**: Replace every `train_q_model()` above with the same
+train -> validate -> calibrate (Platt, per Phase 5's documented reasoning
+for this dataset) -> freeze pattern already correctly implemented in
+`run_model_training_demo.py`, ideally by extracting that pattern into a
+shared helper both Phase 5's demo and Phases 8-12's demos/harnesses call,
+rather than four more copies of a train/calibrate pipeline. Phase 12B's
+real-data walk-forward (item 32) must evaluate the exact calibrated model
+object the controller actually uses, not a separately-fit raw one.
+
+**Regression test required**: Assert the `model` object used inside
+`run_ablation_round`/`ShadowRunner` has `calibrator is not None` (or
+equivalent), and that `predict_proba` output differs from the raw
+logistic sigmoid output on at least one held-out example (proving
+calibration is actually applied, not just constructed and discarded).
+
+## D. Second baseline harness bug: absolute vs. elapsed time — confirmed, compounds with item 3
+
+**File**: [walkforward/ablations.py:153](../src/xamarinbot/walkforward/ablations.py#L153), function `_run_baseline_round()`
+
+**Current behavior, verified directly**:
+```python
+inputs = BaselineInputs(
+    t=decision_ts, p0=p0, twap=twap_obs.value, clob_mid=mid, clob_mid_prev=mid_prev,
+    ...
+)
+```
+`t=decision_ts` passes the **absolute** replay timestamp.
+`baseline/strategy.py::decide()` checks
+`cfg.decision_window_start_s <= inputs.t <= cfg.decision_window_end_s`
+(default `[15, 270]`), which is only meaningful for **elapsed round
+time**, not absolute time. Confirmed against `synthetic/rounds.py`'s own
+round layout (`start_ts=i * (round_length_s + 60.0)`, i.e. round 0 spans
+`[0, 300]`, round 1 spans `[360, 660]`, round 2 spans `[720, 1020]`, ...).
+**Every round except round index 0 has `decision_ts` values entirely
+outside `[15, 270]` for its whole duration**, so
+`OUTSIDE_DECISION_WINDOW` fires at every single decision point for every
+round after the first, regardless of whether item 3's `spot_prev` bug is
+fixed.
+
+**Confirmed as isolated to the same Phase 11 harness function, same
+pattern as item 3**: Phase 0's original `scripts/run_baseline_replay.py:150`
+already does this correctly —
+`t=decision_time - market_config.start_ts` — a third instance (after
+`spot_prev` and this) of `_run_baseline_round` diverging from an
+already-correct reference implementation one file over.
+
+**Mathematical consequence**: combined with item 3, the baseline placed
+**zero possible trades in ~(N-1)/N of all evaluated rounds** purely from
+this bug, independent of and in addition to the unanimity-breaking
+`spot_prev` bug. Fixing `spot_prev` alone would not have produced a
+working baseline in any Phase 11 ablation matrix that used more than one
+round — round 0 would show whatever the spot_prev fix newly enables,
+every other round would still show zero from this bug alone.
+
+**Classification**: **CONFIRMED BUG**, second high-severity Phase 11
+baseline harness defect, must be fixed together with item 3 (fixing one
+without the other still leaves the baseline arm non-functional for
+`n_rounds > 1`).
+
+**Proposed fix**: `t=decision_ts - market_config["start_ts"]`, reading
+`start_ts` from the same `market_config` dict already loaded via
+`next(e.payload for e in events if e.event_type is EventType.MARKET_CONFIG)`
+elsewhere in this module (no new data dependency needed).
+
+**Regression test required**: Three rounds with identical relative
+0-300s market paths but round-start timestamps of `0`, `360`, and a large
+realistic epoch value (e.g. `1_700_000_000.0`) must produce **identical**
+baseline decisions/skip-reasons at every relative timestamp — currently
+would produce a working baseline only for the first.
+
+## E. Execution-path inconsistency across Phase 11/12 — confirmed, wider root cause identified
+
+**File**: [walkforward/ablations.py:235-239](../src/xamarinbot/walkforward/ablations.py#L235), [shadow/runner.py:165-168](../src/xamarinbot/shadow/runner.py#L165), [walkforward/ablations.py:158-161](../src/xamarinbot/walkforward/ablations.py#L158) (baseline)
+
+**V2/optimizer arms, current behavior, verified directly** (identical in
+both `ablations.py` and `shadow/runner.py`):
+```python
+if chosen.mode is OrderMode.FAK and chosen.expected_fill > 0:
+    fee = fee_config.taker_fee(chosen.expected_fill, chosen.price)
+    portfolio = apply_fill(portfolio, Fill(chosen.side, chosen.price, chosen.expected_fill, LiquidityRole.TAKER, fee))
+```
+`chosen.price`/`chosen.expected_fill` *do* come from a real depth-walk
+(`evaluate_taker_candidate` calls `execution/taker.py::walk_depth`
+against the actual book at `decision_ts` before this dispatch code ever
+runs), so partial-fill sizing and price-impact realism **are** present.
+What's missing is Phase 7's `OrderState` lifecycle
+(`submit_taker_order -> PENDING_DELAY -> resolve_pending` at
+`matched_ts`) — the fill is applied synchronously at `decision_ts`
+with no delay and no book revalidation, bypassing the exact machinery
+`execution/simulator.py::submit_taker_order`/`resolve_pending` exists
+to provide and that `tests/test_execution.py` already covers correctly
+in isolation.
+
+**Important scoping correction to the reviewer's framing**: this
+shortcut is **not new to Phase 11/12** — grepped and confirmed
+`scripts/run_one_step_controller_demo.py` (Phase 8's own reference demo)
+uses the identical direct-apply pattern
+(`if chosen.mode is OrderMode.FAK:` -> apply fill directly), never
+calling `submit_taker_order`. **Every phase from 8 onward has bypassed
+the delay/revalidation lifecycle**, not just Phase 11/12. Also confirmed:
+`ExecutionConfig.taker_delay_ms` defaults to `0.0` everywhere it's
+constructed (its own docstring says *"read from MarketConfig.taker_delay_ms
+per round in practice"* — but per item 23, nothing actually does that
+read anywhere in the codebase). At `taker_delay_ms=0.0`, submit-then-
+immediately-resolve is mathematically equivalent to direct-apply, so
+**this has not silently corrupted any PnL number to date** — but the
+moment a real market's actual delay (Strategy doc: 250ms on crypto
+markets) is wired in via item 23's fix, this shortcut would **silently
+ignore it entirely**, since the direct-apply path never reads
+`taker_delay_ms` at all.
+
+**Baseline, current behavior, verified directly**
+(`walkforward/ablations.py:158-161`):
+```python
+result = baseline_decide(inputs, portfolio.U, portfolio.D, portfolio.C, cfg)
+if result.order is not None:
+    fee = fee_config.fee_for(result.order.role, result.order.quantity, result.order.price)
+    portfolio = apply_fill(portfolio, Fill(result.order.side, result.order.price, result.order.quantity, result.order.role, fee))
+```
+`result.order.price` is the pre-computed marketable-limit price
+(`min(1.0, best_ask + limit_delta)`) and `result.order.quantity` is the
+*requested* quantity — confirmed, **no depth-walk at all**, always a
+full fill at the limit price. This is a materially easier execution
+assumption than the V2 arms (which at least depth-walk), confirmed
+exactly as the reviewer describes, and independently makes any
+baseline-vs-V2 PnL comparison invalid on execution-realism grounds
+*even after* items 3 and D are fixed.
+
+**Classification**: **CONFIRMED BUG** for the baseline's full-fill
+assumption (a real, wrong simplification, not merely a "known
+placeholder" — it was never labeled as such anywhere). **CONFIRMED
+DESIGN LIMITATION** for the V2 arms' delay/revalidation bypass (real
+depth-walk cost realism is present; only the timing dimension is
+skipped, and it has been inert-by-coincidence rather than actively wrong
+so far because of the `taker_delay_ms=0.0` default everywhere).
+
+**Proposed fix**: Route both the baseline and every V2 arm's taker fills
+through one common execution path — `submit_taker_order` ->
+`resolve_pending` at the correct `matched_ts`, using
+`walk_depth`-derived partial-fill sizing for *both* arms (the baseline
+currently gets none at all). This directly serves item L (common
+execution layer across ablation arms) — the fix for E and the fix for L
+are the same piece of work, not two separate ones.
+
+**Regression test required**: A round with `taker_delay_ms > 0` and a
+book that moves between `decision_ts` and `decision_ts + taker_delay_ms`
+must produce a different (revalidated) fill than a naive direct-apply —
+proving the delay actually matters once wired in, and regression-proofing
+against silently reverting to the shortcut. Separately, a test that the
+baseline's fill quantity is bounded by actual depth at its execution
+price, not always the full requested quantity.
+
+## F-H. Mathematical correction: `BUFFER_BUILD` / one-sided vs. two-sided `ΔG`
+
+**This is a correction to this audit's own item 12-13 proposed fix, not
+a new code defect** — no code implementing `BUFFER_BUILD` exists yet
+(confirmed: `OrderPurpose` still only has `ALPHA`/`HEDGE`), so there is
+nothing in `main` to classify as buggy here. This section verifies the
+reviewer's corrected math is right and adopts it, superseding the
+original proposal.
+
+**The error in the original proposal**: item 12-13's "Proposed fix" used
+`DeltaG_pair(x) = x - K_U(x) - K_D(x)` to describe acquiring `x` shares
+on a *single* (the cheaper/under-represented) side. That formula is only
+valid for a **simultaneous two-sided** acquisition.
+
+**Proof, worked from the kernel definition `G = min(U,D) - C`**:
+
+*Two-sided case* (`U'=U+x, D'=D+x, C'=C+K_U(x)+K_D(x)`):
+```
+ΔG_both(x) = min(U+x, D+x) - (C+K_U(x)+K_D(x)) - [min(U,D) - C]
+           = [min(U,D) + x] - min(U,D) - K_U(x) - K_D(x)      (since min(a+x,b+x) = min(a,b)+x)
+           = x - K_U(x) - K_D(x)
+```
+This confirms the original formula is correct — **but only for this
+case**, which is not what "acquire x on the cheaper side" (a one-sided
+fill) describes.
+
+*One-sided UP case* (`U'=U+x, D'=D, C'=C+K_U(x)`):
+```
+ΔG_U(x) = min(U+x, D) - (C+K_U(x)) - [min(U,D) - C]
+        = min(U+x, D) - min(U,D) - K_U(x)
+```
+This is the reviewer's boxed formula, confirmed correct by direct
+substitution into the kernel — not a new/different kernel, the exact
+same `G = min(U,D) - C` the Phase 3 property tests already cover, just
+evaluated for a one-sided delta instead of assumed-equal-both-sides.
+
+*One-sided DOWN case*, symmetric:
+`ΔG_D(x) = min(U, D+x) - min(U,D) - K_D(x)`.
+
+*Special case, verified*: if `U < D` and `x <= D-U`, then
+`U+x <= D`, so `min(U+x,D) = U+x`, and `min(U,D) = U`. Substituting:
+`ΔG_U(x) = (U+x) - U - K_U(x) = x - K_U(x)` — confirmed, matches the
+reviewer's boxed special case exactly. The economic reading is correct
+too: existing DOWN inventory already priced into `min(U,D)` doesn't need
+to be "re-bought" — only the *new* UP shares' cost is charged against the
+buffer improvement while `U` stays the binding side of the min.
+
+**Classification**: **CONFIRMED** — the reviewer's correction is
+mathematically right, proven directly against the existing, tested `G`
+kernel (no change to Phase 3's math itself, only to how a proposed new
+candidate type would compute its own `ΔG`).
+
+**Item G, checked separately**: `ΔEV_U(x) = q*x - K_U(x)` and
+`ΔG_U(x)` (above) are independent quantities — confirmed there's no
+algebraic identity forcing them to share a sign (e.g. `ΔG_U(x) > 0`
+requires `min(U+x,D)-min(U,D) > K_U(x)`, a pure portfolio-geometry
+condition, while `ΔEV_U(x) > 0` requires `q*x > K_U(x)`, a pure
+probability/cost condition — nothing ties `q` to `min(U+x,D)-min(U,D)`).
+**Confirmed correct** — a `BUFFER_BUILD` candidate with `ΔG>0, ΔEV<0` is
+a real, non-contradictory possibility and must be evaluated/labeled as
+such, not conflated with `ALPHA`'s profitability meaning.
+
+**Item H, checked against current code**: confirmed no atomic
+matched-pair execution exists or is proposed anywhere (`generate_hedge_candidate`
+submits one single-sided order; nothing in the codebase submits two
+orders as a unit). The reviewer's leg-risk concern is therefore
+correctly forward-looking, not a claim about existing code. Agreed:
+`BUFFER_BUILD`'s two-sided variant (if implemented at all — the one-sided
+`ΔG_U`/`ΔG_D` case above is likely sufficient for the "accumulate cheap
+opposite-side inventory over time" strategy the prompt actually
+describes, since it doesn't require simultaneity) must model
+`FirstLeg -> TemporaryPortfolio -> SecondLeg` explicitly if a genuinely
+simultaneous two-sided candidate is ever built, rather than assuming
+atomicity.
+
+**Proposed fix (supersedes item 12-13's original)**: Implement
+`ΔG_U(x)`/`ΔG_D(x)` (one-sided) as the primary `BUFFER_BUILD` formula —
+this directly matches how the strategy actually accumulates inventory
+(sequential single-sided fills over the round, not simultaneous pairs).
+Keep `ΔG_both(x)` available only if/when a genuinely simultaneous
+two-sided order type is built, modeled with explicit leg-risk per item H
+rather than assumed atomic. Compute `ΔEV_U(x)`/`ΔEV_D(x)` independently
+per item G, and surface both `delta_ev` and `delta_g` as separate fields
+on any `BUFFER_BUILD`/`HEDGE` candidate so the optimizer (and any human
+reviewing the journal) can see risk-improvement and expected-value
+contribution separately, never collapsed into one "profitable" label.
+
+**Regression tests required**: `ΔG_U(x) == min(U+x,D) - min(U,D) - K_U(x)`
+and the symmetric DOWN case, each verified directly against
+`PortfolioState.G` computed before/after a real simulated fill (not
+re-derived independently — i.e. the test must call `apply_fill` and
+compare `after.G - before.G` to the closed-form formula, the same
+pattern `tests/test_portfolio_math.py` already uses for the existing
+identities). The special-case formula (`ΔG_U(x) = x - K_U(x)` when
+`x <= D-U`) as its own explicit test case, not just covered incidentally
+by the general formula's property test.
+
+## I. Do not activate `p_min` while fixing the favored-side bug — adopted
+
+No code contradicts this — item 10's proposed fix already only changes
+*how* `favored_side` is computed, not whether `p_min` becomes active;
+`OneStepConfig.p_min` stays `None` by default regardless. **Adopted as
+an explicit constraint on the implementation plan**: fixing
+`_favored_side()` must not be paired with any change that starts passing
+a non-`None` `p_min` into any demo/ablation config. Re-confirmed via the
+same grep as item 10 — `p_min` is set nowhere today; the fix plan will
+keep it that way unless a specific risk-policy reason is given separately.
+
+## J. Do not invent a sophisticated dynamic `g_min` on synthetic data — adopted
+
+Consistent with and reinforces item 11's own original conclusion ("Do not
+invent the final production formula yet... calibrate it using validation
+data only... No arbitrary g_min = -100 should be interpreted as
+inherently optimal"). **Adopted, no change needed to item 11's
+conclusion** — the correctness-tranche work is limited to exposing a
+clean, explicit, bankroll-relative-*capable* config shape that fails
+closed when required inputs are absent, not to fitting or guessing the
+final formula's weights.
+
+## K. Revised sequencing — adopted, see corrected plan below
+
+Superseded the original "Exact Phase 12B implementation plan" — see the
+rebuilt Tranche 1-5 structure in the Summary section below, which follows
+this section's ordering exactly, with items 3/D, A, B, C, 9, 5, 6, 7, 8,
+10, 18, and E/L now explicitly grouped into Tranche 1 ("correctness /
+invalid-result repair") before any of Tranche 2's portfolio-control
+architecture work begins.
+
+## L. One common execution layer across all Phase 11 ablation arms — adopted, same fix as item E
+
+Confirmed via item E's investigation: baseline currently has *no* depth
+realism (full fill at limit price) while V2 arms have depth-walk realism
+but no delay/revalidation realism — neither arm's execution model matches
+the other today, so any `PnL_A - PnL_B` comparison between them
+(including the already-published Phase 11 ablation matrix numbers, which
+compare `1_baseline_unanimous` against arms 2-8) cannot be attributed to
+the strategy difference alone. **This is not a new finding distinct from
+E — it is E's baseline-vs-V2 half, restated as a cross-arm requirement.**
+The fix is identical: route every arm's taker fills through the same
+`submit_taker_order`/`resolve_pending`/`walk_depth` path.
+
+---
+
 # Summary (per the prompt's required closing sections)
 
 ## Which issues are confirmed
@@ -1147,6 +1644,39 @@ evidence to.
 - Item 9 — `spend_cap` checked per-order, not cumulatively per round.
 - Item 10 — favored-side inference uses payoff geometry (`Pi_U >= Pi_D`), not prediction; currently dormant (`p_min` never configured) but would misfire immediately if enabled.
 - Item 18 — Phase 11 ablations 7/8 call the supervisor with a hardcoded `current_ev_after=0.0` and the wrong (`unconditional` vs `if-filled`) `G` value; `current_optimal_ev` never passed at all, so `REPLACE` can never fire in that harness.
+- **Addendum A — train/evaluation leakage**: every train/eval split in the
+  codebase (9 files: 6 demo scripts, 2 test files, plus the walk-forward
+  harness) generates "held-out" data from the same deterministic
+  round-numbering scheme used for training, producing byte-identical
+  market content for overlapping indices. The single most under-scoped
+  finding in the original audit pass.
+- **Addendum C — uncalibrated `q`**: every `train_q_model()` in Phases
+  8-12's demos/harnesses returns raw `fit_logistic_regression` output,
+  skipping the calibration step Phase 5's own reference demo already
+  implements correctly and that Phase 5's own exit gate requires.
+- **Addendum D — baseline absolute-vs-elapsed time**: `_run_baseline_round`
+  passes absolute `decision_ts` where elapsed round time is required,
+  making the baseline fail its decision-window gate for every round
+  except the one starting at `t=0`. Compounds with item 3 — both must be
+  fixed together for the baseline arm to function at all across more than
+  one round.
+- **Addendum E — baseline execution realism**: the baseline's fill
+  application assumes a full fill at the limit price with no depth-walk
+  at all, a materially easier execution assumption than every V2 arm —
+  confirmed, independent of items 3/D, and invalidates baseline-vs-V2 PnL
+  comparisons on execution-realism grounds alone.
+
+**CONFIRMED DESIGN LIMITATION** (real, verified gaps, several already
+partially self-documented and now given precise root causes) additionally
+includes, from the addendum:
+- **Addendum B** — no per-window model retraining; Phase 11 currently
+  measures strategy/execution sensitivity around one fixed, globally-fit
+  model, not true walk-forward model validation.
+- **Addendum E (V2-arm half)** — taker fills in every Phase 8-12
+  controller path bypass Phase 7's `OrderState` delay/revalidation
+  lifecycle, inert-by-coincidence today (`taker_delay_ms=0.0` everywhere)
+  but silently ignores real delay the moment item 23 wires in per-market
+  config.
 
 **CONFIRMED DESIGN LIMITATION** (real, verified gaps vs. the intended
 architecture, several already partially self-documented in
@@ -1190,9 +1720,21 @@ regardless of how correct the surrounding code becomes.
   — already self-documented in `docs/PHASE_STATUS.md`, and I want to be
   precise that this isn't "maker utility is unweighted," it's "one of two
   terms in the same score has inconsistent weighting."
-- No other claim in the prompt was found to be factually incorrect
-  against the current code — every other numbered item's core technical
-  claim was verified true by direct inspection, not merely plausible.
+- No other claim in the original 38-item prompt was found to be factually
+  incorrect against the current code — every other numbered item's core
+  technical claim was verified true by direct inspection, not merely
+  plausible.
+- Of the reviewer's round-2 findings (A-L), none of A-E or I-L were found
+  factually incorrect — every one was independently re-verified against
+  actual code (not accepted on the strength of the reviewer's framing
+  alone) and confirmed true, several turning out **more severe or
+  wider-reaching** than the reviewer's own framing (Addendum A's leakage
+  is repo-wide across 9 files, not one script; Addendum E's baseline
+  execution gap is independent of and additional to the depth-walk
+  question the reviewer raised for the V2 arms). The one genuine error
+  found in this round was **in this audit's own** original item 12-13
+  proposed fix (the reviewer's item F correctly identified it) — see
+  Addendum F-H for the correction, now adopted.
 
 ## Additional flaws discovered during this audit (not named in the prompt)
 
@@ -1217,64 +1759,196 @@ regardless of how correct the surrounding code becomes.
 
 ## Exact Phase 12B implementation plan (proposed — not yet started)
 
-Following the prompt's own item-35 ordering exactly, mapped to this
-audit's findings:
+**Superseded by the reviewer's Tranche structure (Addendum K), adopted
+in full.** The original single-sequence plan (previous revision of this
+document) is replaced below — correctness/invalid-result repair is now
+explicitly front-loaded into its own tranche, before any portfolio-control
+architecture work (BUFFER_BUILD etc.) begins, and real-market-foundation
+work is separated from real-data calibration, which is separated from
+economics reporting. Every step keeps existing passing tests green (item
+36's "no existing test may be deleted simply because the architecture
+changes" rule); semantics-changing steps get their old test updated in
+place with an inline comment explaining why, alongside new tests, not a
+silent deletion.
 
-1. ~~`docs/PHASE_12B_AUDIT.md`~~ — this document.
-2. Fix baseline `spot_prev` (item 3) — isolated, low-risk, mirrors
-   existing correct pattern in the same file.
-3. Fix `spend_cap` cumulative semantics (item 9).
-4. Rename/clarify `ev_after` → `delta_ev` (item 5) — mechanical, wide
-   diff (~15 files), do before other optimizer changes so they're
-   written against the clarified name.
-5. Split marginal edge from total EV (item 6).
-6. Risk/depth/marginal-edge-aware taker quantity optimization (item 7),
-   wiring in the currently-dead `max_directional_spend`.
-7. Derive real worst-price protection (item 8, backtest-relevant half);
-   defer the dollar-amount translation layer to step 26 (adapter work).
-8. Make favored side explicit (item 10).
-9. Implement `BUFFER_BUILD`/`HEDGE` as genuinely proactive candidates
-   (items 12-13) — the single largest change in this plan.
-10. Make maker price/quantity/TTL dynamic (item 15).
-11. Correct maker probability/risk utility weighting consistency (item 16).
-12. Redesign regime gating as soft prior + hard-gated ablation flag (item 14).
-13. Redesign cancellation with `V_hold/V_cancel/V_replace` + hysteresis (item 17).
-14. Fix Phase 11 supervisor placeholder evaluation (item 18) — mirror the
-    already-correct pattern in `scripts/run_order_supervisor_demo.py`.
-15. Implement chronological maker fills (item 19) — blocked on step 18's
-    real recorder existing; sequence after step 18 below.
-16. Complete real Polymarket/RTDS/Chainlink/user-stream adapters (item 21) —
-    token mapping, Chainlink window confirmation, fee-config wiring (item 23),
-    pre-round history buffer (item 24).
-17. Build the real round recorder (item 31).
-18. Run live non-trading data collection (item 31, continued).
-19. Rerun model calibration and ablations on real data (items 26, 32) —
-    only meaningful once step 18 has produced enough real rounds.
-20. Build a genuine event-driven live loop (item 20) and run true
-    event-driven shadow trading (item 30 stays deferred; MPC expansion
-    does not happen in this pass).
-21. Produce the Phase 12B economic report (item 33) with the requested
-    Pair/Buffer/Directional/Fees/Slippage/AdverseSelection decomposition.
-22. Only then propose Phase 13.
+### Tranche 1 — Correctness / invalid-result repair
 
-Every step keeps existing passing tests green (item 36's "no existing
-test may be deleted simply because the architecture changes" rule);
-semantics-changing steps (1, 4, 9, 12, 13, 17 above) get their old test
-updated in place with an inline comment explaining why, alongside new
-tests, not a silent deletion.
+1. ~~Amend `docs/PHASE_12B_AUDIT.md` with Addendum A-L~~ — this revision.
+2. Fix baseline `spot_prev` (item 3).
+3. Fix baseline elapsed-time `t` (Addendum D) — **must land together
+   with step 2**; fixing either alone still leaves the baseline arm
+   non-functional (item 3 alone: still zero trades outside round 0;
+   Addendum D alone: unanimity still impossible).
+4. Eliminate train/evaluation round overlap (Addendum A) — add
+   `start_index`/`round_ids` support to `generate_synthetic_dataset`,
+   fix all 9 identified call sites (6 demo scripts, 2 test files, the
+   walk-forward harness itself).
+5. Rebuild real walk-forward model fitting/calibration boundaries
+   (Addendum B) — per-window `TRAIN -> fit -> VALIDATE -> calibrate ->
+   FREEZE -> TEST`, folding in calibration (Addendum C) so the
+   per-window `Fit_i` step includes Platt calibration on that window's
+   own validation segment, not a separately-fit raw model.
+6. Fix cumulative round `spend_cap` (item 9).
+7. Rename/clarify `ev_after` → `delta_ev` (item 5).
+8. Add marginal edge, separate from total EV (item 6).
+9. Implement partial/risk/depth-aware taker sizing (item 7), wiring in
+   the currently-dead `max_directional_spend`.
+10. Derive real worst-price protection (item 8, backtest-relevant half);
+    defer the dollar-amount translation layer to the real-adapter tranche.
+11. Fix favored-side semantics (item 10) **without** activating `p_min`
+    (Addendum I) — `OneStepConfig.p_min` stays `None` in every existing
+    config; the fix changes only how `_favored_side` would compute a
+    value if `p_min` were ever set.
+12. Fix Phase 11 supervisor current-order reevaluation (item 18) —
+    mirror the already-correct pattern in
+    `scripts/run_order_supervisor_demo.py`.
+13. Route all Phase 11/12 taker fills through one common, chronological
+    execution path (Addendum E + L combined — same fix serves both):
+    `submit_taker_order -> resolve_pending` with real `walk_depth`
+    sizing, applied identically to the baseline arm (which currently has
+    none) and every V2 arm (which currently has depth-walk sizing but no
+    delay/revalidation).
+
+**After this tranche**: rerun all tests and the synthetic suite **only
+as correctness tests**. Do not report synthetic profitability, per items
+4/37 and Addendum A's confirmation that no "held-out" evaluation to date
+has actually been held out.
+
+### Tranche 2 — Exact portfolio-control architecture
+
+14. Implement `ΔG_U(x)`/`ΔG_D(x)` (one-sided, per Addendum F-H's
+    correction — **not** the two-sided `ΔG_pair` formula this audit
+    originally and incorrectly proposed for a one-sided fill), with
+    `ΔEV_U(x)`/`ΔEV_D(x)` computed independently per Addendum G so
+    `ΔG>0, ΔEV<0` candidates are representable and correctly labeled, not
+    conflated with `ALPHA`'s profitability meaning.
+15. `BUFFER_BUILD`/`HEDGE`/`REBALANCE` purpose separation (items 12-13),
+    built on step 14's corrected formulas, generated independent of a
+    `G < g_min` breach.
+16. Sequential matched-pair / leg-risk state (Addendum H) — model
+    `FirstLeg -> TemporaryPortfolio -> SecondLeg` explicitly if/when a
+    genuinely simultaneous two-sided candidate is built; the one-sided
+    `BUFFER_BUILD` from step 14-15 does not require this since it isn't
+    atomic-pair-dependent.
+17. Soft-regime mode alongside the current hard-gate, kept as an
+    explicit ablation flag (item 14).
+18. Maker hold/cancel/replace economic reevaluation (item 17,
+    `V_hold`/`V_cancel`/`V_replace`).
+19. Cancellation hysteresis/persistence (item 17, continued).
+20. Correct maker probability/risk utility weighting consistency
+    (item 16).
+21. Dynamic maker price/quantity/TTL (item 15).
+22. Chronological maker partial fills (item 19) — the *design*, not
+    yet backed by real event data; blocked on Tranche 3's recorder for
+    real fill reconstruction, but the chronological state-machine
+    structure (submit -> queue -> partial -> more events -> resolve) can
+    be built now and tested against hand-constructed event sequences,
+    the same style `tests/test_execution.py` already uses.
+
+Do not tune any of steps 14-22 to synthetic PnL (item 37 / Addendum J) —
+these are architecture/correctness changes, verified by property tests
+against the exact kernel (Addendum F-H's proof method) and hand-
+constructed scenarios, not by watching synthetic PnL move.
+
+### Tranche 3 — Real market foundation
+
+23. Finish actual market metadata adapter (`_map_tokens_to_sides`, item 22).
+24. Finish Chainlink TWAP mapping/authentication (item 21).
+25. Wire per-market fee config (item 23) and pre-round BTC/TWAP history
+    (item 24).
+26. Implement low-latency BTC event stream + Polymarket CLOB/user/order
+    WebSockets (item 21), and the dollar-amount translation layer
+    deferred from Tranche 1 step 10.
+27. Build a non-trading real round recorder (item 31); validate source
+    vs. receive timestamps (already-correct `event_time`/`recv_ts`
+    machinery from Phases 2/12 — this step is about *recording* real
+    data through it, not changing the causal model).
+28. Collect real BTC five-minute rounds continuously.
+
+### Tranche 4 — Real-data calibration
+
+Only after enough real data exists from Tranche 3:
+
+29. Fit and calibrate `q` using true per-window walk-forward (Tranche
+    1 step 5's rebuilt pipeline, now against real rounds).
+30. Estimate `q` uncertainty (`q_safe`, item 26).
+31. Estimate maker fill hazard / adverse selection from real fills
+    (replacing item 19's stochastic-draw placeholder with the
+    chronological reconstruction from Tranche 2 step 22, now backed by
+    real events).
+32. Estimate latency/slippage distributions.
+33. Calibrate regime persistence (informing Tranche 2's hysteresis
+    thresholds with real data instead of a guessed constant).
+34. Calibrate risk parameters — **only now**, per item 11/Addendum J,
+    build the bankroll-relative `g_min` formula, calibrated against real
+    validation data.
+35. Compare hard regime vs. soft regime (Tranche 2 step 17's ablation)
+    on real data.
+36. Compare static vs. dynamic quantity/TTL/execution choices on real
+    data.
+37. Re-run the full ablation matrix (item 32) on real recorded rounds,
+    including the new ablations item 32 names (hard vs. soft regime
+    gating, proactive buffer on/off, fixed vs. optimized quantity, fixed
+    vs. dynamic TTL, market vs. mixed maker/taker, static vs.
+    bankroll-relative risk floor) — using the one common execution layer
+    from Tranche 1 step 13 so every arm differs only in the strategy
+    dimension being ablated (item L).
+
+### Tranche 5 — Real shadow economics
+
+38. Build the genuine event-driven live loop (item 20) — real async
+    dispatch by event type, heartbeat retained only as a
+    safety/reconciliation fallback.
+39. Run true event-driven shadow trading against the real feeds from
+    Tranche 3.
+40. Produce the Phase 12B economic report (item 33) with the requested
+    net PnL / PnL-per-round / trade frequency / profit factor / average
+    winner-loser / largest loss / max drawdown / CVaR / fees / slippage
+    / maker fill rate / adverse selection / partial fills / cancel
+    regret / G distribution / R distribution / Pi_U/Pi_D distribution /
+    buffer contribution / directional contribution decomposition
+    (`Pair/Buffer Edge + Directional Edge - Fees - Slippage - AdverseSelection`).
+
+**Only after Tranche 5 may Phase 13 be proposed**, per item 34's
+promotion criterion — no arbitrary required dollar PnL per round, per
+item 0/38.
 
 ## Files that will change
 
-`optimizer/candidates.py`, `optimizer/controller.py`, `optimizer/config.py`,
-`optimizer/types.py`, `portfolio/math.py`, `baseline/config.py` (new
-sub-cursor wiring only, not `baseline/strategy.py` itself),
-`walkforward/ablations.py`, `supervisor/supervisor.py`,
-`supervisor/predicates.py`, `supervisor/config.py`, `regime/matrix.py`
-(soft-prior mode, additive), `execution/simulator.py` (once real data
-exists), `shadow/runner.py`, `feeds/polymarket_clob.py`,
-`feeds/chainlink_twap.py`, `feeds/polymarket_user.py`, a new `recorder/`
-module, a new `reports/economic_report.py`, plus the corresponding test
-files for every item above and `docs/PHASE_STATUS.md`.
+**Tranche 1**: `synthetic/rounds.py` (leakage fix — new parameter,
+default-compatible), `walkforward/ablations.py` (baseline `spot_prev` +
+elapsed-time fixes, common execution path, per-window model fitting),
+`walkforward/sensitivity.py` (per-window fitting), `optimizer/candidates.py`,
+`optimizer/controller.py`, `optimizer/config.py`, `optimizer/types.py`,
+`portfolio/math.py`, `supervisor/supervisor.py`, `execution/simulator.py`
+(wiring `submit_taker_order` into the ablations/shadow dispatch paths),
+`shadow/runner.py`, plus every demo script identified in Addendum A's
+table (`scripts/run_one_step_controller_demo.py`,
+`scripts/run_order_supervisor_demo.py`, `scripts/run_mpc_controller_demo.py`,
+`scripts/run_walk_forward_ablation_demo.py`, `scripts/run_shadow_demo.py`)
+and both affected test files (`tests/test_walkforward.py`,
+`tests/test_shadow.py`), and a new shared calibration helper (extracted
+from `scripts/run_model_training_demo.py`'s existing correct pattern) —
+this tranche alone is wider-reaching than the original plan's Tranche 1
+equivalent because of Addendum A's 9-file scope.
+
+**Tranche 2**: `optimizer/candidates.py`, `optimizer/types.py`
+(`OrderPurpose` additions), `portfolio/math.py` (new `ΔG_U`/`ΔG_D`
+functions alongside, not replacing, the existing kernel),
+`supervisor/supervisor.py`, `supervisor/predicates.py`,
+`supervisor/config.py`, `regime/matrix.py` (soft-prior mode, additive),
+`optimizer/config.py` (dynamic maker params).
+
+**Tranche 3**: `feeds/polymarket_clob.py`, `feeds/chainlink_twap.py`,
+`feeds/polymarket_user.py`, `feeds/spot_composite.py`, a new `recorder/`
+module.
+
+**Tranche 4-5**: `model/` (per-window calibration pipeline), a new
+`reports/economic_report.py`, a new live event-loop module (name TBD,
+likely `live/runner.py` alongside the existing `shadow/`).
+
+Plus the corresponding test files for every item above and
+`docs/PHASE_STATUS.md`.
 
 ## Mathematical invariants that will remain untouched
 
@@ -1283,21 +1957,72 @@ files for every item above and `docs/PHASE_STATUS.md`.
 - The `EV_after_total - EV_before_total == q*ΔU + (1-q)*ΔD - ΔC` identity
   (item 5 — the *value* stays; only the *name* changes to `delta_ev`, and
   a test will pin the identity down explicitly for the first time).
-- `DeltaG_pair(x) = x - K_U(x) - K_D(x)` (item 13 — new code, but the
-  identity itself is exact and testable, not an approximation).
+- `ΔG_U(x) = min(U+x,D) - min(U,D) - K_U(x)` and the symmetric DOWN case
+  (Addendum F-H — new code, but the identity is exact and proven directly
+  against the existing `G = min(U,D) - C` kernel above, not an
+  approximation; **this replaces the previous revision's incorrect
+  `ΔG_pair(x) = x - K_U(x) - K_D(x)` for the one-sided case** — that
+  formula is kept, correctly scoped to a genuinely simultaneous two-sided
+  fill only, per Addendum H).
 - Causal replay: `event_time <= decision_time` (Phase 2) and
   `recv_ts <= decision_time` (Phase 12's stricter live gate) both stay
-  exactly as implemented — no item in this audit calls either into
-  question.
+  exactly as implemented — no item in this audit or its addendum calls
+  either into question.
 - Every existing Hypothesis property test in `tests/test_portfolio_math.py`,
   `tests/test_optimizer.py`, and `tests/test_execution.py` continues to
   hold under the proposed changes (none of the proposed fixes alter the
   fill-simulation or constraint-evaluation math itself, only what
-  candidates are generated and what values are compared against
-  constraints).
+  candidates are generated, what model produced `q`, what data a model
+  was fit/evaluated on, and what values are compared against constraints).
 
 ---
 
-**WAITING FOR APPROVAL** before starting the implementation plan above,
-per the prompt's explicit instruction. No implementation changes were
-made in this pass beyond writing this document.
+# Tranche 1 — Implemented (round 3)
+
+**Approved and implemented.** Every Tranche 1 item (the reviewer's 16-item
+approval list) is done, tested, and verified via the full test suite plus
+every affected demo script run end-to-end. Full detail — exact files
+changed, each bug and its exact fix, the formulas implemented, the
+train/validate/test and execution architecture before vs. after, every
+new regression test, the complete suite result, and remaining known
+limitations — was delivered as the chat deliverables report accompanying
+this update, per the reviewer's explicit ask; this document and
+`docs/PHASE_STATUS.md` are updated so the repository itself no longer
+presents pre-Tranche-1 Phase 8-12 evidence as trustworthy.
+
+**Two additional instances of the item-3/D baseline bug and the item-13
+execution-shortcut were found and fixed during Tranche 1 that weren't in
+the original scope list** — `scripts/run_one_step_controller_demo.py` had
+its own local `run_baseline_round()` with the identical `spot_prev`/
+absolute-`t`/no-depth-walk bugs (its own docstring's whole purpose is
+"Compare against baseline on identical replay," so this was a live,
+consequential instance, not a dormant one — confirmed by demo output: 0
+baseline positions before the fix, 4/4 after), and
+`scripts/run_order_supervisor_demo.py`'s controller FAK dispatch had the
+same direct-apply shortcut item 13 fixed in `walkforward/ablations.py`/
+`shadow/runner.py`. Both fixed identically, using the same shared
+`elapsed_t()` helper and `ExecutionSimulator.execute_taker()` already
+built for the originally-scoped fixes.
+
+**Not done, and deliberately so** — real profitability, optimal parameter
+values, or any ablation "winning" cannot be claimed from this pass. Every
+demo re-run in this Tranche is a structural-correctness check (pipeline
+executes, causality holds, no-leakage trace passes, accounting
+reconciles), explicitly not economic evidence, consistent with item 4's
+finding that no synthetic-data claim of that kind was ever supportable.
+
+**Tranche 2 is not started.** Per the reviewer's explicit instruction,
+stopping here for review before any proactive-BUFFER_BUILD architecture,
+soft-regime redesign, maker cancellation redesign, or chronological
+maker-fill work begins.
+
+---
+
+**WAITING FOR APPROVAL (round 2)** before starting the Tranche 1-5
+implementation plan above. Every item in Addendum A-L was independently
+re-verified against actual code, not accepted on the reviewer's framing
+alone — all of A-E and I-L confirmed true (several wider-reaching than
+framed), and the one real error found (this document's own original
+item 12-13 math) corrected in Addendum F-H. **No implementation changes
+have been made in this pass beyond amending this document.** *(Superseded
+by the Tranche 1 — Implemented section above; kept for the audit trail.)*

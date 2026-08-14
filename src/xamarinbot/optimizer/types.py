@@ -33,15 +33,23 @@ class CandidateAction:
     purpose: OrderPurpose
     side: Side | None  # None for WAIT
     mode: OrderMode
-    price: float | None
-    qty: float
+    price: float | None  # average execution price from this candidate's own evaluation-time walk (FAK) or quoted price (maker)
+    qty: float  # desired_shares, per Phase 12B audit item 10's execution contract
     ttl_s: float | None
     expected_fill: float  # expected filled shares (qty for taker if depth suffices, qty*rho for maker)
-    ev_after: float
+    delta_ev: float
     g_after: float
     pi_u_after: float
     pi_d_after: float
     violated_constraints: tuple[str, ...] = field(default_factory=tuple)
+    # Phase 12B audit item 10: the worst acceptable execution price this
+    # candidate was evaluated against (FAK only; None for maker/WAIT,
+    # where it doesn't apply the same way) - `price` above is the
+    # resulting *average* fill price from evaluation, not this cap, so a
+    # caller re-executing the chosen candidate through the real order
+    # lifecycle (item 13) needs this field to preserve the same
+    # worst-price protection rather than re-deriving or guessing a limit.
+    max_execution_price: float | None = None
 
     @property
     def is_valid(self) -> bool:

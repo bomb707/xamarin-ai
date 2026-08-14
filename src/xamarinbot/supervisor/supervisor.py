@@ -35,7 +35,7 @@ class OrderSupervisor:
         tracked: TrackedOrder,
         now_ts: float,
         current_regime_state: RegimeState,
-        current_ev_after: float,
+        current_delta_ev: float,
         current_g_after_if_fill: float,
         tau: float,
         is_fresh: bool,
@@ -53,7 +53,7 @@ class OrderSupervisor:
             return SupervisorDecision(tracked.order_id, SupervisorActionType.CANCEL, CancelReason.RISK_BREACH)
         if regime_flip(tracked.origin_regime_state, current_regime_state):
             return SupervisorDecision(tracked.order_id, SupervisorActionType.CANCEL, CancelReason.REGIME_FLIP)
-        if edge_failure(current_ev_after, self.cfg):
+        if edge_failure(current_delta_ev, self.cfg):
             return SupervisorDecision(tracked.order_id, SupervisorActionType.CANCEL, CancelReason.EDGE_FAILURE)
         if time_compression(tau, self.cfg):
             return SupervisorDecision(tracked.order_id, SupervisorActionType.CANCEL, CancelReason.TIME_COMPRESSION)

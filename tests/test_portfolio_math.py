@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import math
 
-from hypothesis import given, strategies as st
+from hypothesis import given, settings, strategies as st
 
 from xamarinbot.portfolio.math import (
     CandidateFill,
@@ -128,6 +128,28 @@ def test_spend_and_position_constraints():
     assert "position_limit" in evaluate_constraints(result, tight_position).violated
 
 
+def test_spend_cap_is_enforced_cumulatively_across_sequential_candidates():
+    """Phase 12B audit item 9 regression: two sequential candidates, each
+    individually under spend_cap, whose *sum* exceeds it - the second
+    must be rejected. Before the fix, `evaluate_constraints` compared
+    each candidate's own incremental cost (`delta_C`) against the full
+    cap, so both would have passed individually."""
+    fee_config = FeeConfig()
+    constraints = RiskConstraints(g_min=-1000.0, spend_cap=100.0)
+
+    state0 = PortfolioState()
+    first = CandidateFill(Side.UP, 0.5, 150.0, LiquidityRole.TAKER, OrderPurpose.ALPHA)  # cost ~75 + fee
+    result1 = simulate_fill(state0, first, fee_config)
+    check1 = evaluate_constraints(result1, constraints)
+    assert check1.passed  # ~75 <= 100, individually fine
+
+    state1 = result1.portfolio_after  # C now ~75+fee, round-scoped cumulative state
+    second = CandidateFill(Side.UP, 0.5, 100.0, LiquidityRole.TAKER, OrderPurpose.ALPHA)  # cost ~50 + fee, also < 100 alone
+    result2 = simulate_fill(state1, second, fee_config)
+    check2 = evaluate_constraints(result2, constraints)
+    assert "spend_cap" in check2.violated  # ~75 + ~50 > 100 cumulative - must be rejected
+
+
 def test_max_directional_spend_formula():
     assert max_directional_spend(g_current=10.0, g_min=2.0) == 8.0
 
@@ -144,3 +166,47 @@ def test_hedge_quantity_formulas():
 def test_hedge_efficiency_formula():
     assert math.isclose(hedge_efficiency(0.2), 0.8 / 0.2)
     assert math.isclose(hedge_efficiency(0.5), 1.0)
+
+
+# --------------------------------------------------------------------------
+# Phase 12B Tranche 1, item 1: the delta_ev identity, pinned down explicitly
+# (Roadmap audit item 5 - `delta_ev = q*deltaU + (1-q)*deltaD - deltaC` is
+# provably `EV(after) - EV(before)` where `EV(state) = q*U + (1-q)*D - C`,
+# by linearity, for any *fixed* q shared by both states. This was true
+# before the ev_after->delta_ev rename too - only the name was ambiguous,
+# never the value - but no test had pinned the identity down explicitly
+# until now.)
+# --------------------------------------------------------------------------
+
+
+def _ev(state: PortfolioState, q: float) -> float:
+    return q * state.U + (1.0 - q) * state.D - state.C
+
+
+@settings(deadline=None)  # first-call JIT/import warmup can exceed Hypothesis's default 200ms deadline under load; not a correctness concern
+@given(
+    st.floats(min_value=0.0, max_value=500.0, allow_nan=False),
+    st.floats(min_value=0.0, max_value=500.0, allow_nan=False),
+    st.floats(min_value=0.0, max_value=500.0, allow_nan=False),
+    st.sampled_from([Side.UP, Side.DOWN]),
+    st.floats(min_value=0.01, max_value=0.99, allow_nan=False),
+    st.floats(min_value=0.01, max_value=200.0, allow_nan=False),
+    st.floats(min_value=0.0, max_value=1.0, allow_nan=False),
+)
+def test_delta_ev_equals_total_ev_after_minus_ev_before(u0, d0, c0, side, price, shares, q):
+    """delta_ev (q*deltaU + (1-q)*deltaD - deltaC) must equal
+    EV(after; q) - EV(before; q) for the *same* q on both sides - the
+    identity every candidate-selection argmax in optimizer/candidates.py
+    silently relies on."""
+    fee_config = FeeConfig()
+    before = PortfolioState(U=u0, D=d0, C=c0)
+    fee = fee_config.fee_for(LiquidityRole.TAKER, shares, price)
+    fill = Fill(side=side, price=price, shares=shares, role=LiquidityRole.TAKER, fee=fee)
+    after = apply_fill(before, fill)
+
+    delta_U = after.U - before.U
+    delta_D = after.D - before.D
+    delta_C = after.C - before.C
+    delta_ev = q * delta_U + (1.0 - q) * delta_D - delta_C
+
+    assert math.isclose(delta_ev, _ev(after, q) - _ev(before, q), rel_tol=1e-9, abs_tol=1e-9)

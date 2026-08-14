@@ -81,7 +81,7 @@ def test_review_order_holds_when_thesis_still_valid():
     supervisor = OrderSupervisor(cfg)
     tracked = _tracked(submit_ts=0.0)
     tracked.last_action_ts = -1000.0  # clear of rate limiting
-    decision = supervisor.review_order(tracked, now_ts=5.0, current_regime_state=STATE_A, current_ev_after=5.0, current_g_after_if_fill=-1.0, tau=200.0, is_fresh=True)
+    decision = supervisor.review_order(tracked, now_ts=5.0, current_regime_state=STATE_A, current_delta_ev=5.0, current_g_after_if_fill=-1.0, tau=200.0, is_fresh=True)
     assert decision.action is SupervisorActionType.HOLD
     assert decision.reason is None
 
@@ -92,7 +92,7 @@ def test_feed_stale_takes_priority_over_everything_else():
     supervisor = OrderSupervisor(cfg)
     tracked = _tracked()
     tracked.last_action_ts = -1000.0
-    decision = supervisor.review_order(tracked, now_ts=5.0, current_regime_state=STATE_A, current_ev_after=5.0, current_g_after_if_fill=-1.0, tau=200.0, is_fresh=False)
+    decision = supervisor.review_order(tracked, now_ts=5.0, current_regime_state=STATE_A, current_delta_ev=5.0, current_g_after_if_fill=-1.0, tau=200.0, is_fresh=False)
     assert decision.action is SupervisorActionType.CANCEL
     assert decision.reason is CancelReason.FEED_STALE
 
@@ -108,7 +108,7 @@ def test_rapid_regime_flip_cancels_immediately():
     tracked = _tracked(origin=STATE_A)
     supervisor.register(tracked)
 
-    decision = supervisor.review_order(tracked, now_ts=1.0, current_regime_state=STATE_B, current_ev_after=5.0, current_g_after_if_fill=-1.0, tau=200.0, is_fresh=True)
+    decision = supervisor.review_order(tracked, now_ts=1.0, current_regime_state=STATE_B, current_delta_ev=5.0, current_g_after_if_fill=-1.0, tau=200.0, is_fresh=True)
     assert decision.action is SupervisorActionType.CANCEL
     assert decision.reason is CancelReason.REGIME_FLIP
 
@@ -128,7 +128,7 @@ def test_rapid_successive_flips_are_rate_limited():
     supervisor.register(tracked)
 
     # flips again 0.5s later - inside the rate-limit window
-    decision = supervisor.review_order(tracked, now_ts=0.5, current_regime_state=STATE_B, current_ev_after=5.0, current_g_after_if_fill=-1.0, tau=200.0, is_fresh=True)
+    decision = supervisor.review_order(tracked, now_ts=0.5, current_regime_state=STATE_B, current_delta_ev=5.0, current_g_after_if_fill=-1.0, tau=200.0, is_fresh=True)
     assert decision.action is SupervisorActionType.HOLD
     assert decision.detail == "rate_limited"
 
@@ -147,7 +147,7 @@ def test_partial_fill_then_cancel_via_supervisor():
     tracked.order_state.reconcile_fill(1.0, 40.0)  # partial fill happens first
     assert tracked.order_state.state is OrderLifecycleState.PARTIALLY_FILLED
 
-    decision = supervisor.review_order(tracked, now_ts=2.0, current_regime_state=STATE_B, current_ev_after=5.0, current_g_after_if_fill=-1.0, tau=200.0, is_fresh=True)
+    decision = supervisor.review_order(tracked, now_ts=2.0, current_regime_state=STATE_B, current_delta_ev=5.0, current_g_after_if_fill=-1.0, tau=200.0, is_fresh=True)
     assert decision.action is SupervisorActionType.CANCEL
 
     result = supervisor.apply_cancel(decision, now_ts=2.0)
@@ -168,7 +168,7 @@ def test_fill_beating_cancel_still_removes_order_from_tracking():
     tracked.order_state.reconcile_fill(1.0, 20.0)  # fully filled before cancel arrives
     assert tracked.order_state.state is OrderLifecycleState.FILLED
 
-    decision = supervisor.review_order(tracked, now_ts=2.0, current_regime_state=STATE_B, current_ev_after=5.0, current_g_after_if_fill=-1.0, tau=200.0, is_fresh=True)
+    decision = supervisor.review_order(tracked, now_ts=2.0, current_regime_state=STATE_B, current_delta_ev=5.0, current_g_after_if_fill=-1.0, tau=200.0, is_fresh=True)
     result = supervisor.apply_cancel(decision, now_ts=2.0)
     assert not result.accepted  # already terminal, cancel itself is rejected
     assert "o1" not in supervisor.open_order_ids()  # but tracking still cleans it up
@@ -187,7 +187,7 @@ def test_tick_size_change_with_open_order_replace_uses_new_grid():
     tracked = _tracked(price=0.45)
     supervisor.register(tracked)
 
-    decision = supervisor.review_order(tracked, now_ts=1.0, current_regime_state=STATE_A, current_ev_after=10.0, current_g_after_if_fill=-1.0, tau=200.0, is_fresh=True, current_optimal_ev=15.0)
+    decision = supervisor.review_order(tracked, now_ts=1.0, current_regime_state=STATE_A, current_delta_ev=10.0, current_g_after_if_fill=-1.0, tau=200.0, is_fresh=True, current_optimal_ev=15.0)
     assert decision.action is SupervisorActionType.REPLACE
 
     old_tick_size = 0.01
@@ -223,7 +223,7 @@ def test_order_survives_tick_size_change_event_without_error():
     supervisor = OrderSupervisor(cfg)
     tracked = _tracked()
     supervisor.register(tracked)
-    decision = supervisor.review_order(tracked, now_ts=150.0, current_regime_state=STATE_A, current_ev_after=10.0, current_g_after_if_fill=-1.0, tau=150.0, is_fresh=True)
+    decision = supervisor.review_order(tracked, now_ts=150.0, current_regime_state=STATE_A, current_delta_ev=10.0, current_g_after_if_fill=-1.0, tau=150.0, is_fresh=True)
     assert decision.action is SupervisorActionType.HOLD  # nothing else changed, still a valid thesis
 
 
@@ -238,7 +238,7 @@ def test_feed_stale_while_maker_order_rests_cancels_it():
     tracked = _tracked()
     supervisor.register(tracked)
 
-    decision = supervisor.review_order(tracked, now_ts=3.0, current_regime_state=STATE_A, current_ev_after=10.0, current_g_after_if_fill=-1.0, tau=200.0, is_fresh=False)
+    decision = supervisor.review_order(tracked, now_ts=3.0, current_regime_state=STATE_A, current_delta_ev=10.0, current_g_after_if_fill=-1.0, tau=200.0, is_fresh=False)
     assert decision.action is SupervisorActionType.CANCEL
     assert decision.reason is CancelReason.FEED_STALE
     result = supervisor.apply_cancel(decision, now_ts=3.0)

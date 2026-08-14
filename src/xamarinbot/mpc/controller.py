@@ -12,7 +12,7 @@ discrete candidate actions" describes.
 Simplifications, all documented at point of use: continuation projections
 hold CLOB/spot direction fixed, evolving only `GapRegime` via Phase 10's
 transition model; maker candidates' continuation uses their *if-filled*
-portfolio uniformly (their own `ev_after`, used for selection, already
+portfolio uniformly (their own `delta_ev`, used for selection, already
 correctly probability-weights the fill itself - this only affects the
 continuation estimate, not the immediate decision). The order book *depth*
 is NOT held fully fixed - see `_deplete_book` below; only holding depth
@@ -120,7 +120,7 @@ class MPCController:
             # equals one-step action in degenerate horizon") - no
             # continuation term, so total sequence value is just the
             # candidate's own EV, same ranking Phase 8 already computed.
-            sequence_values = {c.action_id: c.ev_after for c in base.candidates}
+            sequence_values = {c.action_id: c.delta_ev for c in base.candidates}
             return MPCDecision(round_id, decision_ts, base.chosen, base.candidates, sequence_values, used_fallback=False, elapsed_ms=(time.monotonic() - start) * 1000.0)
 
         deadline = start + self.cfg.time_budget_ms / 1000.0
@@ -141,7 +141,7 @@ class MPCController:
                         round_id, portfolio_after, next_state, q, book_up_after, book_down_after, tick_size, is_fresh,
                         self.cfg.horizon_steps - 1, deadline,
                     )
-                sequence_values[candidate.action_id] = candidate.ev_after + continuation
+                sequence_values[candidate.action_id] = candidate.delta_ev + continuation
         except _DeadlineExceeded:
             # "Bound computation time; fall back to one-step controller if
             # deadline exceeded" - the plain Phase 8 decision, unmodified.
@@ -174,7 +174,7 @@ class MPCController:
 
         permitted = ActionPermissionMatrix.permitted_actions(classify_seed_action(regime_state))
         decision = self.one_step.decide(round_id, 0.0, portfolio, q, permitted, book_up, book_down, tick_size, is_fresh)
-        value = decision.chosen.ev_after
+        value = decision.chosen.delta_ev
         if depth > 1:
             portfolio_after = _portfolio_after_candidate(portfolio, decision.chosen)
             book_up_after, book_down_after = _deplete_books_for_candidate(book_up, book_down, decision.chosen)

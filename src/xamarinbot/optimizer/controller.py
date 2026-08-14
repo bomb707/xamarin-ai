@@ -18,7 +18,7 @@ from xamarinbot.optimizer.candidates import (
     evaluate_taker_candidate,
     generate_hedge_candidate,
     maker_price_grid,
-    taker_quantities,
+    taker_sizing_boundaries,
     wait_candidate,
 )
 from xamarinbot.optimizer.config import OneStepConfig
@@ -64,25 +64,36 @@ class OneStepController:
             return OneStepDecision(round_id, decision_ts, wait, tuple(candidates), skip_reason="stale_data")
 
         idx = 0
+        # Phase 12B audit items 7/8/10: candidate quantities and the
+        # worst-price cap are now both derived from the actual book +
+        # current risk/position/spend budgets (taker_sizing_boundaries),
+        # not raw depth-level sums evaluated against an unconstraining
+        # limit_price=1.0. p_max is None only when no level clears
+        # min_marginal_edge at all, in which case there is nothing to
+        # generate for that side this decision.
         if SeedAction.TAKER_UP in permitted_actions and book_up is not None and book_up.asks:
-            for qty in taker_quantities(book_up.asks, self.cfg.max_taker_depth_levels):
-                idx += 1
-                candidates.append(
-                    evaluate_taker_candidate(
-                        f"taker_up_{idx}", Side.UP, OrderPurpose.ALPHA, qty, limit_price=1.0,
-                        asks=book_up.asks, portfolio=portfolio, q=q, fee_config=self.fee_config, cfg=self.cfg,
+            sizing = taker_sizing_boundaries(book_up.asks, q, self.fee_config, self.cfg, portfolio, portfolio.U)
+            if sizing.p_max is not None:
+                for qty in sizing.quantities:
+                    idx += 1
+                    candidates.append(
+                        evaluate_taker_candidate(
+                            f"taker_up_{idx}", Side.UP, OrderPurpose.ALPHA, qty, limit_price=sizing.p_max,
+                            asks=book_up.asks, portfolio=portfolio, q=q, fee_config=self.fee_config, cfg=self.cfg,
+                        )
                     )
-                )
 
         if SeedAction.TAKER_DOWN in permitted_actions and book_down is not None and book_down.asks:
-            for qty in taker_quantities(book_down.asks, self.cfg.max_taker_depth_levels):
-                idx += 1
-                candidates.append(
-                    evaluate_taker_candidate(
-                        f"taker_down_{idx}", Side.DOWN, OrderPurpose.ALPHA, qty, limit_price=1.0,
-                        asks=book_down.asks, portfolio=portfolio, q=q, fee_config=self.fee_config, cfg=self.cfg,
+            sizing = taker_sizing_boundaries(book_down.asks, 1.0 - q, self.fee_config, self.cfg, portfolio, portfolio.D)
+            if sizing.p_max is not None:
+                for qty in sizing.quantities:
+                    idx += 1
+                    candidates.append(
+                        evaluate_taker_candidate(
+                            f"taker_down_{idx}", Side.DOWN, OrderPurpose.ALPHA, qty, limit_price=sizing.p_max,
+                            asks=book_down.asks, portfolio=portfolio, q=q, fee_config=self.fee_config, cfg=self.cfg,
+                        )
                     )
-                )
 
         if self.cfg.enable_portfolio_repair:
             # Hedge candidates are evaluated regardless of the regime's
@@ -130,6 +141,6 @@ class OneStepController:
 
         valid = [c for c in candidates if c.is_valid]
         # SS18: J = E[PnL_T] + lambda_G*G_T - ...; lambda_g=0 (the default)
-        # reduces this to plain ev_after ranking, identical to Phases 8-10.
-        chosen = max(valid, key=lambda c: c.ev_after + self.cfg.lambda_g * c.g_after) if valid else wait
+        # reduces this to plain delta_ev ranking, identical to Phases 8-10.
+        chosen = max(valid, key=lambda c: c.delta_ev + self.cfg.lambda_g * c.g_after) if valid else wait
         return OneStepDecision(round_id, decision_ts, chosen, tuple(candidates), skip_reason=None)

@@ -13,9 +13,10 @@ from xamarinbot.events.types import EventType
 from xamarinbot.execution.config import ExecutionConfig
 from xamarinbot.features.config import FeatureConfig
 from xamarinbot.feeds.mock import MockFeedCursor, MockTWAPFeed
+from xamarinbot.model.calibrated import fit_calibrated_model
 from xamarinbot.model.dataset import build_examples_multi
 from xamarinbot.model.features import COMBINED_LEAD_LAG
-from xamarinbot.model.logistic import fit_logistic_regression
+from xamarinbot.model.walkforward import time_ordered_split
 from xamarinbot.optimizer.config import OneStepConfig
 from xamarinbot.portfolio.state import FeeConfig
 from xamarinbot.shadow.config import ShadowConfig
@@ -97,17 +98,21 @@ def one_step_cfg():
 
 @pytest.fixture(scope="module")
 def trained_model(feature_cfg):
+    # Phase 12B audit item 5/C: calibrated, not raw.
     store = EventStore(":memory:")
     results = generate_synthetic_dataset(store, n_rounds=8)
     by_fs = build_examples_multi(store, results, feature_cfg, [COMBINED_LEAD_LAG], heartbeat_s=HEARTBEAT_S)
     examples = by_fs[COMBINED_LEAD_LAG.name]
-    return fit_logistic_regression([e.x for e in examples], [e.y for e in examples], COMBINED_LEAD_LAG.name, COMBINED_LEAD_LAG.column_names)
+    split = time_ordered_split(examples, train_frac=0.6, val_frac=0.2)
+    return fit_calibrated_model(split.train, split.validation, COMBINED_LEAD_LAG)
 
 
 @pytest.fixture(scope="module")
 def eval_dataset():
     store = EventStore(":memory:")
-    results = generate_synthetic_dataset(store, n_rounds=3)
+    # id_offset=8: disjoint from trained_model's training rounds [0, 8)
+    # (Phase 12B audit Addendum A).
+    results = generate_synthetic_dataset(store, n_rounds=3, id_offset=8)
     return store, results
 
 
@@ -124,7 +129,7 @@ def test_shadow_runner_produces_decisions_and_never_crashes(eval_dataset, featur
     assert len(result.records) > 0
     assert result.n_reconnects == 0
     for rec in result.records:
-        assert math.isfinite(rec.ev_after)
+        assert math.isfinite(rec.delta_ev)
         assert math.isfinite(rec.g_after)
         assert rec.decide_elapsed_ms >= 0.0
 

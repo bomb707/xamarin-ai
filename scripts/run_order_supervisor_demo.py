@@ -24,9 +24,10 @@ from xamarinbot.features.types import FeatureVector
 from xamarinbot.feeds.mock import MockBookFeed, MockFeedCursor
 from xamarinbot.journal.schema import SupervisorDecisionRecord
 from xamarinbot.journal.writer import JournalWriter
+from xamarinbot.model.calibrated import fit_calibrated_model
 from xamarinbot.model.dataset import build_examples_multi
 from xamarinbot.model.features import COMBINED_LEAD_LAG, design_vector
-from xamarinbot.model.logistic import fit_logistic_regression
+from xamarinbot.model.walkforward import time_ordered_split
 from xamarinbot.optimizer.candidates import evaluate_maker_candidate, maker_price_grid
 from xamarinbot.optimizer.config import OneStepConfig
 from xamarinbot.optimizer.controller import OneStepController
@@ -45,11 +46,14 @@ N_TRAIN_ROUNDS = 15
 
 
 def train_q_model(feature_cfg: FeatureConfig):
+    # Phase 12B audit item 5/C: fit on train, calibrate (Platt) on a
+    # disjoint validation slice.
     train_store = EventStore(":memory:")
     train_results = generate_synthetic_dataset(train_store, n_rounds=N_TRAIN_ROUNDS)
     by_fs = build_examples_multi(train_store, train_results, feature_cfg, [COMBINED_LEAD_LAG], heartbeat_s=HEARTBEAT_S)
     examples = by_fs[COMBINED_LEAD_LAG.name]
-    return fit_logistic_regression([e.x for e in examples], [e.y for e in examples], COMBINED_LEAD_LAG.name, COMBINED_LEAD_LAG.column_names)
+    split = time_ordered_split(examples, train_frac=0.6, val_frac=0.2)
+    return fit_calibrated_model(split.train, split.validation, COMBINED_LEAD_LAG)
 
 
 def run_round(store, round_id, p0, feature_cfg, model, controller_cfg, supervisor_cfg, exec_cfg, fee_config, journal) -> tuple[PortfolioState, dict]:
@@ -95,7 +99,7 @@ def run_round(store, round_id, p0, feature_cfg, model, controller_cfg, superviso
                 exec_cfg=exec_cfg, cfg=recompute_cfg,
             )
             decision = supervisor.review_order(
-                tracked, decision_ts, snapshot.state, current.ev_after, current.g_after, fv.tau, is_fresh=True,
+                tracked, decision_ts, snapshot.state, current.delta_ev, current.g_after, fv.tau, is_fresh=True,
             )
             journal.write(SupervisorDecisionRecord(
                 round_id=round_id, order_id=order_id, decision_ts=decision_ts, action=decision.action.value,
@@ -113,7 +117,7 @@ def run_round(store, round_id, p0, feature_cfg, model, controller_cfg, superviso
                     if result and result.new_order is not None:
                         supervisor.register(TrackedOrder(
                             result.new_order, snapshot.state, tracked.purpose, q, tracked.fair_value_at_submit,
-                            current.g_after, current.ev_after, tracked.ttl_s, decision_ts, decision_ts,
+                            current.g_after, current.delta_ev, tracked.ttl_s, decision_ts, decision_ts,
                         ))
 
         # 2) resolve TTL-expired orders (stochastic maker fill, Phase 7)
@@ -135,9 +139,14 @@ def run_round(store, round_id, p0, feature_cfg, model, controller_cfg, superviso
 
         # 3) place a new order if the one-step controller wants a maker candidate
         decision = controller.decide(round_id, decision_ts, portfolio, q, snapshot.permitted_actions, book_up, book_down, tick_size, is_fresh=True)
-        if decision.chosen.mode is OrderMode.FAK and decision.chosen.expected_fill > 0:
-            fee = fee_config.taker_fee(decision.chosen.expected_fill, decision.chosen.price)
-            portfolio = apply_fill(portfolio, Fill(decision.chosen.side, decision.chosen.price, decision.chosen.expected_fill, LiquidityRole.TAKER, fee))
+        if decision.chosen.mode is OrderMode.FAK and decision.chosen.qty > 0:
+            # Phase 12B audit items 13/E/L: real submit->resolve lifecycle.
+            order_seq += 1
+            asks = book_up.asks if decision.chosen.side is Side.UP else book_down.asks
+            limit_price = decision.chosen.max_execution_price if decision.chosen.max_execution_price is not None else decision.chosen.price
+            _, taker_result = sim.execute_taker(f"{round_id}-o{order_seq}", decision.chosen.side, decision.chosen.qty, limit_price, asks, decision_ts)
+            if taker_result.walk.filled_shares > 0:
+                portfolio = apply_fill(portfolio, Fill(decision.chosen.side, taker_result.walk.avg_price, taker_result.walk.filled_shares, LiquidityRole.TAKER, taker_result.walk.total_fee))
         elif decision.chosen.mode is OrderMode.POST_ONLY:
             order_seq += 1
             order_id = f"{round_id}-o{order_seq}"
@@ -145,7 +154,7 @@ def run_round(store, round_id, p0, feature_cfg, model, controller_cfg, superviso
             fair_value = q if decision.chosen.side is Side.UP else (1.0 - q)
             supervisor.register(TrackedOrder(
                 order_state, snapshot.state, OrderPurpose.ALPHA, q, fair_value,
-                decision.chosen.g_after, decision.chosen.ev_after, decision.chosen.ttl_s or controller_cfg.maker_horizon_s,
+                decision.chosen.g_after, decision.chosen.delta_ev, decision.chosen.ttl_s or controller_cfg.maker_horizon_s,
                 decision_ts, decision_ts,
             ))
             stats["placed"] += 1
@@ -166,7 +175,9 @@ def main() -> None:
 
     print(f"Running OrderSupervisor over {n_eval_rounds} rounds...")
     eval_store = EventStore(":memory:")
-    eval_results = generate_synthetic_dataset(eval_store, n_rounds=n_eval_rounds)
+    # id_offset=N_TRAIN_ROUNDS: disjoint from training rounds (Phase 12B
+    # audit Addendum A).
+    eval_results = generate_synthetic_dataset(eval_store, n_rounds=n_eval_rounds, id_offset=N_TRAIN_ROUNDS)
     journal = JournalWriter(":memory:")
 
     total_pnl = 0.0

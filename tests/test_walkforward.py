@@ -12,9 +12,10 @@ import pytest
 from xamarinbot.events.store import EventStore
 from xamarinbot.execution.config import ExecutionConfig
 from xamarinbot.features.config import FeatureConfig
+from xamarinbot.model.calibrated import fit_calibrated_model
 from xamarinbot.model.dataset import build_examples_multi
 from xamarinbot.model.features import COMBINED_LEAD_LAG
-from xamarinbot.model.logistic import fit_logistic_regression
+from xamarinbot.model.walkforward import time_ordered_split
 from xamarinbot.portfolio.state import FeeConfig, Side
 from xamarinbot.synthetic.rounds import generate_synthetic_dataset
 from xamarinbot.walkforward.ablations import MANDATORY_ABLATIONS, RoundResult, run_ablation_round
@@ -154,17 +155,24 @@ def exec_cfg():
 
 @pytest.fixture(scope="module")
 def trained_model(feature_cfg):
+    # Phase 12B audit item 5/C: the model these tests exercise the
+    # controller with must be calibrated, matching what every demo/harness
+    # now does - not the raw logistic score.
     store = EventStore(":memory:")
     results = generate_synthetic_dataset(store, n_rounds=8)
     by_fs = build_examples_multi(store, results, feature_cfg, [COMBINED_LEAD_LAG], heartbeat_s=HEARTBEAT_S)
     examples = by_fs[COMBINED_LEAD_LAG.name]
-    return fit_logistic_regression([e.x for e in examples], [e.y for e in examples], COMBINED_LEAD_LAG.name, COMBINED_LEAD_LAG.column_names)
+    split = time_ordered_split(examples, train_frac=0.6, val_frac=0.2)
+    return fit_calibrated_model(split.train, split.validation, COMBINED_LEAD_LAG)
 
 
 @pytest.fixture(scope="module")
 def eval_dataset():
     store = EventStore(":memory:")
-    results = generate_synthetic_dataset(store, n_rounds=6)
+    # id_offset=8: disjoint from trained_model's training rounds [0, 8)
+    # (Phase 12B audit Addendum A - previously both fixtures restarted at
+    # index 0, so "eval" rounds were identical to training rounds).
+    results = generate_synthetic_dataset(store, n_rounds=6, id_offset=8)
     return store, results
 
 
@@ -202,14 +210,26 @@ def test_every_mandatory_ablation_runs_without_error_and_produces_sane_metrics(s
         assert math.isfinite(result.final_g)
 
 
-def test_ablation_6_taker_only_and_7_8_supervisor_variants_show_zero_actions_on_this_dataset(eval_dataset, feature_cfg, fee_config, exec_cfg, trained_model):
-    """Documented, mechanistically-verified findings (see
-    docs/PHASE_STATUS.md), not bugs: #6's book-depth-sized taker
-    quantities all breach g_min=-100 while maker's small fixed clip does
-    not, so taker-only has nothing left to trade; #7/#8's maker orders get
-    registered but cancelled via REGIME_FLIP before ever reaching TTL,
-    reproducing Phase 9's own finding. This test pins that behavior down
-    so a future change that silently alters it gets noticed either way."""
+def test_ablations_6_7_8_now_trade_after_taker_sizing_fix(eval_dataset, feature_cfg, fee_config, exec_cfg, trained_model):
+    """UPDATED by Phase 12B Tranche 1 (items 7/8) - superseding the prior
+    "zero actions" finding this test used to pin down.
+
+    That finding was itself an artifact of the pre-Tranche-1 bug it
+    documented: `taker_quantities` only ever offered raw cumulative
+    depth-level sums as candidate sizes, so whenever even the smallest
+    depth level breached `g_min`, taker-only execution (#6) had literally
+    nothing feasible to offer. Since taker fills are also immediate/
+    synchronous (no resting period), they were never vulnerable to the
+    REGIME_FLIP-before-TTL cancellation dynamic that killed #7/#8's maker
+    orders either - once sizing produces a risk-feasible taker quantity,
+    it can win selection and fill before any regime flip has a chance to
+    cancel it. Fixing the sizing bug (`taker_sizing_boundaries`, wired
+    into `max_directional_spend`) therefore changes all three ablations'
+    behavior on this dataset, not just #6's - confirmed directly (11, 11,
+    and 114 actions respectively across this eval set at the time of the
+    fix). Exact counts aren't asserted here since they're sensitive to
+    the model fit and dataset - the qualitative claim (each can now
+    trade) is the regression this test protects."""
     store, results = eval_dataset
     for name in ("6_portfolio_control_taker_only", "7_maker_taker_cancel_replace", "8_full_mpc"):
         spec = next(s for s in MANDATORY_ABLATIONS if s.name == name)
@@ -217,7 +237,39 @@ def test_ablation_6_taker_only_and_7_8_supervisor_variants_show_zero_actions_on_
             run_ablation_round(spec, store, r.round_id, r.p0, r.outcome, feature_cfg, fee_config, exec_cfg, trained_model, None)
             for r in results
         ]
-        assert sum(r.n_actions for r in totals) == 0, f"{name} expected zero actions on this synthetic dataset"
+        assert sum(r.n_actions for r in totals) > 0, f"{name} expected to trade now that taker sizing is risk/depth/marginal-edge-aware"
+
+
+def test_supervisor_receives_recomputed_economics_not_placeholders(eval_dataset, feature_cfg, fee_config, exec_cfg, trained_model):
+    """Phase 12B audit item 12/18 regression: `_run_controller_round`
+    previously called `supervisor.review_order` with a hardcoded
+    `current_delta_ev=0.0` and `current_g_after_if_fill=portfolio.G`
+    (the *unconditional* current G, not the order's own if-filled G).
+    Spy on `OrderSupervisor.review_order` across a real ablation-7 run and
+    assert at least one call received a `current_delta_ev` that isn't
+    exactly 0.0 and a `current_g_after_if_fill` that isn't always
+    identical to the portfolio's own G at call time - proving real,
+    order-specific recomputation is happening, not the old placeholders."""
+    from unittest.mock import patch
+
+    import xamarinbot.supervisor.supervisor as supervisor_mod
+
+    store, results = eval_dataset
+    spec = next(s for s in MANDATORY_ABLATIONS if s.name == "7_maker_taker_cancel_replace")
+
+    calls = []
+    real_review_order = supervisor_mod.OrderSupervisor.review_order
+
+    def spy(self, tracked, now_ts, current_regime_state, current_delta_ev, current_g_after_if_fill, tau, is_fresh, current_optimal_ev=None):
+        calls.append((current_delta_ev, current_g_after_if_fill))
+        return real_review_order(self, tracked, now_ts, current_regime_state, current_delta_ev, current_g_after_if_fill, tau, is_fresh, current_optimal_ev)
+
+    with patch.object(supervisor_mod.OrderSupervisor, "review_order", spy):
+        for r in results:
+            run_ablation_round(spec, store, r.round_id, r.p0, r.outcome, feature_cfg, fee_config, exec_cfg, trained_model, None)
+
+    assert len(calls) > 0, "expected at least one open-order review across these rounds"
+    assert any(delta_ev != 0.0 for delta_ev, _ in calls), "current_delta_ev was always exactly 0.0 - looks like the old placeholder"
 
 
 def test_ablation_5_without_repair_does_take_action(eval_dataset, feature_cfg, fee_config, exec_cfg, trained_model):

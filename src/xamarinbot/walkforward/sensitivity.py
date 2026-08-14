@@ -19,6 +19,7 @@ from xamarinbot.events.store import EventStore
 from xamarinbot.execution.config import ExecutionConfig
 from xamarinbot.features.config import FeatureConfig
 from xamarinbot.model.features import FeatureSet
+from xamarinbot.model.calibrated import CalibratedModel
 from xamarinbot.model.logistic import LogisticModel
 from xamarinbot.optimizer.config import OneStepConfig
 from xamarinbot.portfolio.state import FeeConfig, Side
@@ -65,7 +66,7 @@ def sweep_parameter(
     feature_cfg: FeatureConfig,
     fee_config: FeeConfig,
     exec_cfg: ExecutionConfig,
-    model: LogisticModel | None,
+    model: LogisticModel | CalibratedModel | None,
 ) -> SensitivityResult:
     """Runs `run_ablation_round` once per (value, round) pair, varying only
     `parameter_name` on `base_cfg` via `dataclasses.replace` - every other
@@ -112,7 +113,7 @@ def parameter_stability_across_windows(
     feature_cfg: FeatureConfig,
     fee_config: FeeConfig,
     exec_cfg: ExecutionConfig,
-    model: LogisticModel | None,
+    model: LogisticModel | CalibratedModel | None,
 ) -> StabilityResult:
     """Per Roadmap Phase 11: "Lock parameters before each test segment" -
     the sweep here uses each window's *validate* rounds only (never test),

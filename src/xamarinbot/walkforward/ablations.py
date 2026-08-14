@@ -21,6 +21,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from xamarinbot.baseline.config import BaselineConfig
+from xamarinbot.baseline.inputs import elapsed_t
 from xamarinbot.baseline.strategy import BaselineInputs, decide as baseline_decide
 from xamarinbot.events.replay import ReplayClock
 from xamarinbot.events.store import EventStore
@@ -32,10 +33,12 @@ from xamarinbot.features.engine import compute
 from xamarinbot.features.types import FeatureVector
 from xamarinbot.feeds.mock import MockBookFeed, MockFeedCursor, MockSpotFeed, MockTWAPFeed
 from xamarinbot.model.features import COMBINED_LEAD_LAG, LEAD_LAG_ONLY, SPOT_ONLY, TWAP_ONLY, FeatureSet, design_vector
+from xamarinbot.model.calibrated import CalibratedModel
 from xamarinbot.model.logistic import LogisticModel
 from xamarinbot.mpc.config import MPCConfig
 from xamarinbot.mpc.controller import MPCController
 from xamarinbot.mpc.scenario import TransitionModel
+from xamarinbot.optimizer.candidates import evaluate_maker_candidate
 from xamarinbot.optimizer.config import OneStepConfig
 from xamarinbot.optimizer.controller import OneStepController
 from xamarinbot.optimizer.types import OrderMode
@@ -69,11 +72,11 @@ def _default_one_step_cfg(**overrides) -> OneStepConfig:
 # lambda_g=0.01 (ablations 6-8) was tuned against this dataset's typical
 # magnitudes, not guessed - two rounds of it: g_after for a meaningful taker
 # position runs in the hundreds (a one-sided fill necessarily drags G down
-# by roughly its own cost) while ev_after runs in the tens, so an initial
+# by roughly its own cost) while delta_ev runs in the tens, so an initial
 # lambda_g=0.5 made every directional candidate's selection score negative
 # and suppressed all trading (the same class of scale mismatch as Phase
 # 10's churn_penalty=5.0 finding). Backing off to 0.05 fixed taker but then
-# suppressed *maker* candidates specifically: their ev_after is properly
+# suppressed *maker* candidates specifically: their delta_ev is properly
 # fill-probability-weighted but the g_after used in the same score is the
 # pessimistic if-filled value, unweighted, so the same lambda_g penalizes
 # maker's risk far more than its true expected contribution. 0.01 is small
@@ -110,15 +113,15 @@ def run_ablation_round(
     feature_cfg: FeatureConfig,
     fee_config: FeeConfig,
     exec_cfg: ExecutionConfig,
-    model: LogisticModel | None,
+    model: LogisticModel | CalibratedModel | None,
     transition_model: TransitionModel | None,
     baseline_cfg: BaselineConfig | None = None,
 ) -> RoundResult:
     if spec.controller == "baseline":
-        portfolio = _run_baseline_round(store, round_id, p0, fee_config, baseline_cfg or BaselineConfig())
+        portfolio, n_actions, n_attempts = _run_baseline_round(store, round_id, p0, fee_config, exec_cfg, baseline_cfg or BaselineConfig())
         pnl = portfolio.Pi_U if outcome is Side.UP else portfolio.Pi_D
-        n_actions = 1 if (portfolio.U > 0 or portfolio.D > 0) else 0
-        return RoundResult(round_id, pnl, n_actions, portfolio.G, fill_rate=1.0 if n_actions else 0.0)
+        fill_rate = (n_actions / n_attempts) if n_attempts else 0.0
+        return RoundResult(round_id, pnl, n_actions, portfolio.G, fill_rate)
 
     portfolio, n_actions, n_attempts = _run_controller_round(spec, store, round_id, p0, feature_cfg, fee_config, exec_cfg, model, transition_model)
     pnl = portfolio.Pi_U if outcome is Side.UP else portfolio.Pi_D
@@ -126,14 +129,45 @@ def run_ablation_round(
     return RoundResult(round_id, pnl, n_actions, portfolio.G, fill_rate)
 
 
-def _run_baseline_round(store: EventStore, round_id: str, p0: float, fee_config: FeeConfig, cfg: BaselineConfig) -> PortfolioState:
+def _run_baseline_round(
+    store: EventStore, round_id: str, p0: float, fee_config: FeeConfig, exec_cfg: ExecutionConfig, cfg: BaselineConfig
+) -> tuple[PortfolioState, int, int]:
+    """Phase 12B Tranche 1 items 2/D: this function previously (a) passed
+    the same value for `spot` and `spot_prev` (making `spot_direction`
+    always 0, so the unanimity check could never pass) and (b) passed
+    absolute `decision_ts` as `t` instead of elapsed round time (making
+    `OUTSIDE_DECISION_WINDOW` fire for the entire duration of every round
+    whose `start_ts != 0`). Both are fixed together below, mirroring the
+    already-correct pattern in `scripts/run_baseline_replay.py` (which
+    never had either bug) via the shared `elapsed_t()` helper and a
+    second lookback cursor for spot, matching the one already used here
+    for `clob_mid_prev`.
+
+    Items 13/E/L: fills are now routed through the same
+    `ExecutionSimulator.execute_taker` real depth-walk lifecycle every V2
+    arm uses (`_run_controller_round` below), instead of assuming the
+    baseline's full requested quantity always fills completely at its
+    quoted limit price - a materially easier execution assumption than
+    every other ablation arm had, confirmed and fixed together with the
+    other two baseline-harness bugs above so all arms share one execution
+    engine per item L ("same book + same latency + same depth + same fee
+    model... only strategy decisions should differ")."""
     events = store.all_events(round_id)
     clock = ReplayClock(store, round_id)
     cursor = MockFeedCursor(store, round_id, preloaded=events)
     twap_feed, spot_feed, book_feed = MockTWAPFeed(cursor), MockSpotFeed(cursor), MockBookFeed(cursor)
-    prev_cursor = MockFeedCursor(store, round_id, preloaded=events)
-    prev_book_feed = MockBookFeed(prev_cursor)
+    prev_clob_cursor = MockFeedCursor(store, round_id, preloaded=events)
+    prev_book_feed = MockBookFeed(prev_clob_cursor)
+    prev_spot_cursor = MockFeedCursor(store, round_id, preloaded=events)
+    prev_spot_feed = MockSpotFeed(prev_spot_cursor)
     portfolio = PortfolioState()
+    sim = ExecutionSimulator(round_id, fee_config, exec_cfg)
+    n_actions = 0
+    n_attempts = 0
+    order_seq = 0
+
+    market_config = next(e.payload for e in events if e.event_type is EventType.MARKET_CONFIG)
+    round_start_ts = market_config["start_ts"]
 
     for decision_ts in clock.decision_points(heartbeat=HEARTBEAT_S):
         cursor.advance_to(decision_ts)
@@ -144,22 +178,32 @@ def _run_baseline_round(store: EventStore, round_id: str, p0: float, fee_config:
         book_down = book_feed.get_snapshot(round_id, Side.DOWN)
         if book_up is None or not book_up.best_bid or not book_up.best_ask:
             continue
-        prev_cursor.advance_to(decision_ts - cfg.clob_lookback_s)
+        prev_clob_cursor.advance_to(decision_ts - cfg.clob_lookback_s)
         prev_book_up = prev_book_feed.get_snapshot(round_id, Side.UP)
         mid = (book_up.best_bid.price + book_up.best_ask.price) / 2.0
         mid_prev = ((prev_book_up.best_bid.price + prev_book_up.best_ask.price) / 2.0) if prev_book_up and prev_book_up.best_bid and prev_book_up.best_ask else mid
 
+        prev_spot_cursor.advance_to(decision_ts - cfg.spot_lookback_s)
+        prev_spot_obs = prev_spot_feed.get_latest(round_id)
+        spot_prev = prev_spot_obs.value if prev_spot_obs is not None else spot_obs.value
+
         inputs = BaselineInputs(
-            t=decision_ts, p0=p0, twap=twap_obs.value, clob_mid=mid, clob_mid_prev=mid_prev,
-            spot=spot_obs.value, spot_prev=spot_obs.value,
+            t=elapsed_t(decision_ts, round_start_ts), p0=p0, twap=twap_obs.value, clob_mid=mid, clob_mid_prev=mid_prev,
+            spot=spot_obs.value, spot_prev=spot_prev,
             best_ask_up=book_up.best_ask.price, best_ask_down=book_down.best_ask.price if book_down and book_down.best_ask else None,
             is_fresh=True,
         )
         result = baseline_decide(inputs, portfolio.U, portfolio.D, portfolio.C, cfg)
         if result.order is not None:
-            fee = fee_config.fee_for(result.order.role, result.order.quantity, result.order.price)
-            portfolio = apply_fill(portfolio, Fill(result.order.side, result.order.price, result.order.quantity, result.order.role, fee))
-    return portfolio
+            n_attempts += 1
+            order_seq += 1
+            book = book_up if result.order.side is Side.UP else book_down
+            asks = book.asks if book is not None else ()
+            _, taker_result = sim.execute_taker(f"{round_id}-o{order_seq}", result.order.side, result.order.quantity, result.order.price, asks, decision_ts)
+            if taker_result.walk.filled_shares > 0:
+                portfolio = apply_fill(portfolio, Fill(result.order.side, taker_result.walk.avg_price, taker_result.walk.filled_shares, result.order.role, taker_result.walk.total_fee))
+                n_actions += 1
+    return portfolio, n_actions, n_attempts
 
 
 def _run_controller_round(
@@ -170,7 +214,7 @@ def _run_controller_round(
     feature_cfg: FeatureConfig,
     fee_config: FeeConfig,
     exec_cfg: ExecutionConfig,
-    model: LogisticModel | None,
+    model: LogisticModel | CalibratedModel | None,
     transition_model: TransitionModel | None,
 ) -> tuple[PortfolioState, int, int]:
     events = store.all_events(round_id)
@@ -220,7 +264,22 @@ def _run_controller_round(
                         tracked.order_state.cancel(decision_ts)
                     del supervisor.orders[order_id]
                     continue
-                decision = supervisor.review_order(tracked, decision_ts, snapshot.state, 0.0, portfolio.G, fv.tau, True)
+                # Phase 12B audit item 12/18: recompute this order's actual
+                # current economics (remaining shares, current q, current
+                # portfolio, current if-filled G, current delta_ev) instead
+                # of the hardcoded current_delta_ev=0.0 / current portfolio.G
+                # placeholders this call used before - mirrors the already-
+                # correct pattern in scripts/run_order_supervisor_demo.py.
+                # current_optimal_ev is left None here, same as that
+                # reference demo - computing a real replacement candidate is
+                # a Tranche 2 concern (item 17's cancellation redesign), not
+                # a placeholder-correctness fix.
+                current = evaluate_maker_candidate(
+                    f"review-{order_id}", tracked.order_state.side, tracked.purpose, tracked.order_state.limit_price,
+                    tracked.order_state.remaining_shares, distance_to_touch_ticks=0.0, queue_ahead_shares=0.0,
+                    horizon_s=horizon, portfolio=portfolio, q=q, exec_cfg=exec_cfg, cfg=spec.one_step_cfg,
+                )
+                decision = supervisor.review_order(tracked, decision_ts, snapshot.state, current.delta_ev, current.g_after, fv.tau, True)
                 if decision.action is SupervisorActionType.CANCEL:
                     supervisor.apply_cancel(decision, decision_ts)
 
@@ -232,15 +291,23 @@ def _run_controller_round(
             one_step_decision = one_step.decide(round_id, decision_ts, portfolio, q, permitted, book_up, book_down, tick_size, True)
             chosen = one_step_decision.chosen
 
-        if chosen.mode is OrderMode.FAK and chosen.expected_fill > 0:
+        if chosen.mode is OrderMode.FAK and chosen.qty > 0:
+            # Phase 12B audit items 13/E/L: route through the real
+            # submit->(delay/revalidation)->resolve lifecycle instead of
+            # directly converting the candidate's own pre-evaluation walk
+            # estimate into a Fill - see ExecutionSimulator.execute_taker.
             n_attempts += 1
-            fee = fee_config.taker_fee(chosen.expected_fill, chosen.price)
-            portfolio = apply_fill(portfolio, Fill(chosen.side, chosen.price, chosen.expected_fill, LiquidityRole.TAKER, fee))
-            n_actions += 1
+            order_seq += 1
+            asks = book_up.asks if chosen.side is Side.UP else book_down.asks
+            limit_price = chosen.max_execution_price if chosen.max_execution_price is not None else chosen.price
+            _, taker_result = sim.execute_taker(f"{round_id}-o{order_seq}", chosen.side, chosen.qty, limit_price, asks, decision_ts)
+            if taker_result.walk.filled_shares > 0:
+                portfolio = apply_fill(portfolio, Fill(chosen.side, taker_result.walk.avg_price, taker_result.walk.filled_shares, LiquidityRole.TAKER, taker_result.walk.total_fee))
+                n_actions += 1
         elif chosen.mode is OrderMode.POST_ONLY and supervisor is not None:
             order_seq += 1
             order_state = sim.submit_maker_order(f"{round_id}-o{order_seq}", chosen.side, chosen.qty, chosen.price, decision_ts)
-            supervisor.register(TrackedOrder(order_state, snapshot.state, chosen.purpose, q, q if chosen.side is Side.UP else 1 - q, chosen.g_after, chosen.ev_after, chosen.ttl_s or spec.one_step_cfg.maker_horizon_s, decision_ts, decision_ts))
+            supervisor.register(TrackedOrder(order_state, snapshot.state, chosen.purpose, q, q if chosen.side is Side.UP else 1 - q, chosen.g_after, chosen.delta_ev, chosen.ttl_s or spec.one_step_cfg.maker_horizon_s, decision_ts, decision_ts))
         elif chosen.mode is OrderMode.POST_ONLY:
             # no supervisor tracking a maker order still resolves as an
             # immediate probability-weighted draw, for ablations that

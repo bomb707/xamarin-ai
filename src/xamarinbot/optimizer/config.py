@@ -15,12 +15,47 @@ class OneStepConfig:
 
     # SS21 "edge_min: minimum predicted net edge | Alpha". Not formularized
     # beyond the name in the source docs; this build applies it as a flat
-    # floor on ev_after for directional (non-WAIT) candidates.
+    # floor on total candidate delta_ev for directional (non-WAIT)
+    # candidates - this is "min_total_delta_ev" in Phase 12B audit item
+    # 6/7's terminology (kept as `edge_min` rather than renamed, to limit
+    # blast radius across the ~14 files that already reference it under
+    # this name; see docs/PHASE_12B_AUDIT.md for the scope note).
     edge_min: float = 0.0
+
+    # Phase 12B audit item 6/7: min_marginal_edge is a genuinely separate
+    # concept from edge_min above - a *per-share* floor
+    # (e_U,i = q - c_i, e_D,i = (1-q) - c_i at ask level i, c_i = price +
+    # fee-per-share) so a large trade with poor per-share edge can't pass
+    # merely because its total dollar delta_ev clears edge_min, and a
+    # small trade with excellent per-share edge isn't rejected merely
+    # because its total dollar delta_ev is small. Also doubles as the
+    # taker worst-price boundary (item 10): a depth level is only walked
+    # while its own marginal edge still clears this floor - "q > c_marginal
+    # + safetyMargin" from the audit's formula is exactly
+    # "e_i > min_marginal_edge" once whatever safety margin is wanted is
+    # folded into this single threshold, rather than a second field.
+    min_marginal_edge: float = 0.0
+
+    # Phase 12B audit item 8: boundary-quantity generation inputs for
+    # taker candidates. taker_min_size is a fallback for the real
+    # exchange minimum order size (MarketConfig.min_order_size once wired
+    # in - Tranche 3 real-adapter work, not yet threaded through here).
+    # taker_qty_step is the configured small-quantity grid spacing.
+    taker_min_size: float = 1.0
+    taker_qty_step: float = 1.0
+    # Caps the small-quantity grid to this many steps near taker_min_size,
+    # regardless of how large the feasible range turns out to be - an
+    # unbounded dense grid exploded candidate counts (and MPC latency)
+    # whenever the risk/spend budget was loose. The boundary quantities
+    # (marginal-edge, risk-budget, spend-cap, position-limit, depth-level)
+    # already cover the rest of the range.
+    taker_qty_grid_points: int = 5
 
     # taker candidate generation: how many cumulative depth levels to
     # generate as separate quantity candidates (Roadmap Phase 8: "Generate
-    # taker quantities from depth levels and portfolio risk budget").
+    # taker quantities from depth levels and portfolio risk budget") -
+    # kept alongside the item 8 boundary-derived quantities below as an
+    # additional, not replaced, source of candidates.
     max_taker_depth_levels: int = 3
 
     # maker candidate generation: price offsets (in ticks, toward the
@@ -31,7 +66,7 @@ class OneStepConfig:
     maker_horizon_s: float = 10.0
 
     # SS18 operational penalties (lambda_churn*OrderChurn style terms) -
-    # flat, uncalibrated placeholders subtracted from ev_after for any
+    # flat, uncalibrated placeholders subtracted from delta_ev for any
     # non-WAIT candidate, representing the operational cost of acting.
     churn_penalty: float = 0.0
     opportunity_cost: float = 0.0
@@ -45,13 +80,13 @@ class OneStepConfig:
     taker_only: bool = False  # skip maker candidate generation entirely (ablation #6 vs #7)
 
     # SS18's actual objective is J = E[PnL_T] + lambda_G*G_T - ... , not
-    # plain EV - selection under pure ev_after can *never* pick a hedge
+    # plain EV - selection under pure delta_ev can *never* pick a hedge
     # candidate (SS17 hedges have negative standalone EV by construction,
     # so they always lose to WAIT at lambda_g=0), which would make
     # enable_portfolio_repair wired in but functionally inert. lambda_g=0.0
-    # preserves Phases 8-10's exact prior ev_after-only ranking; set it
+    # preserves Phases 8-10's exact prior delta_ev-only ranking; set it
     # above 0 to let a worse-EV, better-G candidate actually win selection.
-    # Applied only to the selection score, not to the reported ev_after
-    # field itself, so ev_after keeps meaning "expected PnL" everywhere
+    # Applied only to the selection score, not to the reported delta_ev
+    # field itself, so delta_ev keeps meaning "expected PnL" everywhere
     # else (journaling, reports, tests).
     lambda_g: float = 0.0

@@ -72,6 +72,33 @@ class ExecutionSimulator:
             order.reconcile_fill(result.matched_ts, result.walk.filled_shares)
         return order, result
 
+    def execute_taker(
+        self,
+        order_id: str,
+        side: Side,
+        requested_shares: float,
+        limit_price: float,
+        asks_at_submission: tuple[BookLevel, ...],
+        submit_ts: float,
+    ) -> tuple[OrderState, TakerOrderResult]:
+        """Phase 12B audit items 13/E/L: the one common chronological
+        taker execution path every backtest/ablation/shadow/baseline
+        caller must go through - submit -> (delay/revalidation, if this
+        market's `taker_delay_ms` is nonzero) -> resolve at matched_ts.
+        Replaces every caller's previous shortcut of directly converting
+        a chosen candidate's own pre-evaluation walk estimate into a
+        `Fill` without ever actually submitting an order. At the default
+        `taker_delay_ms=0.0`, this resolves synchronously and produces
+        the identical fill a direct-apply would have (same book, same
+        walk) - the point is that the *architecture* no longer depends on
+        that coincidence: the moment a market's real delay is wired in
+        (Phase 12B Tranche 3, item 23), this same call path handles it
+        correctly with no caller changes."""
+        order, result = self.submit_taker_order(order_id, side, requested_shares, limit_price, asks_at_submission, submit_ts)
+        if result.was_delayed:
+            self.resolve_pending(order, result, result.matched_ts)
+        return order, result
+
     def resolve_pending(self, order: OrderState, result: TakerOrderResult, now_ts: float) -> bool:
         """Applies a delayed taker order's fill once `now_ts` reaches
         `result.matched_ts`. Returns True if resolved, False if it's not

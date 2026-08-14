@@ -32,9 +32,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from xamarinbot.events.store import EventStore
 from xamarinbot.execution.config import ExecutionConfig
 from xamarinbot.features.config import FeatureConfig
+from xamarinbot.model.calibrated import fit_calibrated_model
 from xamarinbot.model.dataset import build_examples_multi
 from xamarinbot.model.features import COMBINED_LEAD_LAG
-from xamarinbot.model.logistic import fit_logistic_regression
+from xamarinbot.model.walkforward import time_ordered_split
 from xamarinbot.optimizer.config import OneStepConfig
 from xamarinbot.portfolio.state import FeeConfig
 from xamarinbot.reports.shadow_report import build_daily_shadow_report, format_daily_shadow_report, format_parity_report
@@ -48,11 +49,15 @@ N_TRAIN_ROUNDS = 15
 
 
 def train_q_model(feature_cfg: FeatureConfig):
+    # Phase 12B audit item 5/C: fit on train, calibrate (Platt) on a
+    # disjoint validation slice - the controller must consume q_calibrated,
+    # never the raw logistic score, per Phase 5's own exit gate.
     store = EventStore(":memory:")
     results = generate_synthetic_dataset(store, n_rounds=N_TRAIN_ROUNDS)
     by_fs = build_examples_multi(store, results, feature_cfg, [COMBINED_LEAD_LAG], heartbeat_s=HEARTBEAT_S)
     examples = by_fs[COMBINED_LEAD_LAG.name]
-    return fit_logistic_regression([e.x for e in examples], [e.y for e in examples], COMBINED_LEAD_LAG.name, COMBINED_LEAD_LAG.column_names)
+    split = time_ordered_split(examples, train_frac=0.6, val_frac=0.2)
+    return fit_calibrated_model(split.train, split.validation, COMBINED_LEAD_LAG)
 
 
 def main() -> None:
@@ -67,7 +72,9 @@ def main() -> None:
 
     print(f"Generating {n_rounds}-round synthetic evaluation dataset (SYNTHETIC - not a real live feed)...")
     store = EventStore(":memory:")
-    results = generate_synthetic_dataset(store, n_rounds=n_rounds)
+    # id_offset=N_TRAIN_ROUNDS: disjoint from training rounds (Phase 12B
+    # audit Addendum A).
+    results = generate_synthetic_dataset(store, n_rounds=n_rounds, id_offset=N_TRAIN_ROUNDS)
 
     print("\nRunning ShadowRunner over each round under the recv_ts-gated live view...")
     round_results = []

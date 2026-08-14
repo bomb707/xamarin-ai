@@ -111,7 +111,7 @@ def test_degenerate_horizon_matches_one_step_exactly():
     base_decision = one_step.decide("r0", 10.0, portfolio, 0.65, permitted, BOOK_UP, BOOK_DOWN, 0.01, True)
 
     assert mpc_decision.chosen.action_id == base_decision.chosen.action_id
-    assert math.isclose(mpc_decision.chosen.ev_after, base_decision.chosen.ev_after)
+    assert math.isclose(mpc_decision.chosen.delta_ev, base_decision.chosen.delta_ev)
     assert not mpc_decision.used_fallback
 
 
@@ -218,9 +218,15 @@ def test_nonzero_churn_penalty_favors_consolidating_into_fewer_actions():
     decision = mpc.decide("r0", 10.0, PortfolioState(), 0.7, REGIME_A, BOOK_UP, BOOK_DOWN, 0.01, True)
 
     # the single-action, full-depth candidate must strictly beat the
-    # smaller, split-requiring candidate once each action costs something
-    small_id = "taker_up_1"  # first depth level only, forces a second action later to match the big candidate's total
-    big_id = "taker_up_2"    # both depth levels in one action
+    # smaller, split-requiring candidate once each action costs something.
+    # Looked up by quantity, not a hardcoded action_id string - Phase 12B
+    # audit items 7/8/10 changed candidate generation from raw depth-level
+    # cumulative sums to boundary/marginal-edge-derived sizing, so which
+    # index a given quantity lands at is no longer stable, only the set of
+    # quantities offered (which still includes both depth-level boundaries
+    # as one of several candidate sources).
+    small_id = next(c.action_id for c in decision.candidates if c.side is Side.UP and math.isclose(c.qty, 500.0))  # first depth level only
+    big_id = next(c.action_id for c in decision.candidates if c.side is Side.UP and math.isclose(c.qty, 1250.0))  # both depth levels in one action
     assert small_id in decision.sequence_values and big_id in decision.sequence_values
     assert decision.sequence_values[big_id] > decision.sequence_values[small_id]
 
@@ -233,7 +239,7 @@ def test_nonzero_churn_penalty_favors_consolidating_into_fewer_actions():
 def _candidate(side, pi_u_after, pi_d_after) -> CandidateAction:
     return CandidateAction(
         action_id="c", purpose=OrderPurpose.ALPHA, side=side, mode=OrderMode.FAK, price=0.5, qty=10.0,
-        ttl_s=0.0, expected_fill=10.0, ev_after=1.0, g_after=min(pi_u_after, pi_d_after),
+        ttl_s=0.0, expected_fill=10.0, delta_ev=1.0, g_after=min(pi_u_after, pi_d_after),
         pi_u_after=pi_u_after, pi_d_after=pi_d_after,
     )
 

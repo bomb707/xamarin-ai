@@ -10,6 +10,24 @@ roadmap itself says must exist before any predictive complexity, per its
 Phases 13-14 are **not implemented** - they are listed below as explicitly
 future work, not silently dropped.
 
+**Phase 12B correctness pass (see `docs/PHASE_12B_AUDIT.md`)**: an audit
+of Phases 8-12 found and fixed several real bugs invalidating specific
+numbers reported below - a baseline-harness bug that made the baseline
+strategy trade in 0 rounds regardless of the market (two independent
+copies of it, both fixed), taker candidate sizing that offered only raw
+depth-level sums instead of risk/marginal-edge-aware quantities, train/
+evaluation round overlap in every demo script and test fixture that
+trained a model (every "held-out" evaluation was frequently evaluating on
+its own training data), an uncalibrated probability model used by every
+Phase 8-12 controller, a cumulative-round-spend check that only compared
+one order at a time, and a hardcoded worst-price assumption
+(`limit_price=1.0`) with no real protection. **Every specific number,
+demo-output claim, or "finding" below dated before this pass should be
+treated as historical record of what a bug produced, not current
+behavior** - fixed instances are marked SUPERSEDED inline with what
+changed; PHASE_12B_AUDIT.md has the complete list, root causes, and
+regression tests.
+
 ## Implemented
 
 | Phase | Status | Notes |
@@ -303,19 +321,26 @@ instead, with hand-constructed scenarios). Real historical data - where
 regimes presumably don't flip on every single tick - would be needed to
 see a more varied trigger mix in the demo itself.
 
-**Phase 8 demo finding worth flagging**: in `run_one_step_controller_demo.py`,
+**SUPERSEDED by Phase 12B Tranche 1 - see `docs/PHASE_12B_AUDIT.md`.**
+~~Phase 8 demo finding worth flagging: in `run_one_step_controller_demo.py`,
 the Phase 0 baseline strategy took 0 positions across the sampled rounds
-while the one-step controller took 19 actions, on an *identical* causal
-replay. This isn't a controller bug - the demo evaluates both at a 10s
-heartbeat (chosen so the O(events) `FeatureVector` computation stays
-affordable across two full controllers), and the baseline's unanimous
-3-signal requirement is starved by that cadence: CLOB direction is already
-noisy at 1s resolution (Phase 6's finding), and sampling even more sparsely
-makes three-way alignment rarer still. The one-step controller doesn't need
-three-way agreement - it optimizes EV directly - so it's far less sensitive
-to decision cadence. Real historical data and a matched, higher-frequency
-cadence for both would be needed before this comparison says anything about
-relative strategy quality, not just cadence sensitivity.
+while the one-step controller took 19 actions~~ - **this "0 positions" was
+never a cadence effect; it was `run_one_step_controller_demo.py`'s own
+local baseline runner reimplementing the same `spot_prev`-always-equal-to-
+`spot` bug found and fixed in `walkforward/ablations.py` (Phase 12B audit
+items 3/D), which makes unanimity impossible regardless of heartbeat.**
+Fixed identically (shared `elapsed_t()` helper,
+`ExecutionSimulator.execute_taker`); after the fix, the same demo config
+shows the baseline taking a position in 4/4 sampled rounds. The heartbeat-
+starves-unanimity mechanism described in the original paragraph below is
+real and worth knowing, but it is not what produced the "0 positions"
+number this finding was built around - that number was a bug artifact.
+Kept for the record, not as a current claim: ~~the demo evaluates both at
+a 10s heartbeat ... CLOB direction is already noisy at 1s resolution
+(Phase 6's finding), and sampling even more sparsely makes three-way
+alignment rarer still.~~ Real historical data and a matched cadence would
+still be needed before any baseline-vs-one-step comparison is evidence of
+relative strategy quality, not just this specific number.
 
 **Phase 5 demo finding worth flagging**: at `n_rounds=80`, the combined
 lead-lag model does *not* beat the TWAP-only baseline out-of-sample (Brier
@@ -329,38 +354,40 @@ relative to simpler baselines") exists to catch - real historical data,
 where TWAP isn't definitionally the whole story, is needed before this
 comparison means anything about real edge.
 
-**Phase 11 demo finding worth flagging (not a bug)**: ablations 6, 7, and 8
-report zero non-wait actions across the evaluation set, versus 5 actions/
-round for ablations 2-5 on the same data. Diagnosed with two standalone
-trace scripts (candidate-table dumps and a supervisor cancel/fill counter)
-rather than assumed, since it initially looked exactly like the kind of
-scale-mismatch bug `lambda_g` had already produced twice during tuning (see
-below):
-- **Ablation 6 (taker-only)**: this dataset's taker candidates are sized
-  from real order-book depth (`taker_quantities`), which runs large enough
-  that every one of them breaches the `g_min=-100` risk floor and gets
-  rejected by Phase 3's `evaluate_constraints` - confirmed by dumping the
-  full candidate table at every decision point where TAKER was permitted:
-  every `taker_*` candidate showed `valid=False` with `g_after` in the
-  hundreds-to-thousands, while maker's small fixed `maker_quantity=20`
-  clip comfortably fits under the same floor. With `taker_only=True`
-  removing maker generation entirely, and no existing position ever
-  established (so SS17's hedge candidate never has an imbalance to
-  repair), there is nothing left to trade. This is a genuine ablation
-  finding: taker-only execution under a tight risk floor can't size itself
-  down to what book depth actually offers, unlike maker's fixed clip.
-- **Ablations 7/8 (cancel/replace, MPC - both wrap `OrderSupervisor`)**: a
-  trace counter over the same replay showed 56 maker orders registered, 55
-  cancelled via `REGIME_FLIP`, 0 resolved via TTL expiry, 0 taker fills.
-  This exactly reproduces Phase 9's own already-documented demo finding
-  (regime dwell times of 1-3s outrun any maker order's ~10s horizon) in
-  the ablation context, not a new bug - `run_walk_forward_ablation_demo.py`
-  and `test_ablation_6_taker_only_and_7_8_supervisor_variants_show_zero_actions_on_this_dataset`
-  pin this down explicitly so a future change that silently alters it gets
-  noticed either way. Real historical data with slower regime dynamics
-  would be needed before this ablation comparison says anything about
-  cancel/replace's true value versus simply reflecting this synthetic
-  generator's flip frequency.
+**SUPERSEDED by Phase 12B Tranche 1 - see `docs/PHASE_12B_AUDIT.md` item 7/8.**
+~~Phase 11 demo finding: ablations 6, 7, and 8 report zero non-wait actions
+across the evaluation set~~ - the root cause identified below (raw
+depth-level-only taker sizing, no marginal/risk-budget-derived
+intermediate quantities) was correctly diagnosed **as a real defect**, not
+correctly classified as a "not a bug" finding - Phase 12B audit item 7/8
+fixed it directly (`taker_sizing_boundaries`, wiring in the previously-dead
+`max_directional_spend`). After the fix, on the same class of dataset, all
+three ablations trade (confirmed directly: 11, 11, and 114 actions
+respectively across one 6-round eval set at fix time - see
+`tests/test_walkforward.py::test_ablations_6_7_8_now_trade_after_taker_sizing_fix`).
+Kept below for the diagnostic record, since the mechanism described was
+real and is exactly what got fixed:
+- **Ablation 6 (taker-only)**: this dataset's taker candidates were sized
+  from raw cumulative order-book depth only (`taker_quantities`, no
+  intermediate/partial quantities), which ran large enough that every one
+  of them breached the `g_min=-100` risk floor, while maker's small fixed
+  `maker_quantity=20` clip fit comfortably. With `taker_only=True` removing
+  maker generation entirely, there was nothing feasible left to trade.
+  `taker_sizing_boundaries` now generates the exact partial quantity that
+  *does* fit the risk budget (e.g. "189.6 shares" out of a 500-share first
+  level, not just 0 or 500), so taker-only execution can trade again.
+- **Ablations 7/8 (cancel/replace, MPC - both wrap `OrderSupervisor`)**:
+  since taker fills are immediate/synchronous (no resting period), they
+  were never vulnerable to the REGIME_FLIP-before-TTL cancellation
+  dynamic that killed these ablations' *maker* orders (Phase 9's own
+  documented finding, still real and still reproducible for maker orders
+  specifically - see the Phase 9 section above). Once sizing made a
+  risk-feasible taker candidate available, it could win selection and
+  fill before any regime flip had a chance to cancel it, so #7/#8 trade
+  again too. Real historical data is still needed before any ablation
+  comparison here is evidence of relative strategy value rather than an
+  artifact of this synthetic generator's dynamics - that caveat, at
+  least, was correct in the original finding.
 
 **Phase 12 demo finding worth flagging (not a bug) - the dominant driver
 of the ~96% live-vs-replay parity rate**: `run_shadow_demo.py` shows the
@@ -409,12 +436,86 @@ vs `0.80` live at one such boundary) - which is the kind of small,
 occasional, and expected live/replay divergence Phase 12's parity report
 is meant to catch and quantify.
 
-## Notable bugs caught during Phase 0/4/5/7/8/9/10/11 build-out (fixed, worth knowing about)
+## Notable bugs caught during Phase 0/4/5/7/8/9/10/11/12B build-out (fixed, worth knowing about)
 
 Building each phase exercised the previous phases' pipeline far more
 heavily than their own build-out did, and surfaced real bugs versus just
 calibration issues - noted here since they affected numbers already
 reported to the user in earlier sessions:
+
+- **(Phase 12B, item 3/D)** `walkforward/ablations.py::_run_baseline_round`
+  (and an independent second copy in
+  `scripts/run_one_step_controller_demo.py`) passed the same value for
+  `spot` and `spot_prev` (making `spot_direction` always 0, breaking the
+  baseline's unanimity check) and passed absolute replay time where
+  elapsed round time was required (making the decision-window gate fail
+  for the entire duration of every round except the one starting at
+  `t=0`). Both bugs made the baseline strategy trade in 0 rounds
+  regardless of the underlying market, invalidating every baseline
+  comparison reported before this fix. Fixed via a shared `elapsed_t()`
+  helper (`baseline/inputs.py`) and a genuine spot lookback cursor,
+  mirroring the pattern `scripts/run_baseline_replay.py` already had
+  right, one file over. Full detail: `docs/PHASE_12B_AUDIT.md`.
+- **(Phase 12B, item 7/8)** Taker candidate quantities were raw cumulative
+  book-depth sums only (`taker_quantities`), with no intermediate,
+  marginal-edge, or risk-budget-derived sizes - `max_directional_spend()`
+  had existed since Phase 3, unit-tested in isolation, but was never
+  called from anywhere in candidate generation. Whenever even the
+  smallest depth level breached `g_min`, taker execution had nothing
+  feasible to offer at all (the root cause of Phase 11's "ablation 6/7/8
+  show zero actions" finding above). Fixed with
+  `taker_sizing_boundaries`, generating the exact partial quantity that
+  fits the tightest of the marginal-edge/position/spend/risk-budget
+  boundaries.
+- **(Phase 12B, item 10)** Every taker candidate (alpha and hedge) was
+  evaluated with `limit_price=1.0` - not real worst-price protection,
+  since prices are probabilities in `[0,1]` and 1.0 is unconstraining.
+  Fixed: `taker_sizing_boundaries` now derives the worst acceptable price
+  as the last book level whose own marginal edge still clears
+  `min_marginal_edge`, threaded through as `CandidateAction.max_execution_price`
+  and used as the real limit price at dispatch.
+- **(Phase 12B, item 9)** `evaluate_constraints`'s `spend_cap` check
+  compared one candidate's own incremental cost against the full cap,
+  not cumulative round spend - a sequence of individually-legal orders
+  could exceed the intended round budget by an unbounded multiple. Fixed
+  by comparing `portfolio_after.C` (the real cumulative cost, since every
+  caller constructs a fresh `PortfolioState()` per round) against the cap
+  directly.
+- **(Phase 12B, item A)** `generate_synthetic_dataset()` always restarted
+  round numbering at index 0, so any two separate calls (e.g. "train on
+  15 rounds" then "evaluate on 6 rounds," the pattern used in every
+  Phase 8-12 demo script and two test-suite fixtures) generated
+  byte-identical market content for overlapping indices - every "held-out"
+  evaluation performed since Phase 8 had actually evaluated on training
+  data. Fixed with an `id_offset` parameter; all 9 identified call sites
+  updated to use disjoint ranges.
+- **(Phase 12B, item C)** Every Phase 8-12 demo/harness `train_q_model()`
+  returned the raw `fit_logistic_regression` output directly, skipping
+  the Platt calibration step Phase 5's own reference demo already
+  implements correctly - an uncalibrated `q` can make
+  `DeltaEV_U(x) = q*x - K_U(x)` look positive when the true (calibrated)
+  probability would make it negative. Fixed with a shared
+  `CalibratedModel`/`fit_calibrated_model` helper
+  (`model/calibrated.py`), duck-type-compatible with the existing
+  `LogisticModel.predict_proba` interface so no downstream caller needed
+  to change beyond how the model is constructed.
+- **(Phase 12B, item 13/E/L)** Every Phase 8-12 controller path (and the
+  baseline) converted a chosen taker candidate directly into a `Fill`
+  using that candidate's own pre-evaluation walk estimate, never actually
+  submitting through Phase 7's `OrderState`/delay/revalidation lifecycle
+  (`ExecutionSimulator.submit_taker_order`/`resolve_pending`, both
+  already built and tested since Phase 7, just never called from any
+  downstream controller). Inert-by-coincidence to date
+  (`taker_delay_ms=0.0` everywhere, since nothing yet reads a market's
+  real delay from its config - Phase 12B Tranche 3), but would have
+  silently ignored a real delay the moment one was wired in. The
+  baseline additionally had no depth-walk realism at all (always a full
+  fill at the quoted limit price), a materially easier execution
+  assumption than every V2 arm. Fixed with a single shared
+  `ExecutionSimulator.execute_taker()` used identically by every arm
+  (baseline included) in `walkforward/ablations.py`, `shadow/runner.py`,
+  and the two demo scripts that had their own inline dispatch
+  (`run_one_step_controller_demo.py`, `run_order_supervisor_demo.py`).
 
 - **(Phase 5)** The L2 regularization gradient was divided by `n` twice
   (once as part of the averaged data gradient, again explicitly on the
