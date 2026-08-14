@@ -650,6 +650,86 @@ reported to the user in earlier sessions:
   table. Lowered to 0.001 so mid stays graduated across the observed
   gap range.
 
+- **(Phase 12B Tranche 1.1)** The per-window calibration split
+  (`walkforward/pipeline.py::fit_window_artifacts`) ran an example-count
+  fraction split (`time_ordered_split`) over a window's own flat example
+  list, which could and did place some of a round's own decision-point
+  examples in the raw-model fit set and the rest of that *same round* in
+  the calibration set - a round-level leak, since every example from one
+  round shares that round's single settlement outcome. `sweep_parameter`
+  was also evaluated directly on TEST rounds in the demo script (test-
+  period tuning), and `parameter_stability_across_windows` reused window
+  0's model for every window instead of fitting one per window.
+  `taker_sizing_boundaries`'s risk-budget boundary used a flat
+  `G_current - g_min` budget that is only exact when the purchased side
+  is already the non-minimum side - buying the currently-underrepresented
+  side can raise `min(U,D)` faster than it costs, making the flat budget
+  badly conservative. Fixed: round-granular fit/calibration split
+  (`_split_rounds_for_fit_and_calibration`), the sweep now uses
+  `window.validate_round_ids`, stability fits a real per-window model via
+  `WindowArtifacts`, and `directional_projected_g` replaces the flat
+  budget with the exact side-aware kernel evaluation. Full detail:
+  `docs/PHASE_12B_AUDIT.md`'s Tranche 1.1 section.
+- **(Phase 12B Tranche 1.2)** `ExecutionSimulator.execute_taker()` could
+  be handed the actual future book at submission time
+  (`revalidation_asks`), so a delayed order's eventual fill was fully
+  computed and stored before `matched_ts` ever arrived - one caller
+  already read `.walk` immediately, silently bypassing the delay
+  entirely. Three more execution paths (`shadow/runner.py`,
+  `run_order_supervisor_demo.py`, `_run_baseline_round`) still mutated
+  portfolio state from a delayed result without waiting for `matched_ts`.
+  Taker candidate sizing had no candidate-specific worst-price limit
+  (only the shared, depth/marginal-edge-only `p_max`), so an adverse
+  repricing during the delay window could still breach `g_min`/
+  `spend_cap`. A one-round calibration holdout (the common case at
+  default window sizes) risked fitting Platt on a single-class `y`,
+  silently producing a degenerate constant calibrator. Fixed: the
+  `submit_taker`/`resolve_taker`/`PendingTakerOrder` redesign (no future
+  fill information exists until `resolve_taker` is called with the real
+  causal book), a shared `TakerOrderQueue` used by every execution path,
+  `taker_max_execution_price` (exact, candidate-specific, tick-floored),
+  and an `IdentityCalibrator` fallback with backward-expanding
+  calibration-window search. Full detail: `docs/PHASE_12B_AUDIT.md`'s
+  Tranche 1.2 section.
+- **(Phase 12B Tranche 2A)** `PendingExposure.worst_case_portfolio()`
+  assumed every active order filling *simultaneously* was the worst case
+  for `G = min(U,D) - C` - false in general, since a fill on the
+  currently-underrepresented side can *raise* `min(U,D)` enough to more
+  than offset its own cost (a two-sided fill can be the BEST case, not
+  the worst; a one-sided fill of just one leg can be worse than both
+  filling). Pending exposure also omitted fees from committed cost, no
+  `RiskView` combined confirmed + pending-taker + open-maker exposure for
+  admission, open maker orders were never checked jointly before placing
+  another one, `ShadowRunner`'s delayed-order resolution book was gated
+  on `recv_ts` (this system's own wire-arrival time) instead of
+  `event_time`/`source_ts` (the real exchange's own book at `matched_ts`
+  - the two are genuinely different clocks), and the per-window
+  calibration split could satisfy calibration-side class diversity while
+  leaving the raw model fit on a single-class prefix. Fixed: an exact
+  (bounded, `2^n`-subset) scenario envelope with a conservative
+  analytical fallback beyond the cap (`PendingExposure.worst_case_g`),
+  fee-inclusive `ActiveOrderExposure`, a `RiskView.admits()` hard-
+  admission gate wired into every maker-placement path that tracks open
+  orders, `event_time`-gated exchange execution-truth resolution, and a
+  two-sided (fit AND calibration) diversity search that returns "no
+  model" rather than fake calibration when unreachable. Full detail:
+  `docs/PHASE_12B_AUDIT.md`'s Tranche 2A section.
+- **(Phase 12B Tranche 2B-2E)** Four architectural additions on top of
+  2A's aggregate risk admission, all gated behind default-`False`/`0.0`
+  config so pre-existing behavior is unchanged unless explicitly enabled:
+  `OrderPurpose.BUFFER_BUILD` candidates that may trade negative EV for
+  positive `delta_g` (`cfg.enable_buffer_build`); soft regime control,
+  where a disallowed candidate family is generated with a selection
+  penalty instead of never existing (`cfg.soft_regime`); dynamic maker
+  quantity/TTL/price-offset grids derived from `q, tau, sigma, G`
+  instead of fixed constants (`cfg.dynamic_maker`); and a redesigned
+  `OrderSupervisor.review_order` that replaced the old unconditional
+  "regime flip -> cancel" rule with an `argmax(V_hold, V_cancel,
+  V_replace)` economic policy plus a hysteresis margin against
+  thrashing, keeping only feed-staleness and risk-breach as
+  unconditional hard-safety cancels. Full detail (formulas, files, test
+  list): `docs/PHASE_12B_AUDIT.md`'s Tranche 2B-2E section.
+
 **Phase 7 demo limitation worth flagging (not a bug)**: `run_execution_simulator_demo.py`
 always reports 0 repriced orders. The synthetic generator emits book events
 on a 1-second tick; the 250ms delay window is entirely inside a single tick,
@@ -683,9 +763,13 @@ production**:
   reconciles, not that any strategy has edge.
 - Re-run Phase 11's 8-ablation matrix and parameter sensitivity/stability
   sweeps against real historical rounds before trusting any of them - the
-  ablations 6-8 "zero actions" finding and the `edge_min=0.0`/`lambda_g=0.01`
-  tuning are both dataset-specific artifacts of this synthetic generator's
-  regime-flip frequency and book-depth sizing, not general conclusions.
+  ablations 6-8 "zero actions" finding (fixed in Phase 12B Tranche 1 -
+  see "Notable bugs" above; all 8 arms trade on synthetic data now) and
+  the `edge_min=0.0`/`lambda_g=0.01` tuning are both dataset-specific
+  artifacts of this synthetic generator's regime-flip frequency and
+  book-depth sizing, not general conclusions. See
+  `docs/PHASE_12B_AUDIT.md`'s Tranche 1/1.1/1.2/2A status for everything
+  fixed since the original audit.
 - Before trusting Phase 12's parity numbers against a real feed, re-tune
   `FeatureConfig.canonical_horizon_s` with a safety margin above measured
   real feed-arrival latency - see the Phase 12 finding above; this

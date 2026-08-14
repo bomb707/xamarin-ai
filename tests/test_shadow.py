@@ -72,6 +72,119 @@ def test_default_event_time_gated_cursor_is_optimistic_relative_to_recv_ts():
 
 
 # --------------------------------------------------------------------------
+# Phase 12B Tranche 2A item 5: exchange execution time (event_time/source_ts)
+# vs. local strategy information time (recv_ts) - two genuinely different
+# clocks for a delayed taker order's resolution.
+# --------------------------------------------------------------------------
+
+
+def test_exchange_execution_book_uses_event_time_not_recv_ts_for_delayed_resolution():
+    """A book change with source_ts < matched_ts but recv_ts > matched_ts
+    must be visible to an event_time-gated cursor (the real exchange's
+    own book at matched_ts) even though a recv_ts-gated cursor (this
+    system's own wire-arrival view) does not see it yet."""
+    store = EventStore(":memory:")
+    matched_ts = 10.25
+    store.append(
+        EventType.BOOK_DELTA, "r1", recv_ts=matched_ts + 1.0, source_ts=matched_ts - 0.05,
+        payload={"side": "UP", "book": "asks", "price": 0.60, "size": 100.0},
+    )
+
+    execution_truth_cursor = MockFeedCursor(store, "r1")  # default time_attr="event_time"
+    execution_truth_cursor.advance_to(matched_ts)
+    assert len(execution_truth_cursor.events_up_to(EventType.BOOK_DELTA)) == 1  # exchange truth: already happened
+
+    strategy_view_cursor = MockFeedCursor(store, "r1", time_attr="recv_ts")
+    strategy_view_cursor.advance_to(matched_ts)
+    assert len(strategy_view_cursor.events_up_to(EventType.BOOK_DELTA)) == 0  # this system: hasn't arrived yet
+
+
+def test_shadow_runner_delayed_resolution_uses_exchange_event_time_not_recv_ts():
+    """End-to-end proof through ShadowRunner itself: inject a BOOK_DELTA
+    with source_ts just before matched_ts but recv_ts well after it, force
+    a delayed FAK decision, and confirm the resolved fill reflects the
+    injected (exchange-truth) price - not the round's original book, and
+    not the strategy's own recv_ts-gated view (which never even sees this
+    delta before the round replay moves on)."""
+    from unittest.mock import patch
+
+    from xamarinbot.optimizer.controller import OneStepController, OneStepDecision
+    from xamarinbot.optimizer.types import CandidateAction, OrderMode
+    from xamarinbot.portfolio.math import OrderPurpose
+    from xamarinbot.portfolio.state import Side
+
+    import xamarinbot.execution.simulator as simulator_mod
+
+    store = EventStore(":memory:")
+    results = generate_synthetic_dataset(store, n_rounds=1)
+    r = results[0]
+    feature_cfg = FeatureConfig()
+    fee_config = FeeConfig()
+    exec_cfg = ExecutionConfig(taker_delay_ms=250.0)
+    permissive_cfg = OneStepConfig(g_min=-1_000_000.0, spend_cap=None, position_limit=None, edge_min=-1_000_000.0)
+
+    forced = CandidateAction(
+        action_id="forced_taker_up", purpose=OrderPurpose.ALPHA, side=Side.UP, mode=OrderMode.FAK,
+        price=0.99, qty=5.0, ttl_s=0.0, expected_fill=5.0, delta_ev=1.0, g_after=0.0,
+        pi_u_after=0.0, pi_d_after=0.0, violated_constraints=(), max_execution_price=0.99,
+    )
+    already_submitted = {"flag": False}
+
+    def forced_decide(self, round_id, decision_ts, portfolio, q, permitted_actions, book_up, book_down, tick_size, is_fresh):
+        # Submit exactly one delayed taker order (at the first decision
+        # point real feature data is available) so there is exactly one
+        # fill to check the resolution price of - every later decision
+        # point just WAITs.
+        if already_submitted["flag"]:
+            wait = CandidateAction(
+                action_id="wait", purpose=OrderPurpose.ALPHA, side=None, mode=OrderMode.WAIT, price=None,
+                qty=0.0, ttl_s=None, expected_fill=0.0, delta_ev=0.0, g_after=portfolio.G,
+                pi_u_after=portfolio.Pi_U, pi_d_after=portfolio.Pi_D, violated_constraints=(),
+            )
+            return OneStepDecision(round_id, decision_ts, wait, (wait,), skip_reason=None)
+        already_submitted["flag"] = True
+        return OneStepDecision(round_id, decision_ts, forced, (forced,), skip_reason=None)
+
+    def _run() -> "ShadowRoundResult":
+        with patch.object(OneStepController, "decide", forced_decide):
+            runner = ShadowRunner(store, r.round_id, r.p0, feature_cfg, fee_config, exec_cfg, permissive_cfg, None, None, ShadowConfig())
+            return runner.run()
+
+    # Phase 1 (dry run): discover the REAL matched_ts of the one order
+    # that gets submitted - depends on exactly which decision point has
+    # valid feature data first, which this test must not hardcode/guess.
+    captured: dict = {}
+    real_submit_taker = simulator_mod.ExecutionSimulator.submit_taker
+
+    def spy_submit_taker(self, *a, **kw):
+        pending = real_submit_taker(self, *a, **kw)
+        if "matched_ts" not in captured and pending.was_delayed:
+            captured["matched_ts"] = pending.matched_ts
+        return pending
+
+    with patch.object(simulator_mod.ExecutionSimulator, "submit_taker", spy_submit_taker):
+        _run()
+    assert "matched_ts" in captured, "expected the forced FAK decision to submit exactly one delayed order"
+    matched_ts = captured["matched_ts"]
+
+    # Phase 2: inject the exchange-truth book change - genuinely happened
+    # at the exchange just before matched_ts, but doesn't arrive over this
+    # system's own wire until well after it - then rerun for real.
+    store.append(
+        EventType.BOOK_DELTA, r.round_id, recv_ts=matched_ts + 5.0, source_ts=matched_ts - 0.01,
+        payload={"side": "UP", "book": "asks", "price": 0.10, "size": 1000.0},
+    )
+    already_submitted["flag"] = False
+    result = _run()
+
+    assert math.isclose(result.final_portfolio.U, 5.0)
+    expected_cost = 5.0 * 0.10 + fee_config.taker_fee(5.0, 0.10)
+    assert math.isclose(result.final_portfolio.C, expected_cost, rel_tol=1e-6), (
+        "resolved fill must reflect the injected exchange-truth (event_time-gated) book, not the original/recv_ts-gated one"
+    )
+
+
+# --------------------------------------------------------------------------
 # ShadowRunner - shared fixtures
 # --------------------------------------------------------------------------
 

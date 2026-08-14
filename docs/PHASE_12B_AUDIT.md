@@ -2026,3 +2026,330 @@ framed), and the one real error found (this document's own original
 item 12-13 math) corrected in Addendum F-H. **No implementation changes
 have been made in this pass beyond amending this document.** *(Superseded
 by the Tranche 1 — Implemented section above; kept for the audit trail.)*
+
+---
+
+# Tranche 1.1 — Implemented
+
+**Approved and implemented**, correcting 8 items found in a re-review of
+the pushed Tranche 1 implementation:
+
+1. Round-disjoint q-model/calibration split (`_split_rounds_for_fit_and_calibration`,
+   `walkforward/pipeline.py`) — the per-window fit/calibration split
+   previously operated on individual examples, not rounds, so a single
+   round's own decision-point examples could land partly in the fit set
+   and partly in calibration despite sharing one settlement outcome.
+2. Parameter sensitivity swept `edge_min` directly on a window's TEST
+   rounds in `run_walk_forward_ablation_demo.py` — fixed to use
+   `window.validate_round_ids` only.
+3. `parameter_stability_across_windows` reused one externally-fit model
+   for every window instead of each window's own frozen artifacts —
+   fixed via `WindowArtifacts`/`window_artifacts: dict[int, WindowArtifacts]`.
+4. `LeakageTrace` was pooled across every window, which could mask or
+   false-positive leakage checks once a round legitimately moves from one
+   window's TEST to a later window's TRAIN — fixed to one trace per
+   window, keyed by `window_index`.
+5. `taker_sizing_boundaries`'s risk-budget boundary used the flat
+   `max_directional_spend(g_current, g_min)` budget universally, which is
+   only exact when the purchased side is already the non-minimum side —
+   fixed with `directional_projected_g`, the exact side-aware kernel
+   evaluation (`G_U(x)=min(U+x,D)-[C+K_U(x)]`).
+6. `run_one_step_controller_demo.py::run_one_step_round` still directly
+   converted a chosen FAK candidate into a `Fill`, bypassing
+   `ExecutionSimulator.execute_taker` — the one remaining shortcut found
+   by an explicit repo-wide audit (all other call sites already fixed in
+   Tranche 1).
+7. `ExecutionSimulator.execute_taker()` called `submit_taker_order` without
+   `asks_at_revalidation` and then resolved synchronously in the same
+   call regardless of delay, so a delayed order was resolved against the
+   submission book, not the actual book at `matched_ts`. Fixed to accept
+   a revalidation book and defer resolution to the caller's own replay
+   clock reaching `matched_ts` — see the fuller redesign in Tranche 1.2
+   item 2, which replaced this API entirely.
+8. Tranche 2 (BUFFER_BUILD, soft regime, dynamic maker, cancel/replace)
+   deliberately not started, per instruction.
+
+Full regression coverage, exact test counts, and demo re-run results were
+delivered as the chat deliverables report accompanying this update (233 ->
+241 tests, all passing).
+
+---
+
+# Tranche 1.2 — Implemented
+
+**Approved and implemented**, a further 12-item correctness/execution-
+safety pass found in a re-review of Tranche 1.1:
+
+1. Three more execution paths (`shadow/runner.py`,
+   `run_order_supervisor_demo.py`, `walkforward/ablations.py::_run_baseline_round`)
+   still called the old `execute_taker`/consumed `.walk` immediately
+   regardless of delay — fixed together with item 2's API redesign, using
+   a shared `TakerOrderQueue` (`execution/simulator.py`) in every path.
+2. `execute_taker`'s design let a caller supply the actual future book
+   (`revalidation_asks`) at submission time, so a delayed order's
+   eventual fill existed (computed, in the returned object) before
+   `matched_ts` ever arrived — "dangerous by construction," since a
+   caller reading `.walk` immediately silently bypasses the delay with
+   nothing in the API shape to stop it. Redesigned:
+   `submit_taker()` -> `PendingTakerOrder` (no future-fill information at
+   all for a delayed order) -> `resolve_taker(pending, asks_at_match, now_ts)`
+   (the ONLY place a delayed order's real fill is ever computed, and only
+   once `now_ts >= matched_ts`).
+3. `taker_sizing_boundaries` had no candidate-specific worst-price limit,
+   only the shared depth/marginal-edge-only `p_max` — insufficient to
+   protect `g_min`/`spend_cap` against an adverse repricing during the
+   delay window. Added `taker_max_execution_price` (exact,
+   `K_max,s(x) = min(K_s^G(x), K^B)`, inverted to a raw price via
+   monotonic binary search, floored to the tick grid) and
+   `TakerSizing.max_execution_price_by_qty` (per-quantity, not shared).
+4. Regression proving delayed repricing cannot breach `g_min`, using the
+   exact named scenario (`p_submit=0.50, p_later=0.80, fee_rate=0.07`).
+5. `PendingExposure`/conservative admission: `TakerOrderQueue` now defers
+   a second delayed taker submission while one is already
+   `PENDING_DELAY`, rather than allowing unbounded concurrent exposure
+   with no aggregate accounting.
+6. `exposure_from_open_maker_orders` interface added (not yet wired into
+   an admission gate at this point — deferred to Tranche 2A item 4).
+7. Probability calibration could silently fit Platt on a single-class
+   calibration window (the common case at small default window sizes,
+   since every example from one round shares that round's one outcome) —
+   added `IdentityCalibrator` fallback
+   (`UNCALIBRATED_INSUFFICIENT_CLASS_DIVERSITY`) plus backward-expanding
+   calibration-window search for class diversity.
+8. Audited remaining Phase 8-12 demo/test model constructors for the same
+   round-vs-example split issue Tranche 1.1 item 1 fixed in the walk-
+   forward pipeline specifically — added `round_ordered_split`
+   (`model/walkforward.py`) and swapped every remaining
+   `time_ordered_split` call site (5 demo scripts, 2 test fixtures) to it.
+9. Fixed the `max_directional_spend()` docstring's own worked example
+   ($100 -> $50).
+10. Repository hygiene: removed 201 tracked `__pycache__`/`*.pyc` files,
+    added `.gitignore`.
+11. Walk-forward scope clarification: the ablation matrix (fixed configs)
+    and the sensitivity/stability sweep (fixed grid on VALIDATE) are
+    explicitly documented as NOT implementing a
+    `Config*_i = argmax_theta Metric(VALIDATE_i, theta)` -> evaluate-on-
+    `TEST_i` closed selection loop — that belongs to the later real-data
+    calibration tranche.
+12. Acceptance gate: full suite (241 -> 274 tests), all explicitly-named
+    regressions added and passing, demo re-runs clean.
+
+---
+
+# Tranche 2A — Implemented (Aggregate Hard-Risk Envelope)
+
+**Approved and implemented**, correcting the `PendingExposure`
+mathematics and completing the aggregate hard-risk admission
+architecture Tranche 2B-2E (BUFFER_BUILD, soft regime, dynamic maker,
+economic cancel/replace) is gated on:
+
+1. `PendingExposure.worst_case_portfolio()` assumed "every active order
+   fills simultaneously" was always the worst case for
+   `G = min(U,D) - C` — proven false by the reviewer's own counterexample
+   (`U=D=C=0`, pending 100 UP@0.40 and 100 DOWN@0.40: both filling gives
+   `G=+20`; only UP filling gives `G=-40` — strictly worse despite fewer
+   fills). Replaced with `PendingExposure.worst_case_g`, an exact `min`
+   over every fill subset (`2^n` scenario enumeration while
+   `n <= DEFAULT_EXACT_SUBSET_CAP`, else a conservative analytical bound
+   crediting no protective share contribution from any pending order).
+2. Pending taker/maker exposure cost omitted fees — fixed to
+   `K_max = x*p_limit + Fee(x, p_limit)`, routed through the same
+   `FeeConfig` confirmed fills use, in both `exposure_from_pending_takers`
+   and `exposure_from_open_maker_orders`.
+3. Added `RiskView` (`portfolio/exposure.py`): combines confirmed
+   portfolio + pending taker exposure + open maker exposure into
+   `committed_spend`/`worst_case_g`/`potential_up_position`/
+   `potential_down_position`, and `admits(candidate, g_min, spend_cap)`
+   for hard admission — kept explicitly distinct from the probabilistic
+   EV model candidates use for ranking (`ExpectedState != HardRiskState`).
+4. `exposure_from_open_maker_orders` existed since Tranche 1.2 but was
+   never wired into an actual admission path — now checked via
+   `RiskView.admits()` before registering a new maker order with
+   `OrderSupervisor`, in both `walkforward/ablations.py`'s
+   supervisor-enabled ablation arm and `run_order_supervisor_demo.py`.
+5. `ShadowRunner`'s delayed-order resolution book was gated on `recv_ts`
+   (this system's own wire-arrival time) — corrected to the default
+   `event_time`/`source_ts` gate, since a delayed taker's fill is
+   determined by the real exchange's own book at `matched_ts`, which has
+   nothing to do with when *this* system happened to receive the update.
+   The strategy's own decision-time visibility gate correctly stays on
+   `recv_ts` — these are two genuinely different clocks
+   (`strategy_view -> recv_ts`, `execution_truth -> event_time`).
+6. The per-window calibration split (Tranche 1.2 item 7) only searched
+   for calibration-side diversity — could leave the raw model fit on a
+   single-class prefix. `_split_rounds_for_fit_and_calibration` now
+   searches bidirectionally (both growing AND shrinking the calibration
+   window from the default point) for a split where BOTH sides
+   independently have `>= 2` classes, returning `None` (no model fit at
+   all) when genuinely unreachable rather than a partially-diverse split.
+7. Documentation: this section, plus the Tranche 1/1.1/1.2/2A summary
+   added to `docs/PHASE_STATUS.md`'s "Notable bugs" section.
+
+Proceeding to Tranche 2B-2E (BUFFER_BUILD/REBALANCE purposes, soft
+regime control, dynamic maker price/quantity/TTL, economic hold/cancel/
+replace) in the same pass, per instruction. Exact file list, test
+counts, and the risk-envelope/BUFFER_BUILD/soft-regime/maker/cancel-
+replace architecture summaries are in the chat deliverables report
+accompanying this update.
+
+# Tranche 2B-2E — Implemented (proactive geometry, soft regime, dynamic maker, economic cancel/replace)
+
+**Approved and implemented**, completing Tranche 2 on top of 2A's
+aggregate hard-risk admission. Full suite: 317 passed, 0 failed.
+
+**2B — BUFFER_BUILD/REBALANCE proactive purposes** (`portfolio/math.py`,
+`optimizer/candidates.py`, `optimizer/controller.py`):
+- `OrderPurpose` extended `ALPHA, HEDGE` -> `ALPHA, HEDGE, BUFFER_BUILD,
+  REBALANCE`. `REBALANCE` is a structural enum member only — the prompt
+  gave an exact formula for BUFFER_BUILD but none for REBALANCE, and
+  inventing one would be exactly the "don't tune economics on synthetic
+  data" instruction this tranche repeats; no generator produces it.
+- Exact kernel identities added and proven against the unchanged
+  portfolio kernel (`tests/test_portfolio_math.py`):
+  `delta_g_directional(u,d,side,x,k_x) = min(u+x,d)-min(u,d)-k_x` (UP) /
+  symmetric for DOWN, and independently `delta_ev_directional(side,x,k_x,q)
+  = q*x-k_x` (UP) / `(1-q)*x-k_x` (DOWN) — the two are never equated;
+  BUFFER_BUILD candidates are accepted on `delta_g > 0` alone and may
+  carry negative `delta_ev`, proven by
+  `test_buffer_build_generates_candidate_with_positive_delta_g_even_when_delta_ev_is_negative`
+  and its mirror-image ALPHA test
+  (`test_alpha_candidate_can_have_positive_ev_and_negative_g_independently`).
+- `generate_buffer_build_candidates` targets the underrepresented side's
+  gap (`x0 = |U-D|`), walks the book with `_risk_boundary_step`'s exact
+  unimodal ΔG-vs-x logic to find the ΔG=0 crossing, and offers
+  `min(x0, boundary_qty) * 0.999` (a small safety margin off the exact
+  boundary) as a single candidate — generated unconditionally of the
+  regime's `permitted_actions` (same as HEDGE), gated behind
+  `cfg.enable_buffer_build` (default `False`).
+- Exempted from `edge_min` (`_EDGE_MIN_EXEMPT_PURPOSES = (HEDGE,
+  BUFFER_BUILD)`) since both are geometry-driven, not edge-driven,
+  candidates.
+- **Bug found and fixed via Hypothesis fuzzing while adding these
+  tests** (pre-existing, not introduced by 2B): `_risk_boundary_step`
+  divided by zero (`(g_start-g_min)/(g_start-g_kink)`) when floating-point
+  underflow at an astronomically small `x0` made `g_kink` numerically
+  identical to `g_start`. Fixed with `denom <= 1e-15` guards before both
+  interpolation divisions.
+
+**2C — soft regime control** (`optimizer/config.py`, `optimizer/
+controller.py`, `optimizer/types.py`):
+- `CandidateAction.selection_penalty: float = 0.0` (new field) and
+  `OneStepController._family_gate(family, permitted_actions) ->
+  (should_generate, penalty)`: with `cfg.soft_regime=False` (default,
+  the existing hard-gate ablation, unchanged bit-for-bit — see
+  `test_hard_regime_gate_still_produces_no_candidate_for_a_disallowed_family`),
+  a disallowed family generates nothing, exactly as before. With
+  `cfg.soft_regime=True`, the family is generated anyway, tagged with
+  `cfg.regime_prior_penalty` as `selection_penalty`.
+- Final selection: `argmax(delta_ev + lambda_g*g_after -
+  selection_penalty)` — the penalty is subtracted only from the
+  *selection* score, never from `delta_ev` itself, so a large enough edge
+  can still beat WAIT despite the penalty
+  (`test_soft_regime_can_still_select_a_strong_enough_disfavored_candidate`),
+  while a permitted family never carries a penalty
+  (`test_permitted_family_never_gets_a_penalty_under_soft_regime`).
+- Portfolio-repair/buffer-build candidates are already generated
+  independent of `permitted_actions` (2B, and HEDGE before it) — soft
+  regime doesn't gate them at all, satisfying "portfolio repair/buffer
+  actions must not be blocked by directional seed WAIT state" by
+  construction rather than a special case.
+
+**2D — dynamic maker price/quantity/TTL** (`optimizer/candidates.py`,
+`optimizer/controller.py`, `optimizer/config.py`):
+- `dynamic_maker_sizing(q, side, tau, sigma, portfolio, cfg) -> (qty, ttl,
+  offsets)`: quantity is volatility-damped
+  (`maker_quantity/(1+sigma)`) and capped at the live risk budget
+  (`G-g_min`, the same concept `taker_sizing_boundaries` already uses);
+  TTL is volatility-damped and additionally capped at the round's
+  remaining time (`tau`); the price-offset grid widens (more ticks
+  probed) as volatility rises. An explicit structural placeholder, not
+  fit to synthetic PnL (item 37/Addendum J) — the functional form is a
+  documented stand-in for Tranche 4 real-data calibration.
+- `OneStepController.decide()` gained optional `tau: float = 0.0, sigma:
+  float = 0.0` parameters (defaulting to values that are inert unless
+  `cfg.dynamic_maker=True`), so no existing caller (`ablations.py`,
+  `shadow/runner.py`, `mpc/controller.py`, both demo scripts) needed to
+  change. `cfg.dynamic_maker` (default `False`) switches the MAKER_UP/
+  MAKER_DOWN blocks between the fixed `maker_quantity`/`maker_horizon_s`/
+  `maker_price_offsets_ticks` constants and `dynamic_maker_sizing`'s
+  output — proven byte-identical to the fixed path at the default even
+  when `tau`/`sigma` are passed
+  (`test_dynamic_maker_controller_wiring_is_off_by_default_and_matches_fixed_constants`),
+  and proven to actually switch when enabled
+  (`test_dynamic_maker_controller_wiring_uses_dynamic_sizing_when_enabled`).
+- "No new maker may be posted if any admissible fill subset would violate
+  hard risk limits" required no new wiring: 2A's `RiskView.admits()` gate
+  in `ablations.py`/`run_order_supervisor_demo.py` runs at *dispatch*
+  time on whatever candidate was chosen, dynamically-sized or not — the
+  existing `test_ablations_maker_admission_uses_risk_view_and_rejects_when_unsafe`
+  already exercises this composition.
+
+**2E — economic hold/cancel/replace with hysteresis**
+(`supervisor/predicates.py`, `supervisor/supervisor.py`,
+`supervisor/config.py`):
+- Removed the unconditional categorical cancel rules for `regime_flip`,
+  `edge_failure`, `time_compression`, and the unconditional-if-true
+  `book_displacement` replace check. The two genuine safety triggers
+  (`feed_stale`, `risk_breach`) remain unconditional, checked first,
+  exactly as before.
+- Everything else now goes through three value functions
+  (`predicates.value_hold/value_cancel/value_replace`) and
+  `a* = argmax(V_hold + hysteresis_margin, V_cancel, V_replace)`:
+  - `V_hold = current_delta_ev`, degraded by `regime_flip_penalty` if the
+    origin regime no longer holds and/or `time_compression_penalty` if
+    remaining time makes a passive fill unlikely — a flip lowers the
+    order's value, it no longer vetoes it outright.
+  - `V_cancel = edge_min - cancel_cost` — the same "expected filled edge"
+    floor `edge_failure` used before, now an indifference point rather
+    than a hard veto, minus the fixed cost of executing a cancel.
+  - `V_replace = current_optimal_ev - churn_threshold` if a new tick's
+    EV was actually evaluated this review, else `None` (not a candidate
+    action) — compared against the order's *current* held value, not its
+    stale submit-time EV (a deliberate correction from the old
+    `book_displacement(current_optimal_ev, ev_at_submit, ...)` baseline).
+  - All four new coefficients (`regime_flip_penalty`,
+    `time_compression_penalty`, `cancel_cost`, `hysteresis_margin`)
+    default to `0.0`; at the defaults `V_cancel` winning reduces exactly
+    to the old `edge_failure` comparison, so every pre-2E caller's
+    default behavior for the *edge* dimension is unchanged. The
+    behavioral change specifically targeted by this tranche — a regime
+    flip alone no longer forces a cancel — is real at the defaults, since
+    `regime_flip_penalty=0.0` means a flip no longer degrades `V_hold` at
+    all unless configured to
+    (`test_regime_flip_alone_does_not_force_cancellation_when_edge_remains_strong`,
+    replacing the old `test_rapid_regime_flip_cancels_immediately` which
+    asserted the removed unconditional behavior).
+  - Hysteresis: `hysteresis_margin` is an incumbency bonus added to
+    `V_hold` before the argmax, so a small, possibly-noisy edge dip does
+    not by itself flip the decision away from HOLD
+    (`test_hysteresis_margin_prevents_thrashing_on_a_marginal_edge_dip`).
+  - CANCEL's `reason` field (used only for journaling/reports) is
+    attributed post-hoc by `_cancel_reason` — REGIME_FLIP if the origin
+    regime changed, else TIME_COMPRESSION if `tau` is short, else
+    EDGE_FAILURE — diagnostic labeling, not a second decision path.
+- **Known limitation carried forward**: `walkforward/ablations.py`'s
+  supervisor-enabled ablation arm still never passes
+  `current_optimal_ev` into `review_order` (a pre-existing gap noted in
+  its own comment since Tranche 2A), so `V_replace` is always `None`
+  there and REPLACE can never actually fire through that call site —
+  only `run_order_supervisor_demo.py` computes a real replacement tick.
+  Wiring a real "evaluate the current best alternative tick" step into
+  the ablations harness is a separate integration task, not part of the
+  policy redesign this tranche specified.
+
+**Files changed (2B-2E only; 2A's files listed in the section above):**
+`src/xamarinbot/portfolio/math.py`, `src/xamarinbot/optimizer/
+candidates.py`, `src/xamarinbot/optimizer/controller.py`,
+`src/xamarinbot/optimizer/config.py`, `src/xamarinbot/optimizer/
+types.py`, `src/xamarinbot/supervisor/predicates.py`,
+`src/xamarinbot/supervisor/supervisor.py`, `src/xamarinbot/supervisor/
+config.py`, `tests/test_portfolio_math.py`, `tests/test_optimizer.py`,
+`tests/test_supervisor.py`, this file, `docs/PHASE_STATUS.md`.
+
+**Not done in this pass, by explicit instruction**: Phase 13
+(real-capital trading) was not started. No parameter introduced across
+2B-2E was fit or selected against this repository's synthetic PnL —
+`dynamic_maker_sizing`'s functional form, and the four new
+`SupervisorConfig` economic coefficients, are documented structural
+placeholders defaulting to values that reduce to prior behavior, not
+tuned settings.

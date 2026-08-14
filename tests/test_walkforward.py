@@ -330,6 +330,41 @@ def test_baseline_round_resolves_delayed_taker_orders_via_matched_ts_not_submit_
         assert now_ts >= matched_ts
 
 
+def test_ablations_maker_admission_uses_risk_view_and_rejects_when_unsafe(eval_dataset, feature_cfg, fee_config, exec_cfg, trained_model):
+    """Phase 12B Tranche 2A item 4 integration proof: the supervisor-
+    enabled ablation arm's new-maker admission actually consults
+    RiskView.admits before registering a resting order with the
+    supervisor - forcing it to always return False must suppress every
+    maker registration that arm would otherwise make; forcing it True
+    must let registrations proceed as before."""
+    from unittest.mock import patch
+
+    import xamarinbot.walkforward.ablations as ablations_mod
+
+    store, results = eval_dataset
+    spec = next(s for s in MANDATORY_ABLATIONS if s.name == "7_maker_taker_cancel_replace")
+
+    def count_registrations(admits_return: bool) -> int:
+        calls = {"n": 0}
+        real_tracked_order = ablations_mod.TrackedOrder
+
+        def spy_tracked_order(*a, **kw):
+            calls["n"] += 1
+            return real_tracked_order(*a, **kw)
+
+        with patch.object(ablations_mod.RiskView, "admits", return_value=admits_return), \
+             patch.object(ablations_mod, "TrackedOrder", spy_tracked_order):
+            for r in results:
+                run_ablation_round(spec, store, r.round_id, r.p0, r.outcome, feature_cfg, fee_config, exec_cfg, trained_model, None)
+        return calls["n"]
+
+    n_admitted = count_registrations(True)
+    n_blocked = count_registrations(False)
+
+    assert n_admitted > 0, "expected at least one maker registration when admission is forced True"
+    assert n_blocked == 0, "RiskView.admits()==False must block every maker registration"
+
+
 def test_supervisor_receives_recomputed_economics_not_placeholders(eval_dataset, feature_cfg, fee_config, exec_cfg, trained_model):
     """Phase 12B audit item 12/18 regression: `_run_controller_round`
     previously called `supervisor.review_order` with a hardcoded

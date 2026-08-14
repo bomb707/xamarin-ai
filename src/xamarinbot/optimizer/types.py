@@ -50,6 +50,15 @@ class CandidateAction:
     # lifecycle (item 13) needs this field to preserve the same
     # worst-price protection rather than re-deriving or guessing a limit.
     max_execution_price: float | None = None
+    # Phase 12B Tranche 2C: soft-regime selection penalty - nonzero only
+    # when `cfg.soft_regime=True` and this candidate's own family was NOT
+    # in the regime classifier's hard-permitted set. Subtracted from the
+    # selection score (never from `delta_ev` itself, which must keep
+    # meaning "expected PnL") so a regime-disfavored-but-still-valid
+    # candidate can still win selection if its edge is large enough,
+    # rather than never existing at all (the old hard-gate behavior,
+    # still available as `cfg.soft_regime=False`, the default).
+    selection_penalty: float = 0.0
 
     @property
     def is_valid(self) -> bool:

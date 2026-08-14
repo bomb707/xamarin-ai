@@ -38,9 +38,15 @@ def test_each_window_fits_a_distinct_model_not_one_global_model():
     cycle actually runs independently per window, not once globally -
     two windows with disjoint train_round_ids must produce two distinct
     fitted model objects (different weights), not the same one reused."""
-    store, results = _dataset(n_rounds=18)
+    # n_train=8 (not 4): Phase 12B Tranche 2A item 6 requires class
+    # diversity on BOTH the fit and calibration sides, which a very small
+    # window can genuinely fail to achieve (correctly - see
+    # test_split_returns_none_when_diversity_is_unreachable_on_either_side);
+    # this test's own purpose is "two windows produce two distinct
+    # models," which needs a window large enough to realistically succeed.
+    store, results = _dataset(n_rounds=24)
     round_ids = [r.round_id for r in results]
-    windows = rolling_windows(round_ids, n_train=4, n_validate=2, n_test=2)
+    windows = rolling_windows(round_ids, n_train=8, n_validate=2, n_test=2)
     assert len(windows) >= 2
 
     feature_cfg = FeatureConfig()
@@ -55,9 +61,9 @@ def test_each_window_fits_a_distinct_model_not_one_global_model():
 
 
 def test_window_artifacts_are_calibrated_not_raw():
-    store, results = _dataset(n_rounds=12)
+    store, results = _dataset(n_rounds=16)  # n_train=8: see the item 6 comment above
     round_ids = [r.round_id for r in results]
-    windows = rolling_windows(round_ids, n_train=4, n_validate=2, n_test=2)
+    windows = rolling_windows(round_ids, n_train=8, n_validate=2, n_test=2)
     feature_cfg = FeatureConfig()
     trace = LeakageTrace()
 
@@ -163,9 +169,10 @@ def test_calibrator_fit_round_ids_are_disjoint_from_model_fit_round_ids_within_a
 
 
 # --------------------------------------------------------------------------
-# Phase 12B Tranche 1.2 item 7: the calibration block expands backward for
-# class diversity where possible, and never invents calibration when it
-# genuinely can't be achieved.
+# Phase 12B Tranche 1.2 item 7 / Tranche 2A item 6: the split searches for
+# a point where BOTH the fit prefix and the calibration suffix
+# independently have class diversity, and never invents a model (fit OR
+# calibration) when that genuinely can't be achieved.
 # --------------------------------------------------------------------------
 
 
@@ -173,23 +180,55 @@ def test_split_expands_calibration_window_backward_until_both_classes_present():
     round_ids = tuple(f"r{i}" for i in range(10))
     # Naive holdout (frac=0.2 of 10 -> 2 rounds) would land on r8,r9, both UP.
     outcomes = {rid: Side.UP for rid in round_ids}
-    outcomes["r7"] = Side.DOWN  # only reachable by expanding one round further back
+    outcomes["r0"] = Side.DOWN  # gives the fit side its own diversity
+    outcomes["r7"] = Side.DOWN  # only reachable by expanding calibration one round further back
 
     fit_ids, calib_ids = _split_rounds_for_fit_and_calibration(round_ids, 0.2, outcomes)
 
     assert "r7" in calib_ids
     assert {outcomes[rid] for rid in calib_ids} == {Side.UP, Side.DOWN}
+    assert {outcomes[rid] for rid in fit_ids} == {Side.UP, Side.DOWN}
     assert fit_ids and set(fit_ids).isdisjoint(calib_ids)
 
 
-def test_split_stops_expanding_at_one_remaining_fit_round_when_diversity_is_unreachable():
+def test_split_can_shrink_calibration_below_the_default_to_fix_fit_side_diversity():
+    """Phase 12B Tranche 2A item 6: the default calibration window can
+    already be diverse while the fit prefix is NOT - fixable only by
+    SHRINKING calibration (pulling a round back into fit), which the
+    old, monotonic-only-growing search (Tranche 1.2 item 7 alone) could
+    never find. Default (frac=0.3 of 10 -> n_calib=3) calib=r7,r8,r9;
+    fit=r0..r6 (all UP - not diverse). Shrinking to n_calib=2 pulls r7
+    (DOWN) into fit, fixing it, while calib=r8,r9 stays diverse."""
+    round_ids = tuple(f"r{i}" for i in range(10))
+    outcomes = {rid: Side.UP for rid in round_ids}
+    outcomes["r7"] = Side.DOWN
+    outcomes["r9"] = Side.DOWN
+
+    fit_ids, calib_ids = _split_rounds_for_fit_and_calibration(round_ids, 0.3, outcomes)
+
+    assert fit_ids is not None
+    assert {outcomes[rid] for rid in fit_ids} == {Side.UP, Side.DOWN}
+    assert {outcomes[rid] for rid in calib_ids} == {Side.UP, Side.DOWN}
+    assert set(fit_ids).isdisjoint(calib_ids)
+    assert "r7" in fit_ids  # pulled back into fit by the shrink search
+
+
+def test_split_returns_none_when_diversity_is_unreachable_on_either_side():
     round_ids = tuple(f"r{i}" for i in range(6))
-    outcomes = {rid: Side.UP for rid in round_ids}  # every round UP - diversity is impossible
+    outcomes = {rid: Side.UP for rid in round_ids}  # every round UP - diversity is impossible anywhere
+    result = _split_rounds_for_fit_and_calibration(round_ids, 0.2, outcomes)
+    assert result is None
 
-    fit_ids, calib_ids = _split_rounds_for_fit_and_calibration(round_ids, 0.2, outcomes)
 
-    assert len(fit_ids) == 1  # expansion stops leaving exactly one fit round, never zero
-    assert len(fit_ids) + len(calib_ids) == len(round_ids)
+def test_split_returns_none_when_only_one_round_could_ever_supply_the_second_class():
+    """A single DOWN round among many UP rounds can go to fit XOR
+    calibration, never both - genuinely impossible, must return None,
+    not a partially-diverse split."""
+    round_ids = tuple(f"r{i}" for i in range(8))
+    outcomes = {rid: Side.UP for rid in round_ids}
+    outcomes["r4"] = Side.DOWN
+    result = _split_rounds_for_fit_and_calibration(round_ids, 0.2, outcomes)
+    assert result is None
 
 
 def test_split_without_round_outcomes_keeps_original_fixed_fraction_behavior():

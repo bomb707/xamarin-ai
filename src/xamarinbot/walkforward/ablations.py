@@ -42,6 +42,7 @@ from xamarinbot.optimizer.candidates import evaluate_maker_candidate
 from xamarinbot.optimizer.config import OneStepConfig
 from xamarinbot.optimizer.controller import OneStepController
 from xamarinbot.optimizer.types import OrderMode
+from xamarinbot.portfolio.exposure import ActiveOrderExposure, RiskView, exposure_from_open_maker_orders
 from xamarinbot.portfolio.state import Fill, FeeConfig, LiquidityRole, PortfolioState, Side, apply_fill
 from xamarinbot.regime.classifier import RegimeClassifier
 from xamarinbot.regime.matrix import ActionPermissionMatrix, classify_seed_action
@@ -361,9 +362,23 @@ def _run_controller_round(
                     portfolio = apply_fill(portfolio, Fill(chosen.side, taker_result.walk.avg_price, taker_result.walk.filled_shares, LiquidityRole.TAKER, taker_result.walk.total_fee))
                     n_actions += 1
         elif chosen.mode is OrderMode.POST_ONLY and supervisor is not None:
-            order_seq += 1
-            order_state = sim.submit_maker_order(f"{round_id}-o{order_seq}", chosen.side, chosen.qty, chosen.price, decision_ts)
-            supervisor.register(TrackedOrder(order_state, snapshot.state, chosen.purpose, q, q if chosen.side is Side.UP else 1 - q, chosen.g_after, chosen.delta_ev, chosen.ttl_s or spec.one_step_cfg.maker_horizon_s, decision_ts, decision_ts))
+            # Phase 12B Tranche 2A item 4: check the new maker candidate
+            # against a RiskView that includes every currently open maker
+            # order (not just confirmed portfolio) before admitting it -
+            # several individually-safe open makers filling together can
+            # still jointly breach g_min/spend_cap (item 1's own
+            # counterexample), which per-placement-time-only checks miss.
+            maker_fee = fee_config.fee_for(LiquidityRole.MAKER, chosen.qty, chosen.price)
+            candidate_order = ActiveOrderExposure(chosen.side, chosen.qty, chosen.qty * chosen.price + maker_fee)
+            risk_view = RiskView(
+                portfolio,
+                pending_taker_exposure=queue.exposure,
+                open_maker_exposure=exposure_from_open_maker_orders(list(supervisor.orders.values()), fee_config),
+            )
+            if risk_view.admits(candidate_order, spec.one_step_cfg.g_min, spec.one_step_cfg.spend_cap):
+                order_seq += 1
+                order_state = sim.submit_maker_order(f"{round_id}-o{order_seq}", chosen.side, chosen.qty, chosen.price, decision_ts)
+                supervisor.register(TrackedOrder(order_state, snapshot.state, chosen.purpose, q, q if chosen.side is Side.UP else 1 - q, chosen.g_after, chosen.delta_ev, chosen.ttl_s or spec.one_step_cfg.maker_horizon_s, decision_ts, decision_ts))
         elif chosen.mode is OrderMode.POST_ONLY:
             # no supervisor tracking a maker order still resolves as an
             # immediate probability-weighted draw, for ablations that

@@ -32,6 +32,7 @@ from xamarinbot.optimizer.candidates import evaluate_maker_candidate, maker_pric
 from xamarinbot.optimizer.config import OneStepConfig
 from xamarinbot.optimizer.controller import OneStepController
 from xamarinbot.optimizer.types import OrderMode
+from xamarinbot.portfolio.exposure import ActiveOrderExposure, RiskView, exposure_from_open_maker_orders
 from xamarinbot.portfolio.math import OrderPurpose
 from xamarinbot.portfolio.state import Fill, FeeConfig, LiquidityRole, PortfolioState, Side, apply_fill
 from xamarinbot.regime.classifier import RegimeClassifier
@@ -169,16 +170,28 @@ def run_round(store, round_id, p0, feature_cfg, model, controller_cfg, superviso
                 if taker_result.walk.filled_shares > 0:
                     portfolio = apply_fill(portfolio, Fill(decision.chosen.side, taker_result.walk.avg_price, taker_result.walk.filled_shares, LiquidityRole.TAKER, taker_result.walk.total_fee))
         elif decision.chosen.mode is OrderMode.POST_ONLY:
-            order_seq += 1
-            order_id = f"{round_id}-o{order_seq}"
-            order_state = sim.submit_maker_order(order_id, decision.chosen.side, decision.chosen.qty, decision.chosen.price, decision_ts)
-            fair_value = q if decision.chosen.side is Side.UP else (1.0 - q)
-            supervisor.register(TrackedOrder(
-                order_state, snapshot.state, OrderPurpose.ALPHA, q, fair_value,
-                decision.chosen.g_after, decision.chosen.delta_ev, decision.chosen.ttl_s or controller_cfg.maker_horizon_s,
-                decision_ts, decision_ts,
-            ))
-            stats["placed"] += 1
+            # Phase 12B Tranche 2A item 4: admit against a RiskView that
+            # includes every currently open maker order, not just
+            # confirmed portfolio - several individually-safe open makers
+            # can still jointly breach g_min/spend_cap.
+            maker_fee = fee_config.fee_for(LiquidityRole.MAKER, decision.chosen.qty, decision.chosen.price)
+            candidate_order = ActiveOrderExposure(decision.chosen.side, decision.chosen.qty, decision.chosen.qty * decision.chosen.price + maker_fee)
+            risk_view = RiskView(
+                portfolio,
+                pending_taker_exposure=queue.exposure,
+                open_maker_exposure=exposure_from_open_maker_orders(list(supervisor.orders.values()), fee_config),
+            )
+            if risk_view.admits(candidate_order, supervisor_cfg.g_min, controller_cfg.spend_cap):
+                order_seq += 1
+                order_id = f"{round_id}-o{order_seq}"
+                order_state = sim.submit_maker_order(order_id, decision.chosen.side, decision.chosen.qty, decision.chosen.price, decision_ts)
+                fair_value = q if decision.chosen.side is Side.UP else (1.0 - q)
+                supervisor.register(TrackedOrder(
+                    order_state, snapshot.state, OrderPurpose.ALPHA, q, fair_value,
+                    decision.chosen.g_after, decision.chosen.delta_ev, decision.chosen.ttl_s or controller_cfg.maker_horizon_s,
+                    decision_ts, decision_ts,
+                ))
+                stats["placed"] += 1
 
     return portfolio, stats
 

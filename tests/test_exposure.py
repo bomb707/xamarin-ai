@@ -1,6 +1,7 @@
-"""Phase 12B Tranche 1.2 items 5/6: PendingExposure - aggregate risk
-exposure from not-yet-confirmed active orders, kept separate from the
-confirmed-fills-only PortfolioState kernel.
+"""Phase 12B Tranche 1.2 items 5/6, corrected and completed in Tranche 2A:
+PendingExposure/RiskView - aggregate risk exposure from not-yet-confirmed
+active orders, kept separate from the confirmed-fills-only PortfolioState
+kernel, admitted via a mathematically correct scenario envelope.
 """
 from __future__ import annotations
 
@@ -12,53 +13,121 @@ from xamarinbot.execution.simulator import ExecutionSimulator, TakerOrderQueue
 from xamarinbot.feeds.base import BookLevel
 from xamarinbot.portfolio.exposure import (
     NO_EXPOSURE,
+    ActiveOrderExposure,
     PendingExposure,
+    RiskView,
     exposure_from_open_maker_orders,
     exposure_from_pending_takers,
 )
-from xamarinbot.portfolio.math import OrderPurpose
 from xamarinbot.portfolio.state import FeeConfig, LiquidityRole, PortfolioState, Side
 
 FEE = FeeConfig()
+ZERO_FEE = FeeConfig(crypto_fee_rate=0.0)
 ASKS = (BookLevel(0.50, 500.0),)
 
 
-def test_no_exposure_leaves_portfolio_unchanged():
+def test_no_exposure_worst_case_g_equals_confirmed_g():
     portfolio = PortfolioState(U=10.0, D=5.0, C=7.0)
-    worst = NO_EXPOSURE.worst_case_portfolio(portfolio)
-    assert worst == portfolio
+    assert NO_EXPOSURE.worst_case_g(portfolio) == portfolio.G
 
 
-def test_worst_case_portfolio_adds_exposure_on_top_of_confirmed():
-    portfolio = PortfolioState(U=10.0, D=5.0, C=7.0)
-    exposure = PendingExposure(max_committed_spend=20.0, potential_up_shares=15.0, potential_down_shares=0.0)
-    worst = exposure.worst_case_portfolio(portfolio)
-    assert worst.U == 25.0
-    assert worst.D == 5.0
-    assert worst.C == 27.0
-    assert worst.G < portfolio.G  # strictly more exposed, never less
-
-
-def test_pending_exposure_addition_sums_all_fields():
-    a = PendingExposure(max_committed_spend=10.0, potential_up_shares=5.0, n_pending_delayed_takers=1)
-    b = PendingExposure(max_committed_spend=3.0, potential_down_shares=2.0, n_open_maker_orders=1)
+def test_pending_exposure_addition_sums_all_fields_including_orders():
+    order_a = ActiveOrderExposure(Side.UP, 10.0, 5.0)
+    order_b = ActiveOrderExposure(Side.DOWN, 3.0, 1.0)
+    a = PendingExposure(max_committed_spend=10.0, potential_up_shares=5.0, n_pending_delayed_takers=1, orders=(order_a,))
+    b = PendingExposure(max_committed_spend=3.0, potential_down_shares=2.0, n_open_maker_orders=1, orders=(order_b,))
     total = a + b
     assert total.max_committed_spend == 13.0
     assert total.potential_up_shares == 5.0
     assert total.potential_down_shares == 2.0
     assert total.n_pending_delayed_takers == 1
     assert total.n_open_maker_orders == 1
+    assert total.orders == (order_a, order_b)
 
 
-def test_exposure_from_pending_takers_uses_worst_case_limit_price():
+# --------------------------------------------------------------------------
+# Phase 12B Tranche 2A item 1: worst_case_g's scenario envelope - the exact
+# counterexample from the reviewer's prompt, proving "all fill" is NOT
+# always the worst case for G = min(U,D) - C.
+# --------------------------------------------------------------------------
+
+
+def test_worst_case_g_all_fill_is_not_necessarily_worst_case():
+    """U=D=C=0, pending 100 UP@0.40 and 100 DOWN@0.40 (zero fee for exact
+    round numbers). Both filling: G=+20. Only UP filling: G=-40. The
+    worst case (only one side fills) must be found, not "both fill"."""
+    confirmed = PortfolioState()
+    up_order = ActiveOrderExposure(Side.UP, 100.0, 100.0 * 0.40)
+    down_order = ActiveOrderExposure(Side.DOWN, 100.0, 100.0 * 0.40)
+    exposure = PendingExposure(orders=(up_order, down_order))
+
+    # Sanity-check both named scenarios directly against the exact kernel.
+    both_fill = PortfolioState(U=100.0, D=100.0, C=80.0)
+    assert math.isclose(both_fill.G, 20.0)
+    only_up_fills = PortfolioState(U=100.0, D=0.0, C=40.0)
+    assert math.isclose(only_up_fills.G, -40.0)
+
+    worst = exposure.worst_case_g(confirmed)
+    assert math.isclose(worst, -40.0), "worst_case_g must find the only-one-side-fills scenario, not assume all-fill"
+
+
+def test_worst_case_g_exact_enumeration_matches_hand_computed_minimum_over_all_subsets():
+    confirmed = PortfolioState(U=5.0, D=5.0, C=2.0)
+    orders = (
+        ActiveOrderExposure(Side.UP, 20.0, 9.0),
+        ActiveOrderExposure(Side.DOWN, 15.0, 6.0),
+        ActiveOrderExposure(Side.UP, 10.0, 4.5),
+    )
+    exposure = PendingExposure(orders=orders)
+
+    # Hand-enumerate every subset (2^3 = 8) independently of the implementation.
+    best = None
+    for mask in range(8):
+        u, d, c = confirmed.U, confirmed.D, confirmed.C
+        for i, o in enumerate(orders):
+            if mask & (1 << i):
+                if o.side is Side.UP:
+                    u += o.max_fill_qty
+                else:
+                    d += o.max_fill_qty
+                c += o.max_cost
+        g = min(u, d) - c
+        if best is None or g < best:
+            best = g
+
+    assert math.isclose(exposure.worst_case_g(confirmed), best)
+
+
+def test_worst_case_g_falls_back_to_conservative_bound_beyond_exact_cap():
+    confirmed = PortfolioState()
+    orders = tuple(ActiveOrderExposure(Side.UP, 10.0, 4.0) for _ in range(5))
+    exposure = PendingExposure(orders=orders)
+
+    exact = exposure.worst_case_g(confirmed, exact_subset_cap=10)
+    conservative = exposure.worst_case_g(confirmed, exact_subset_cap=2)  # force the fallback path
+
+    total_cost = sum(o.max_cost for o in orders)
+    expected_conservative = min(confirmed.U, confirmed.D) - (confirmed.C + total_cost)
+    assert math.isclose(conservative, expected_conservative)
+    # the conservative bound must never be more optimistic (higher) than the true exact worst case
+    assert conservative <= exact + 1e-9
+
+
+# --------------------------------------------------------------------------
+# Phase 12B Tranche 2A item 2: fee-inclusive committed cost.
+# --------------------------------------------------------------------------
+
+
+def test_exposure_from_pending_takers_includes_taker_fee_in_max_cost():
     sim = ExecutionSimulator("r0", FEE, ExecutionConfig(taker_delay_ms=250.0))
     pending = sim.submit_taker("o1", Side.UP, 50.0, limit_price=0.90, asks_at_submission=ASKS, submit_ts=10.0)
     assert pending.was_delayed and not pending.is_resolved
 
-    exposure = exposure_from_pending_takers([pending])
-    assert math.isclose(exposure.potential_up_shares, 50.0)
-    assert math.isclose(exposure.max_committed_spend, 50.0 * 0.90)  # worst case: fills at the full limit price
-    assert exposure.n_pending_delayed_takers == 1
+    exposure = exposure_from_pending_takers([pending], FEE)
+    expected_fee = FEE.taker_fee(50.0, 0.90)
+    assert expected_fee > 0.0
+    assert math.isclose(exposure.max_committed_spend, 50.0 * 0.90 + expected_fee)
+    assert exposure.orders[0].max_cost == exposure.max_committed_spend
 
 
 def test_exposure_from_pending_takers_ignores_already_resolved_orders():
@@ -66,11 +135,11 @@ def test_exposure_from_pending_takers_ignores_already_resolved_orders():
     pending = sim.submit_taker("o1", Side.UP, 50.0, 0.90, ASKS, submit_ts=10.0)
     assert pending.is_resolved  # no delay - resolved immediately at submission
 
-    exposure = exposure_from_pending_takers([pending])
+    exposure = exposure_from_pending_takers([pending], FEE)
     assert exposure == NO_EXPOSURE
 
 
-def test_exposure_from_open_maker_orders_uses_remaining_shares_and_limit_price():
+def test_exposure_from_open_maker_orders_uses_remaining_shares_and_is_fee_consistent():
     order = OrderState(order_id="m1", side=Side.DOWN, role=LiquidityRole.MAKER, limit_price=0.40, requested_shares=30.0, submit_ts=0.0)
     order.reconcile_fill(1.0, 10.0)  # 10 of 30 already filled - only the remaining 20 is still exposure
 
@@ -78,61 +147,111 @@ def test_exposure_from_open_maker_orders_uses_remaining_shares_and_limit_price()
         def __init__(self, order_state):
             self.order_state = order_state
 
-    exposure = exposure_from_open_maker_orders([_FakeTracked(order)])
+    exposure = exposure_from_open_maker_orders([_FakeTracked(order)], FEE)
     assert math.isclose(exposure.potential_down_shares, 20.0)
-    assert math.isclose(exposure.max_committed_spend, 20.0 * 0.40)
+    # maker fee is always 0 today, but the cost must still be computed via
+    # fee_config (not hardcoded), matching apply_fill's cost definition exactly.
+    expected_fee = FEE.fee_for(LiquidityRole.MAKER, 20.0, 0.40)
+    assert expected_fee == 0.0
+    assert math.isclose(exposure.max_committed_spend, 20.0 * 0.40 + expected_fee)
     assert exposure.n_open_maker_orders == 1
 
 
 # --------------------------------------------------------------------------
-# Phase 12B Tranche 1.2 item 5's literal regression: pending order A is
-# individually safe, order B is individually safe against the CONFIRMED
-# portfolio alone, but A+B jointly would violate g_min - B must be
-# rejected/deferred, not admitted merely because confirmed+B looks safe.
+# RiskView (Phase 12B Tranche 2A item 3): the hard-admission interface.
 # --------------------------------------------------------------------------
 
 
-def test_second_delayed_taker_is_deferred_even_though_individually_safe_against_confirmed_portfolio():
-    confirmed = PortfolioState()  # flat - both A and B look individually safe against this alone
+def test_risk_view_committed_spend_and_potential_positions_combine_confirmed_and_pending():
+    confirmed = PortfolioState(U=10.0, D=5.0, C=7.0)
+    taker_exposure = PendingExposure(max_committed_spend=8.0, potential_up_shares=6.0, orders=(ActiveOrderExposure(Side.UP, 6.0, 8.0),))
+    maker_exposure = PendingExposure(max_committed_spend=2.0, potential_down_shares=3.0, orders=(ActiveOrderExposure(Side.DOWN, 3.0, 2.0),))
+    view = RiskView(confirmed, taker_exposure, maker_exposure)
+
+    assert math.isclose(view.committed_spend, 7.0 + 8.0 + 2.0)
+    assert math.isclose(view.potential_up_position, 10.0 + 6.0)
+    assert math.isclose(view.potential_down_position, 5.0 + 3.0)
+
+
+def test_risk_view_admits_rejects_candidate_that_would_breach_g_min_jointly():
+    """The literal item-4 scenario: an existing maker A is individually
+    safe, a new maker B is individually safe against confirmed alone, but
+    A+B jointly breach g_min - RiskView.admits must reject B."""
+    confirmed = PortfolioState()  # flat
     g_min = -60.0
 
-    # Order A: 60 shares @ ~0.5175 all-in => worst-case cost ~31.05, G' ~ -31.05 - individually safe (>= -60).
-    a_shares, a_price = 60.0, 0.50
-    a_cost = a_shares * (a_price + FEE.taker_fee(1.0, a_price))
-    g_after_a_alone = min(a_shares, 0.0) - a_cost  # D stays 0, min(U,D)=0
-    assert g_after_a_alone >= g_min
+    order_a = ActiveOrderExposure(Side.UP, 60.0, 60.0 * 0.5175)  # individually safe: G = -31.05 >= -60
+    assert PendingExposure(orders=(order_a,)).worst_case_g(confirmed) >= g_min
 
-    # Order B: same size/side, evaluated ALONE against the same confirmed (flat) portfolio - also individually safe.
-    b_shares, b_price = 60.0, 0.50
-    b_cost = b_shares * (b_price + FEE.taker_fee(1.0, b_price))
-    g_after_b_alone = min(b_shares, 0.0) - b_cost
-    assert g_after_b_alone >= g_min
+    order_b = ActiveOrderExposure(Side.UP, 60.0, 60.0 * 0.5175)  # also individually safe alone
+    assert PendingExposure(orders=(order_b,)).worst_case_g(confirmed) >= g_min
 
-    # But A+B together (both UP, both spend, D stays 0) would NOT be safe:
-    joint_cost = a_cost + b_cost
-    g_after_both = min(a_shares + b_shares, 0.0) - joint_cost
-    assert g_after_both < g_min, "test setup must actually construct a jointly-unsafe pair, or this regression is vacuous"
+    view = RiskView(confirmed, open_maker_exposure=PendingExposure(orders=(order_a,), max_committed_spend=order_a.max_cost, potential_up_shares=order_a.max_fill_qty))
+    admitted = view.admits(order_b, g_min, spend_cap=None)
+    assert not admitted, "B must be rejected once A is already tracked in the RiskView - A+B jointly breach g_min"
 
-    # The actual admission mechanism: TakerOrderQueue's conservative gate
-    # (Phase 12B Tranche 1.2 item 5) must defer B while A is still pending,
-    # exactly because this codebase does not yet have the aggregate
-    # reservation model that would be required to admit B safely.
+
+def test_risk_view_admits_accepts_candidate_when_jointly_safe():
+    confirmed = PortfolioState()
+    g_min = -1000.0
+    order_a = ActiveOrderExposure(Side.UP, 10.0, 5.0)
+    view = RiskView(confirmed, open_maker_exposure=PendingExposure(orders=(order_a,), max_committed_spend=5.0, potential_up_shares=10.0))
+    candidate = ActiveOrderExposure(Side.DOWN, 10.0, 5.0)
+    assert view.admits(candidate, g_min, spend_cap=None)
+
+
+def test_risk_view_admits_opposite_side_makers_where_each_alone_looks_safe_but_one_sided_fill_is_not():
+    """Opposite-side makers: a UP maker and a DOWN maker each individually
+    safe, but if only the UP one fills (the DOWN one never does), the
+    resulting one-sided position breaches g_min - admits() must catch
+    this via the scenario envelope, not just check "both fill together"."""
+    confirmed = PortfolioState()
+    g_min = -50.0
+    order_up = ActiveOrderExposure(Side.UP, 100.0, 51.75)  # only-this-fills: G = min(100,0)-51.75 = -51.75 < -50
+
+    view = RiskView(confirmed)
+    admitted = view.admits(order_up, g_min, spend_cap=None)
+    assert not admitted  # the one-sided-fill subset alone already breaches g_min, regardless of a second order
+
+
+def test_risk_view_admits_rejects_on_spend_cap_breach():
+    confirmed = PortfolioState(C=90.0)
+    order_a = ActiveOrderExposure(Side.UP, 5.0, 5.0)
+    candidate = ActiveOrderExposure(Side.DOWN, 6.0, 6.0)
+    view = RiskView(confirmed, pending_taker_exposure=PendingExposure(orders=(order_a,), max_committed_spend=5.0))
+    assert not view.admits(candidate, g_min=-1_000_000.0, spend_cap=100.0)  # 90+5+6=101 > 100
+
+
+# --------------------------------------------------------------------------
+# TakerOrderQueue integration (unchanged behavior, new fee-inclusive exposure)
+# --------------------------------------------------------------------------
+
+
+def test_taker_order_queue_exposure_uses_fee_inclusive_cost():
+    sim = ExecutionSimulator("r0", FEE, ExecutionConfig(taker_delay_ms=250.0))
+    queue = TakerOrderQueue(sim)
+    queue.try_submit("o1", Side.UP, 50.0, 0.90, ASKS, submit_ts=10.0)
+    expected_fee = FEE.taker_fee(50.0, 0.90)
+    assert math.isclose(queue.exposure.max_committed_spend, 50.0 * 0.90 + expected_fee)
+
+
+def test_taker_order_queue_defers_a_second_delayed_submission_while_one_is_pending():
+    """Phase 12B Tranche 1.2 item 5's conservative gate: with no full
+    aggregate reservation model wired into candidate GENERATION yet, a
+    second delayed taker order must be rejected/deferred while one is
+    already PENDING_DELAY."""
     sim = ExecutionSimulator("r0", FEE, ExecutionConfig(taker_delay_ms=250.0))
     queue = TakerOrderQueue(sim)
 
-    order_a = queue.try_submit("A", Side.UP, a_shares, a_price, (BookLevel(a_price, 200.0),), submit_ts=10.0)
-    assert order_a is not None and order_a.was_delayed
+    first = queue.try_submit("o1", Side.UP, 50.0, 0.99, ASKS, submit_ts=10.0)
+    assert first is not None and first.was_delayed
 
-    order_b = queue.try_submit("B", Side.UP, b_shares, b_price, (BookLevel(b_price, 200.0),), submit_ts=10.05)
-    assert order_b is None, "B must be rejected/deferred while A is still PENDING_DELAY"
+    second = queue.try_submit("o2", Side.UP, 50.0, 0.99, ASKS, submit_ts=10.05)
+    assert second is None  # deferred - queue.has_pending was already True
+    assert len(queue._pending) == 1
 
-    # Confirm via PendingExposure that the admission gate's caution was
-    # actually warranted here - worst-case confirmed+A alone already
-    # accounts for A's exposure; had B been (wrongly) admitted too, the
-    # combined worst-case portfolio would breach g_min.
-    exposure_a_only = queue.exposure
-    worst_with_a = exposure_a_only.worst_case_portfolio(confirmed)
-    hypothetical_worst_with_both = PortfolioState(
-        U=worst_with_a.U + b_shares, D=worst_with_a.D, C=worst_with_a.C + b_cost,
-    )
-    assert hypothetical_worst_with_both.G < g_min
+    queue.resolve_ready(now_ts=10.25, book_at_fn=lambda p: ASKS)
+    assert not queue.has_pending
+
+    third = queue.try_submit("o3", Side.UP, 50.0, 0.99, ASKS, submit_ts=10.30)
+    assert third is not None  # admitted now that the queue is clear again

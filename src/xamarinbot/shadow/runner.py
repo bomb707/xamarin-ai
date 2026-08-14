@@ -112,11 +112,23 @@ class ShadowRunner:
         book_feed = MockBookFeed(live_cursor)
         # Dedicated cursor/book_feed for fetching the actual causal book at
         # a delayed taker order's matched_ts, only at resolve time (Phase
-        # 12B Tranche 1.2 items 1/2) - gated on recv_ts like the main
-        # cursor above, since this runner must never act on data it
-        # hasn't actually "received" yet, even when resolving a pending
-        # order.
-        revalidation_cursor = MockFeedCursor(self.store, self.round_id, preloaded=events, time_attr="recv_ts")
+        # 12B Tranche 1.2 items 1/2, corrected in Tranche 2A item 5).
+        #
+        # Deliberately time_attr="event_time" (the default), NOT recv_ts,
+        # unlike the strategy's own decision-time cursor above. These are
+        # two genuinely different clocks/views:
+        #   strategy_view (decisions)   -> recv_ts   (this system's own wire-arrival gate)
+        #   execution_truth (fills)     -> event_time/source_ts (what the real EXCHANGE's book actually was)
+        # A delayed taker's fill at matched_ts is determined by the real
+        # exchange matching engine against the book as it truly stood at
+        # matched_ts (by source/exchange event ordering) - that has
+        # nothing to do with when *this* system happened to receive the
+        # update over its own wire. Gating the resolution book on recv_ts
+        # would make the simulated fill depend on this system's own
+        # network/processing latency, which is backwards: a book update
+        # that reached the real exchange before matched_ts determines the
+        # fill even if it reaches this system's feed handler later.
+        revalidation_cursor = MockFeedCursor(self.store, self.round_id, preloaded=events)
         revalidation_book_feed = MockBookFeed(revalidation_cursor)
         regime_clf = RegimeClassifier(round_id=self.round_id)
         one_step = OneStepController(self.one_step_cfg, self.exec_cfg, self.fee_config)

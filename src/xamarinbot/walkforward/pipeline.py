@@ -56,7 +56,7 @@ def _split_rounds_for_fit_and_calibration(
     train_round_ids: tuple[str, ...],
     calibration_holdout_frac: float,
     round_outcomes: dict[str, Side] | None = None,
-) -> tuple[tuple[str, ...], tuple[str, ...]]:
+) -> tuple[tuple[str, ...], tuple[str, ...]] | None:
     """Splits a window's own `train_round_ids` into a chronologically
     earlier fit sub-range and a later calibration sub-range, at ROUND
     granularity (Phase 12B Tranche 1.1 item 1).
@@ -73,39 +73,55 @@ def _split_rounds_for_fit_and_calibration(
     example level.
 
     `train_round_ids` is already chronologically ordered (guaranteed by
-    `rolling_windows()` slicing `round_ids_chronological`), so a simple
-    index split preserves TRAIN_i -> VALIDATE_i chronology within the
-    window's own train segment.
+    `rolling_windows()` slicing `round_ids_chronological`), so fit is
+    always the earlier prefix and calibration the later suffix - that
+    chronological ordering (TRAIN_i -> VALIDATE_i) is preserved by every
+    split point this function ever returns.
 
-    Phase 12B Tranche 1.2 item 7: with `round_outcomes` given (maps
-    round_id -> settlement `Side`), the trailing calibration block
-    expands backward, one round at a time, until it contains both UP and
-    DOWN outcomes - a small default holdout (e.g. `n_train=6,
-    calibration_holdout_frac=0.2` usually yields exactly one calibration
-    round) is otherwise likely to land on a single-class window purely by
-    chance, since every decision example from one round shares that
-    round's one settlement outcome. Expansion always leaves at least one
-    round for the raw model fit; if diversity still can't be achieved
-    even using every available round, `fit_calibrated_model`'s own
-    one-class guard is the final backstop (falls back to
-    `IdentityCalibrator`/`UNCALIBRATED_INSUFFICIENT_CLASS_DIVERSITY`
-    rather than inventing calibration)."""
+    Phase 12B Tranche 1.2 item 7 / Tranche 2A item 6: with
+    `round_outcomes` given (maps round_id -> settlement `Side`), this
+    searches for a split point where BOTH the fit prefix AND the
+    calibration suffix independently contain both UP and DOWN outcomes
+    (`|{y_fit}| >= 2` and `|{y_calibration}| >= 2`) - a small default
+    holdout (e.g. `n_train=6, calibration_holdout_frac=0.2` usually
+    yields exactly one calibration round) is otherwise likely to land on
+    a single-class window purely by chance, since every decision example
+    from one round shares that round's one settlement outcome. Growing
+    the calibration suffix can only ever shrink (never help) the fit
+    prefix's own diversity, so this searches outward from the default
+    split point in both directions (more AND less calibration) for the
+    closest point satisfying both sides at once, rather than only ever
+    expanding calibration monotonically.
+
+    Returns `None` if no split point achieves diversity on both sides -
+    the caller must not fit a model at all in that case (an unstable
+    one-class raw model is not an acceptable fallback merely because
+    `fit_calibrated_model`'s own guard would still catch the calibration
+    half; the FIT half needs the same guarantee)."""
     n = len(train_round_ids)
     if n <= 1:
         return train_round_ids, ()
     n_calib = max(1, round(n * calibration_holdout_frac))
     n_calib = min(n_calib, n - 1)  # always leave at least one round to fit on
 
-    if round_outcomes is not None:
-        for candidate_n_calib in range(n_calib, n):  # up to n-1, always keeping >=1 fit round
-            calib_ids = train_round_ids[n - candidate_n_calib:]
-            outcomes = {round_outcomes[rid] for rid in calib_ids if rid in round_outcomes}
-            n_calib = candidate_n_calib
-            if len(outcomes) >= 2:
-                break
+    if round_outcomes is None:
+        n_fit = n - n_calib
+        return train_round_ids[:n_fit], train_round_ids[n_fit:]
 
-    n_fit = n - n_calib
-    return train_round_ids[:n_fit], train_round_ids[n_fit:]
+    def outcomes_for(rids: tuple[str, ...]) -> set[Side]:
+        return {round_outcomes[rid] for rid in rids if rid in round_outcomes}
+
+    for offset in range(0, n):
+        for candidate in (n_calib + offset, n_calib - offset):
+            if candidate < 1 or candidate > n - 1:
+                continue
+            n_fit = n - candidate
+            fit_ids = train_round_ids[:n_fit]
+            calib_ids = train_round_ids[n_fit:]
+            if len(outcomes_for(fit_ids)) >= 2 and len(outcomes_for(calib_ids)) >= 2:
+                return fit_ids, calib_ids
+
+    return None  # no split achieves class diversity on both sides
 
 
 @dataclass
@@ -183,23 +199,31 @@ def fit_window_artifacts(
     # window.test_round_ids, only a chronologically-earlier/later
     # partition of this window's own train_round_ids, with every example
     # from a given round landing entirely in one side of the split. The
-    # calibration block expands backward for class diversity where
-    # possible (Phase 12B Tranche 1.2 item 7).
+    # split searches for class diversity on BOTH sides (Phase 12B Tranche
+    # 1.2 item 7 / Tranche 2A item 6); if no split anywhere achieves that,
+    # no model is fit at all for this window (an unstable one-class raw
+    # model is not an acceptable silent fallback) - every feature_set maps
+    # to None, and callers already treat model=None as "fall back to
+    # q=0.5" (see ablations.py/run_one_step_controller_demo.py/
+    # shadow/runner.py's `q = model.predict_proba(...) if model is not
+    # None ... else 0.5` pattern).
     round_outcomes = {r.round_id: r.outcome for r in train_rounds}
-    fit_round_ids, calib_round_ids = _split_rounds_for_fit_and_calibration(
-        window.train_round_ids, _CALIBRATION_HOLDOUT_FRAC, round_outcomes
-    )
-    fit_round_id_set, calib_round_id_set = set(fit_round_ids), set(calib_round_ids)
+    split_result = _split_rounds_for_fit_and_calibration(window.train_round_ids, _CALIBRATION_HOLDOUT_FRAC, round_outcomes)
 
     models: dict[str, CalibratedModel | None] = {}
-    for fs in feature_sets:
-        by_fs = build_examples_multi(store, train_rounds, feature_cfg, [fs], heartbeat_s=HEARTBEAT_S)
-        examples = by_fs[fs.name]
-        fit_examples = [e for e in examples if e.round_id in fit_round_id_set]
-        calib_examples = [e for e in examples if e.round_id in calib_round_id_set]
-        trace.model_fit_round_ids.update(e.round_id for e in fit_examples)
-        trace.calibrator_fit_round_ids.update(e.round_id for e in calib_examples)
-        models[fs.name] = fit_calibrated_model(fit_examples, calib_examples, fs)
+    if split_result is None:
+        models = {fs.name: None for fs in feature_sets}
+    else:
+        fit_round_ids, calib_round_ids = split_result
+        fit_round_id_set, calib_round_id_set = set(fit_round_ids), set(calib_round_ids)
+        for fs in feature_sets:
+            by_fs = build_examples_multi(store, train_rounds, feature_cfg, [fs], heartbeat_s=HEARTBEAT_S)
+            examples = by_fs[fs.name]
+            fit_examples = [e for e in examples if e.round_id in fit_round_id_set]
+            calib_examples = [e for e in examples if e.round_id in calib_round_id_set]
+            trace.model_fit_round_ids.update(e.round_id for e in fit_examples)
+            trace.calibrator_fit_round_ids.update(e.round_id for e in calib_examples)
+            models[fs.name] = fit_calibrated_model(fit_examples, calib_examples, fs)
 
     transition_model = _train_transition_model(store, train_rounds, feature_cfg)
     trace.transition_fit_round_ids.update(r.round_id for r in train_rounds)

@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from xamarinbot.execution.order_state import CancelResult, ReplaceResult, replace_order
 from xamarinbot.regime.types import RegimeState
 from xamarinbot.supervisor.config import SupervisorConfig
-from xamarinbot.supervisor.predicates import book_displacement, edge_failure, feed_stale, regime_flip, risk_breach, time_compression
+from xamarinbot.supervisor.predicates import feed_stale, regime_flip, risk_breach, time_compression, value_cancel, value_hold, value_replace
 from xamarinbot.supervisor.types import CancelReason, SupervisorActionType, SupervisorDecision, TrackedOrder
 
 
@@ -41,9 +41,16 @@ class OrderSupervisor:
         is_fresh: bool,
         current_optimal_ev: float | None = None,
     ) -> SupervisorDecision:
-        """Priority order matches Strategy doc SS16's table roughly
-        top-to-bottom, with the two hard-safety triggers (stale data, risk
-        breach) checked first regardless of what else is true."""
+        """Phase 12B Tranche 2E: the two hard-safety triggers (stale data,
+        risk breach) are still checked first, unconditionally - these are
+        genuine safety constraints, not economic tradeoffs. Everything
+        else (regime flip, edge failure, time compression, book
+        displacement) is no longer a categorical "if true, cancel/replace"
+        rule; it now feeds V_hold/V_cancel/V_replace, and the action taken
+        is whichever scores highest - `argmax(V_hold + hysteresis_margin,
+        V_cancel, V_replace)`. This is what makes a regime flip alone
+        insufficient to force a cancel: a still strongly profitable order
+        can outscore V_cancel even after the flip's penalty is applied."""
         if now_ts - tracked.last_action_ts < self.cfg.min_action_interval_s:
             return SupervisorDecision(tracked.order_id, SupervisorActionType.HOLD, None, "rate_limited")
 
@@ -51,15 +58,31 @@ class OrderSupervisor:
             return SupervisorDecision(tracked.order_id, SupervisorActionType.CANCEL, CancelReason.FEED_STALE)
         if risk_breach(current_g_after_if_fill, self.cfg):
             return SupervisorDecision(tracked.order_id, SupervisorActionType.CANCEL, CancelReason.RISK_BREACH)
-        if regime_flip(tracked.origin_regime_state, current_regime_state):
-            return SupervisorDecision(tracked.order_id, SupervisorActionType.CANCEL, CancelReason.REGIME_FLIP)
-        if edge_failure(current_delta_ev, self.cfg):
-            return SupervisorDecision(tracked.order_id, SupervisorActionType.CANCEL, CancelReason.EDGE_FAILURE)
-        if time_compression(tau, self.cfg):
-            return SupervisorDecision(tracked.order_id, SupervisorActionType.CANCEL, CancelReason.TIME_COMPRESSION)
-        if current_optimal_ev is not None and book_displacement(current_optimal_ev, tracked.ev_at_submit, self.cfg):
+
+        v_hold = value_hold(current_delta_ev, tracked.origin_regime_state, current_regime_state, tau, self.cfg) + self.cfg.hysteresis_margin
+        v_cancel = value_cancel(self.cfg)
+        v_replace = value_replace(current_optimal_ev, self.cfg)
+
+        scores = {SupervisorActionType.HOLD: v_hold, SupervisorActionType.CANCEL: v_cancel}
+        if v_replace is not None:
+            scores[SupervisorActionType.REPLACE] = v_replace
+        best_action = max(scores, key=scores.get)
+
+        if best_action is SupervisorActionType.HOLD:
+            return SupervisorDecision(tracked.order_id, SupervisorActionType.HOLD, None)
+        if best_action is SupervisorActionType.REPLACE:
             return SupervisorDecision(tracked.order_id, SupervisorActionType.REPLACE)
-        return SupervisorDecision(tracked.order_id, SupervisorActionType.HOLD, None)
+        return SupervisorDecision(tracked.order_id, SupervisorActionType.CANCEL, self._cancel_reason(tracked, current_regime_state, tau))
+
+    def _cancel_reason(self, tracked: TrackedOrder, current_regime_state: RegimeState, tau: float) -> CancelReason:
+        """Diagnostic attribution only (journaling/reports) - the argmax
+        above has already decided CANCEL; this just names the most likely
+        contributing predicate for `SupervisorDecisionRecord.reason`."""
+        if regime_flip(tracked.origin_regime_state, current_regime_state):
+            return CancelReason.REGIME_FLIP
+        if time_compression(tau, self.cfg):
+            return CancelReason.TIME_COMPRESSION
+        return CancelReason.EDGE_FAILURE
 
     def apply_cancel(self, decision: SupervisorDecision, now_ts: float) -> CancelResult | None:
         tracked = self.orders.get(decision.order_id)

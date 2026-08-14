@@ -22,6 +22,21 @@ from xamarinbot.portfolio.state import Fill, FeeConfig, LiquidityRole, Portfolio
 class OrderPurpose(str, Enum):
     ALPHA = "ALPHA"
     HEDGE = "HEDGE"
+    # Phase 12B Tranche 2B (Strategy doc SS17): proactively accumulate
+    # cheap opposite-side inventory to improve settlement geometry
+    # (min(U,D)), generated independent of any G<g_min breach - unlike
+    # HEDGE, which only reacts once already in trouble. See
+    # `delta_g_directional` below and
+    # `optimizer/candidates.py::generate_buffer_build_candidates`.
+    BUFFER_BUILD = "BUFFER_BUILD"
+    # Structural placeholder (Phase 12B audit item 27's action-space gap):
+    # a purpose tag for a future two-sided/portfolio-rebalancing order
+    # type. No dedicated candidate generator exists yet - the prompt that
+    # introduced BUFFER_BUILD gave exact math for it specifically, not for
+    # REBALANCE, so building a REBALANCE generator without a specified
+    # formula would mean inventing one, which Tranche 2's own "do not
+    # tune/invent economics on synthetic data" instruction argues against.
+    REBALANCE = "REBALANCE"
 
 
 @dataclass(frozen=True)
@@ -196,6 +211,41 @@ def directional_projected_g(u: float, d: float, c: float, side: Side, x: float, 
     if side is Side.UP:
         return min(u + x, d) - (c + k_x)
     return min(u, d + x) - (c + k_x)
+
+
+def delta_g_directional(u: float, d: float, side: Side, x: float, k_x: float) -> float:
+    """Exact side-aware CHANGE in worst-case settlement margin from
+    buying `x` additional shares on `side` at cumulative (fee-inclusive)
+    cost `k_x` (Phase 12B Tranche 2B, Strategy doc SS17's BUFFER_BUILD):
+
+        ΔG_U(x) = min(U+x, D) - min(U, D) - K_U(x)
+        ΔG_D(x) = min(U, D+x) - min(U, D) - K_D(x)
+
+    Proof (Phase 12B audit Addendum F-H, corrected from an earlier draft
+    that used the two-sided-only `ΔG_pair(x) = x - K_U(x) - K_D(x)` for a
+    one-sided fill): for a one-sided UP fill (`U'=U+x, D'=D, C'=C+K_U(x)`),
+
+        ΔG = G' - G = [min(U+x,D) - (C+K_U(x))] - [min(U,D) - C]
+                     = min(U+x,D) - min(U,D) - K_U(x)
+
+    - exactly `directional_projected_g(u, d, c, side, x, k_x) -
+    (min(u,d) - c)`, the `c` terms canceling; this function computes the
+    same delta without needing `c` as an input at all. Special case: if
+    `U < D` and `x <= D-U`, `min(U+x,D) = U+x` and `min(U,D) = U`, so
+    `ΔG_U(x) = x - K_U(x)` exactly - the existing DOWN inventory already
+    priced into `min(U,D)` doesn't need "re-buying," only the new UP
+    shares' own cost counts against the buffer improvement.
+
+    `ΔG_side(x)` is independent of `ΔEV_side(x) = q*x - K_side(x)` (for
+    UP) / `(1-q)*x - K_side(x)` (for DOWN, computed separately wherever
+    `q` is available - this module stays prediction-free, see the module
+    docstring) - nothing ties `q` to the portfolio-geometry term
+    `min(U+x,D)-min(U,D)`, so a `ΔG>0, ΔEV<0` candidate is a real,
+    non-contradictory possibility (Addendum G) and must never be
+    conflated with `ΔEV>0` meaning "profitable" or vice versa."""
+    if side is Side.UP:
+        return min(u + x, d) - min(u, d) - k_x
+    return min(u, d + x) - min(u, d) - k_x
 
 
 def min_hedge_quantity(l_max: float, pi_down: float, c_d: float) -> float:

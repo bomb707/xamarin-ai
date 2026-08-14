@@ -4,6 +4,8 @@ Plus predicate correctness, rate limiting, and cancel-regret analytics.
 """
 from __future__ import annotations
 
+import math
+
 from xamarinbot.events.store import EventStore
 from xamarinbot.events.types import EventType
 from xamarinbot.execution.order_state import OrderLifecycleState, OrderState
@@ -15,7 +17,7 @@ from xamarinbot.portfolio.state import LiquidityRole, Side
 from xamarinbot.regime.types import Direction, GapRegime, RegimeState
 from xamarinbot.reports.supervisor_report import build_supervisor_report
 from xamarinbot.supervisor.config import SupervisorConfig
-from xamarinbot.supervisor.predicates import book_displacement, edge_failure, feed_stale, regime_flip, risk_breach, time_compression
+from xamarinbot.supervisor.predicates import book_displacement, edge_failure, feed_stale, regime_flip, risk_breach, time_compression, value_cancel, value_hold, value_replace
 from xamarinbot.supervisor.supervisor import OrderSupervisor
 from xamarinbot.supervisor.types import CancelReason, SupervisorActionType, TrackedOrder
 
@@ -72,6 +74,44 @@ def test_book_displacement_predicate_requires_clearing_churn_threshold():
 
 
 # --------------------------------------------------------------------------
+# Phase 12B Tranche 2E: V_hold/V_cancel/V_replace value functions
+# --------------------------------------------------------------------------
+
+
+def test_value_hold_reduces_to_delta_ev_at_default_zero_penalties():
+    cfg = SupervisorConfig()
+    v = value_hold(7.0, STATE_A, STATE_B, tau=200.0, cfg=cfg)  # flipped, but penalty=0.0
+    assert v == 7.0
+
+
+def test_value_hold_applies_regime_flip_penalty_only_on_an_actual_flip():
+    cfg = SupervisorConfig(regime_flip_penalty=3.0)
+    assert value_hold(7.0, STATE_A, STATE_B, tau=200.0, cfg=cfg) == 4.0
+    assert value_hold(7.0, STATE_A, STATE_A, tau=200.0, cfg=cfg) == 7.0
+
+
+def test_value_hold_applies_time_compression_penalty_only_when_compressed():
+    cfg = SupervisorConfig(min_tau_for_passive_s=15.0, time_compression_penalty=2.0)
+    assert value_hold(7.0, STATE_A, STATE_A, tau=10.0, cfg=cfg) == 5.0  # compressed (tau < 15)
+    assert value_hold(7.0, STATE_A, STATE_A, tau=20.0, cfg=cfg) == 7.0  # not compressed
+
+
+def test_value_cancel_is_edge_min_minus_cancel_cost():
+    cfg = SupervisorConfig(edge_min=1.0, cancel_cost=0.4)
+    assert math.isclose(value_cancel(cfg), 0.6)
+
+
+def test_value_replace_is_none_without_an_evaluated_optimal_tick():
+    cfg = SupervisorConfig(churn_threshold=0.5)
+    assert value_replace(None, cfg) is None
+
+
+def test_value_replace_nets_out_the_churn_cost():
+    cfg = SupervisorConfig(churn_threshold=0.5)
+    assert math.isclose(value_replace(2.0, cfg), 1.5)
+
+
+# --------------------------------------------------------------------------
 # review_order: priority order and the "everything's fine" HOLD path
 # --------------------------------------------------------------------------
 
@@ -98,16 +138,44 @@ def test_feed_stale_takes_priority_over_everything_else():
 
 
 # --------------------------------------------------------------------------
-# "Rapid regime flip" (Roadmap Phase 9 verification, named explicitly)
+# "Rapid regime flip" (Roadmap Phase 9 verification, named explicitly) -
+# Phase 12B Tranche 2E: a regime flip is no longer an unconditional cancel
+# trigger. It now degrades V_hold by `regime_flip_penalty` (0.0 by
+# default); whether that actually flips the argmax to CANCEL depends on
+# whether the order's edge can absorb the penalty.
 # --------------------------------------------------------------------------
 
 
-def test_rapid_regime_flip_cancels_immediately():
+def test_regime_flip_alone_does_not_force_cancellation_when_edge_remains_strong():
+    """Phase 12B Tranche 2E regression: the pre-2E supervisor canceled on
+    ANY regime flip regardless of economics. With `regime_flip_penalty`
+    at its default (0.0), a flip must no longer force a cancel by itself
+    when the order's edge is still strongly positive - V_hold must beat
+    V_cancel on the merits, not lose automatically to a categorical rule."""
     cfg = SupervisorConfig(g_min=-1000.0, edge_min=-1000.0, min_tau_for_passive_s=0.0, min_action_interval_s=0.0)
     supervisor = OrderSupervisor(cfg)
     tracked = _tracked(origin=STATE_A)
     supervisor.register(tracked)
 
+    decision = supervisor.review_order(tracked, now_ts=1.0, current_regime_state=STATE_B, current_delta_ev=5.0, current_g_after_if_fill=-1.0, tau=200.0, is_fresh=True)
+    assert decision.action is SupervisorActionType.HOLD
+    assert decision.reason is None
+
+
+def test_regime_flip_penalty_can_still_trigger_cancellation_once_it_erodes_the_edge():
+    """The flip must remain economically *relevant*, just not an absolute
+    veto: once `regime_flip_penalty` is large enough to push V_hold below
+    V_cancel (here, below `edge_min`), the argmax picks CANCEL and still
+    attributes it to REGIME_FLIP for diagnostics - proving the trigger
+    still does real work, now mediated through the economics rather than
+    bypassing them."""
+    cfg = SupervisorConfig(g_min=-1000.0, edge_min=0.0, min_tau_for_passive_s=0.0, min_action_interval_s=0.0, regime_flip_penalty=10.0)
+    supervisor = OrderSupervisor(cfg)
+    tracked = _tracked(origin=STATE_A)
+    supervisor.register(tracked)
+
+    # Same delta_ev=5.0 that HOLDs above (test_regime_flip_alone_does_not_...)
+    # - only the added penalty changes the outcome.
     decision = supervisor.review_order(tracked, now_ts=1.0, current_regime_state=STATE_B, current_delta_ev=5.0, current_g_after_if_fill=-1.0, tau=200.0, is_fresh=True)
     assert decision.action is SupervisorActionType.CANCEL
     assert decision.reason is CancelReason.REGIME_FLIP
@@ -115,6 +183,18 @@ def test_rapid_regime_flip_cancels_immediately():
     result = supervisor.apply_cancel(decision, now_ts=1.0)
     assert result.accepted
     assert "o1" not in supervisor.open_order_ids()
+
+
+def test_regime_flip_penalty_is_not_applied_when_no_flip_occurred():
+    """The penalty must be conditional on an actual flip, not a constant
+    drag applied every review regardless of regime state."""
+    cfg = SupervisorConfig(g_min=-1000.0, edge_min=0.0, min_tau_for_passive_s=0.0, min_action_interval_s=0.0, regime_flip_penalty=10.0)
+    supervisor = OrderSupervisor(cfg)
+    tracked = _tracked(origin=STATE_A)
+    supervisor.register(tracked)
+
+    decision = supervisor.review_order(tracked, now_ts=1.0, current_regime_state=STATE_A, current_delta_ev=5.0, current_g_after_if_fill=-1.0, tau=200.0, is_fresh=True)
+    assert decision.action is SupervisorActionType.HOLD
 
 
 def test_rapid_successive_flips_are_rate_limited():
@@ -139,7 +219,7 @@ def test_rapid_successive_flips_are_rate_limited():
 
 
 def test_partial_fill_then_cancel_via_supervisor():
-    cfg = SupervisorConfig(g_min=-1000.0, edge_min=-1000.0, min_tau_for_passive_s=0.0, min_action_interval_s=0.0)
+    cfg = SupervisorConfig(g_min=-1000.0, edge_min=0.0, min_tau_for_passive_s=0.0, min_action_interval_s=0.0)
     supervisor = OrderSupervisor(cfg)
     tracked = _tracked(qty=100.0)
     supervisor.register(tracked)
@@ -147,7 +227,9 @@ def test_partial_fill_then_cancel_via_supervisor():
     tracked.order_state.reconcile_fill(1.0, 40.0)  # partial fill happens first
     assert tracked.order_state.state is OrderLifecycleState.PARTIALLY_FILLED
 
-    decision = supervisor.review_order(tracked, now_ts=2.0, current_regime_state=STATE_B, current_delta_ev=5.0, current_g_after_if_fill=-1.0, tau=200.0, is_fresh=True)
+    # current_delta_ev below edge_min so the economics themselves (not a
+    # categorical regime-flip rule) drive the CANCEL this test exercises.
+    decision = supervisor.review_order(tracked, now_ts=2.0, current_regime_state=STATE_B, current_delta_ev=-5.0, current_g_after_if_fill=-1.0, tau=200.0, is_fresh=True)
     assert decision.action is SupervisorActionType.CANCEL
 
     result = supervisor.apply_cancel(decision, now_ts=2.0)
@@ -168,7 +250,11 @@ def test_fill_beating_cancel_still_removes_order_from_tracking():
     tracked.order_state.reconcile_fill(1.0, 20.0)  # fully filled before cancel arrives
     assert tracked.order_state.state is OrderLifecycleState.FILLED
 
-    decision = supervisor.review_order(tracked, now_ts=2.0, current_regime_state=STATE_B, current_delta_ev=5.0, current_g_after_if_fill=-1.0, tau=200.0, is_fresh=True)
+    # current_delta_ev below the default edge_min=0.0 so the decision is
+    # CANCEL (via the V_hold/V_cancel argmax) and apply_cancel's rejection
+    # path is actually exercised.
+    decision = supervisor.review_order(tracked, now_ts=2.0, current_regime_state=STATE_B, current_delta_ev=-5.0, current_g_after_if_fill=-1.0, tau=200.0, is_fresh=True)
+    assert decision.action is SupervisorActionType.CANCEL
     result = supervisor.apply_cancel(decision, now_ts=2.0)
     assert not result.accepted  # already terminal, cancel itself is rejected
     assert "o1" not in supervisor.open_order_ids()  # but tracking still cleans it up
@@ -225,6 +311,60 @@ def test_order_survives_tick_size_change_event_without_error():
     supervisor.register(tracked)
     decision = supervisor.review_order(tracked, now_ts=150.0, current_regime_state=STATE_A, current_delta_ev=10.0, current_g_after_if_fill=-1.0, tau=150.0, is_fresh=True)
     assert decision.action is SupervisorActionType.HOLD  # nothing else changed, still a valid thesis
+
+
+# --------------------------------------------------------------------------
+# Phase 12B Tranche 2E acceptance items: "cancellation hysteresis" and
+# "hold-vs-replace economic comparison"
+# --------------------------------------------------------------------------
+
+
+def test_hysteresis_margin_prevents_thrashing_on_a_marginal_edge_dip():
+    """Without hysteresis, an edge that dips just below edge_min tips the
+    argmax straight to CANCEL. `hysteresis_margin` biases V_hold so a
+    small, possibly-noisy dip doesn't immediately thrash the order -
+    proving the incumbency bonus is a real cancellation-hysteresis
+    mechanism, not just documentation."""
+    tracked_kwargs = dict(now_ts=1.0, current_regime_state=STATE_A, current_delta_ev=-0.5, current_g_after_if_fill=-1.0, tau=200.0, is_fresh=True)
+
+    cfg_no_margin = SupervisorConfig(g_min=-1000.0, edge_min=0.0, min_tau_for_passive_s=0.0, min_action_interval_s=0.0, hysteresis_margin=0.0)
+    supervisor_no_margin = OrderSupervisor(cfg_no_margin)
+    tracked = _tracked(origin=STATE_A)
+    supervisor_no_margin.register(tracked)
+    decision_no_margin = supervisor_no_margin.review_order(tracked, **tracked_kwargs)
+    assert decision_no_margin.action is SupervisorActionType.CANCEL
+
+    cfg_with_margin = SupervisorConfig(g_min=-1000.0, edge_min=0.0, min_tau_for_passive_s=0.0, min_action_interval_s=0.0, hysteresis_margin=1.0)
+    supervisor_with_margin = OrderSupervisor(cfg_with_margin)
+    tracked2 = _tracked(origin=STATE_A)
+    supervisor_with_margin.register(tracked2)
+    decision_with_margin = supervisor_with_margin.review_order(tracked2, **tracked_kwargs)
+    assert decision_with_margin.action is SupervisorActionType.HOLD
+
+
+def test_replace_wins_over_hold_only_once_the_new_tick_clears_the_churn_cost():
+    """"Hold-vs-replace economic comparison": REPLACE must not win merely
+    because a new tick exists - it has to beat V_hold (the order's
+    *current* held value) net of the churn cost. A marginal improvement
+    stays HOLD; a large one wins REPLACE."""
+    cfg = SupervisorConfig(g_min=-1000.0, edge_min=-1000.0, min_tau_for_passive_s=0.0, min_action_interval_s=0.0, churn_threshold=1.0)
+    supervisor = OrderSupervisor(cfg)
+    tracked_small = _tracked(order_id="o_small", origin=STATE_A)
+    supervisor.register(tracked_small)
+    decision_small = supervisor.review_order(
+        tracked_small, now_ts=1.0, current_regime_state=STATE_A, current_delta_ev=10.0,
+        current_g_after_if_fill=-1.0, tau=200.0, is_fresh=True, current_optimal_ev=10.5,
+    )
+    assert decision_small.action is SupervisorActionType.HOLD, "a small improvement that doesn't clear the churn cost must not trigger a replace"
+
+    supervisor2 = OrderSupervisor(cfg)
+    tracked_big = _tracked(order_id="o_big", origin=STATE_A)
+    supervisor2.register(tracked_big)
+    decision_big = supervisor2.review_order(
+        tracked_big, now_ts=1.0, current_regime_state=STATE_A, current_delta_ev=10.0,
+        current_g_after_if_fill=-1.0, tau=200.0, is_fresh=True, current_optimal_ev=15.0,
+    )
+    assert decision_big.action is SupervisorActionType.REPLACE
 
 
 # --------------------------------------------------------------------------

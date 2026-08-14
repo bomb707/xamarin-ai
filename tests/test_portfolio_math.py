@@ -11,6 +11,7 @@ from xamarinbot.portfolio.math import (
     CandidateFill,
     OrderPurpose,
     RiskConstraints,
+    delta_g_directional,
     directional_projected_g,
     evaluate_constraints,
     hedge_efficiency,
@@ -275,3 +276,62 @@ def test_delta_ev_equals_total_ev_after_minus_ev_before(u0, d0, c0, side, price,
     delta_ev = q * delta_U + (1.0 - q) * delta_D - delta_C
 
     assert math.isclose(delta_ev, _ev(after, q) - _ev(before, q), rel_tol=1e-9, abs_tol=1e-9)
+
+
+# --------------------------------------------------------------------------
+# Phase 12B Tranche 2B: delta_g_directional - the exact one-sided BUFFER_BUILD
+# kernel identity (Addendum F-H corrected), proven directly against
+# apply_fill/.G, plus its documented special case.
+# --------------------------------------------------------------------------
+
+
+@settings(deadline=None)
+@given(
+    st.floats(min_value=0.0, max_value=500.0, allow_nan=False),
+    st.floats(min_value=0.0, max_value=500.0, allow_nan=False),
+    st.floats(min_value=0.0, max_value=500.0, allow_nan=False),
+    st.sampled_from([Side.UP, Side.DOWN]),
+    st.floats(min_value=0.01, max_value=0.99, allow_nan=False),
+    st.floats(min_value=0.01, max_value=300.0, allow_nan=False),
+)
+def test_delta_g_directional_matches_kernel_g_after_minus_g_before(u0, d0, c0, side, price, shares):
+    fee_config = FeeConfig()
+    before = PortfolioState(U=u0, D=d0, C=c0)
+    fee = fee_config.fee_for(LiquidityRole.TAKER, shares, price)
+    k_x = shares * price + fee
+    fill = Fill(side=side, price=price, shares=shares, role=LiquidityRole.TAKER, fee=fee)
+    after = apply_fill(before, fill)
+
+    delta_g = delta_g_directional(u0, d0, side, shares, k_x)
+    assert math.isclose(delta_g, after.G - before.G, rel_tol=1e-9, abs_tol=1e-9)
+
+
+def test_delta_g_up_and_down_identities_numeric():
+    # ΔG_U(x) = min(U+x,D) - min(U,D) - K_U(x)
+    assert math.isclose(delta_g_directional(10.0, 30.0, Side.UP, 5.0, 3.0), min(15.0, 30.0) - min(10.0, 30.0) - 3.0)
+    # ΔG_D(x) = min(U,D+x) - min(U,D) - K_D(x)
+    assert math.isclose(delta_g_directional(30.0, 10.0, Side.DOWN, 5.0, 3.0), min(30.0, 15.0) - min(30.0, 10.0) - 3.0)
+
+
+def test_delta_g_special_case_when_buying_the_underrepresented_side():
+    """U < D and x <= D-U: ΔG_U(x) = x - K_U(x) exactly (Addendum F-H's
+    documented special case) - existing DOWN inventory already priced
+    into min(U,D) doesn't need "re-buying," only the new UP shares' own
+    cost counts against the buffer improvement."""
+    u, d, x, k_x = 10.0, 30.0, 15.0, 8.0  # x=15 <= D-U=20
+    assert math.isclose(delta_g_directional(u, d, Side.UP, x, k_x), x - k_x)
+
+
+def test_delta_g_is_independent_of_delta_ev_sign():
+    """Addendum G: nothing ties q to the portfolio-geometry term, so
+    ΔG>0 with ΔEV<0 (and vice versa) are both real, non-contradictory
+    combinations - this test constructs one of each."""
+    u, d = 0.0, 100.0  # buying UP raises min(U,D) toward parity
+    x, k_x = 50.0, 26.0  # K_U(50) = 26 (e.g. ~0.5175/share plus a bit)
+    delta_g = delta_g_directional(u, d, Side.UP, x, k_x)
+    assert delta_g > 0.0  # min(50,100)-min(0,100)-26 = 50-0-26 = 24 > 0
+
+    # A low q makes this same purchase's ΔEV negative independently.
+    low_q = 0.1
+    delta_ev = low_q * x - k_x  # ΔEV_U(x) = q*x - K_U(x)
+    assert delta_ev < 0.0

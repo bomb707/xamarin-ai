@@ -33,6 +33,7 @@ from xamarinbot.portfolio.math import (
     FillSimulationResult,
     OrderPurpose,
     RiskConstraints,
+    delta_g_directional,
     directional_projected_g,
     evaluate_constraints,
     min_hedge_quantity,
@@ -118,7 +119,17 @@ def _risk_boundary_step(
     if kink > cum_qty and g_kink < g_min:
         # crosses within the non-decreasing sub-range (only possible if
         # c_i > 1, a pathological book state) - interpolate linearly.
-        frac = (g_start - g_min) / (g_start - g_kink)
+        # Guard against a near-zero denominator: at an astronomically
+        # small x0 (e.g. u and d differing only in the last few bits of
+        # float precision), `kink` can end up numerically identical to
+        # `cum_qty` after rounding, making g_kink == g_start exactly even
+        # though the < g_min check above (with its own tolerance) still
+        # fired - in that degenerate case there is no real interpolation
+        # to do, so just report no further feasible movement.
+        denom = g_start - g_kink
+        if denom <= 1e-15:
+            return cum_qty, False
+        frac = (g_start - g_min) / denom
         return cum_qty + frac * (kink - cum_qty), False
 
     g_end = g_at(level_end)
@@ -127,7 +138,10 @@ def _risk_boundary_step(
 
     # crosses within the non-increasing sub-range [kink, level_end]
     ref_x, ref_g = (kink, g_kink) if kink > cum_qty else (cum_qty, g_start)
-    frac = (ref_g - g_min) / (ref_g - g_end)
+    denom = ref_g - g_end
+    if denom <= 1e-15:
+        return ref_x, False
+    frac = (ref_g - g_min) / denom
     return ref_x + frac * (level_end - ref_x), False
 
 
@@ -329,6 +343,12 @@ def taker_sizing_boundaries(
     return TakerSizing(final_quantities, p_max, max_execution_price_by_qty)
 
 
+# Purposes exempt from the edge_min alpha-edge floor (Phase 12B Tranche
+# 2B): both are explicitly allowed negative standalone EV in exchange for
+# improving worst-case risk/settlement geometry - see _finalize's docstring.
+_EDGE_MIN_EXEMPT_PURPOSES = (OrderPurpose.HEDGE, OrderPurpose.BUFFER_BUILD)
+
+
 def maker_price_grid(best_bid: float, best_ask: float, tick_size: float, offsets_ticks: tuple[int, ...]) -> list[tuple[float, int]]:
     """(price, offset_ticks) pairs moving from the current best bid toward
     (but never at or past) the best ask, on the live tick grid - "Do not
@@ -340,6 +360,51 @@ def maker_price_grid(best_bid: float, best_ask: float, tick_size: float, offsets
         if price < best_ask - 1e-12:
             out.append((price, offset))
     return out
+
+
+def dynamic_maker_sizing(
+    q: float, side: Side, tau: float, sigma: float, portfolio: PortfolioState, cfg: OneStepConfig,
+) -> tuple[float, float, tuple[int, ...]]:
+    """Derives maker (quantity, TTL, price_offsets_ticks) from
+    `(q, tau, sigma, G, R, purpose)` instead of `OneStepConfig`'s fixed
+    `maker_quantity`/`maker_horizon_s`/`maker_price_offsets_ticks`
+    constants (Phase 12B Tranche 2D). This is a STRUCTURAL replacement
+    for the fixed constants, not a calibrated economic model - per item
+    37/Addendum J, no coefficient here has been tuned against synthetic
+    PnL; the specific functional form is a placeholder for real-data
+    calibration (Tranche 4) to replace, gated behind `cfg.dynamic_maker`
+    so the default (fixed) behavior is exactly Phases 8-12B's.
+
+    Quantity: damped by volatility (`sigma`) - a larger resting order
+    carries more adverse-selection risk in a faster-moving market before
+    it can be reconsidered - and capped by the current risk budget
+    (`G - g_min`, the same risk-budget concept `taker_sizing_boundaries`
+    already uses), so a maker candidate's size responds to the same risk
+    state a taker candidate would, rather than being a market-state-blind
+    constant.
+
+    TTL: damped by volatility (a stale quote is riskier in a fast market)
+    and capped by remaining round time (`tau`), so a maker candidate
+    never proposes resting past the round's own decision window.
+
+    Price offsets: widen with volatility (a wider grid gives more price
+    points to react to a faster-moving touch) - three offsets in calm
+    conditions, growing with `sigma`, capped to avoid an unbounded grid.
+    """
+    vol = max(0.0, sigma)
+    risk_budget = max(0.0, portfolio.G - cfg.g_min)
+    vol_damped_qty = cfg.maker_quantity / (1.0 + vol)
+    qty = max(cfg.taker_min_size, min(vol_damped_qty, risk_budget)) if risk_budget > 0 else cfg.taker_min_size
+
+    ttl = cfg.maker_horizon_s / (1.0 + vol)
+    if tau > 0:
+        ttl = min(ttl, tau)
+    ttl = max(1.0, ttl)
+
+    n_offsets = min(8, 3 + round(vol * 4))
+    offsets = tuple(range(n_offsets))
+
+    return qty, ttl, offsets
 
 
 def _risk_constraints(cfg: OneStepConfig) -> RiskConstraints:
@@ -398,13 +463,15 @@ def _finalize(
     violated = list(check.violated)
 
     delta_ev = delta_ev_raw - cfg.churn_penalty
-    # Hedge orders are explicitly allowed negative standalone EV in
-    # exchange for improving worst-case risk (SS17: "Hedge orders may have
-    # negative standalone EV if they efficiently improve the whole
-    # portfolio risk. They must be labeled separately in the journal and
-    # optimizer.") - edge_min is an alpha-edge floor and does not apply to
-    # them, regardless of what the caller passed.
-    if apply_edge_min and purpose is not OrderPurpose.HEDGE and delta_ev < cfg.edge_min:
+    # Hedge and BUFFER_BUILD orders are explicitly allowed negative
+    # standalone EV in exchange for improving worst-case risk (SS17:
+    # "Hedge orders may have negative standalone EV if they efficiently
+    # improve the whole portfolio risk. They must be labeled separately in
+    # the journal and optimizer." - Phase 12B Tranche 2B extends the same
+    # allowance to BUFFER_BUILD, which trades EV for settlement geometry
+    # by the same design) - edge_min is an alpha-edge floor and does not
+    # apply to either, regardless of what the caller passed.
+    if apply_edge_min and purpose not in _EDGE_MIN_EXEMPT_PURPOSES and delta_ev < cfg.edge_min:
         violated.append("edge_min")
 
     return CandidateAction(
@@ -566,6 +633,105 @@ def generate_hedge_candidate(
         action_id, side, OrderPurpose.HEDGE, x_min, limit_price=1.0, asks=asks,
         portfolio=portfolio, q=q, fee_config=fee_config, cfg=cfg,
     )
+
+
+def delta_ev_directional(side: Side, x: float, k_x: float, q: float) -> float:
+    """ΔEV_U(x) = q*x - K_U(x); ΔEV_D(x) = (1-q)*x - K_D(x) (Phase 12B
+    Tranche 2B) - computed independently of `delta_g_directional`
+    (`portfolio/math.py`), which stays prediction-free and never sees
+    `q`. For a one-sided fill this is provably identical to the module's
+    general `q*delta_U + (1-q)*delta_D - delta_C` formula (delta_D=0 for
+    a pure UP buy reduces it to exactly this), so `evaluate_taker_candidate`
+    doesn't need a separate code path to get the same number - this
+    function exists so the identity is explicit and independently
+    testable, matching the reviewer's "independently calculate" ask.
+    ΔG and ΔEV must never be conflated: `ΔG>0, ΔEV<0` is a real,
+    non-contradictory possibility (Addendum G) - a BUFFER_BUILD
+    candidate is allowed exactly that combination."""
+    if side is Side.UP:
+        return q * x - k_x
+    return (1.0 - q) * x - k_x
+
+
+def generate_buffer_build_candidates(
+    action_id_prefix: str,
+    portfolio: PortfolioState,
+    asks_up: tuple[BookLevel, ...],
+    asks_down: tuple[BookLevel, ...],
+    q: float,
+    fee_config: FeeConfig,
+    cfg: OneStepConfig,
+) -> list[CandidateAction]:
+    """BUFFER_BUILD candidates (Phase 12B Tranche 2B, Strategy doc SS17):
+    proactively accumulate cheap opposite-side inventory to improve
+    settlement geometry, generated independent of any `G < g_min` breach
+    - unlike `generate_hedge_candidate`, which only ever fires once
+    already at/below the risk floor. Buys the currently underrepresented
+    side (`U <= D` -> buy UP, else buy DOWN) - buying that side raises
+    `min(U,D)`; buying the already-overrepresented side never can (see
+    `delta_g_directional`'s proof).
+
+    Sizes the single candidate at `x0 = |U-D|` (clamped to available book
+    depth) - the exact quantity at which `ΔG_side(x)` peaks (see
+    `delta_g_directional`'s docstring: non-decreasing for `x<=x0`,
+    non-increasing after), i.e. the largest settlement-geometry
+    improvement reachable without walking past the point where it starts
+    giving cost back. Reuses `_risk_boundary_step`'s own tested unimodal-
+    walk logic to find this exactly, by observing that "the max x with
+    `G_side(x) >= G_current`" (i.e. `ΔG_side(x) >= 0`) is the SAME kind of
+    boundary `_risk_boundary_step` already computes for an arbitrary
+    `g_min` - passing `g_min=G_current` finds the ΔG=0 crossing directly.
+    The candidate is then sized to the earlier of that crossing and `x0`
+    itself, since `x0` is where `ΔG` is maximized, not merely non-negative.
+
+    Every returned candidate's own `delta_ev` may be negative (SS17:
+    BUFFER_BUILD trades expected value for improved worst-case
+    settlement, same allowance as HEDGE) - `edge_min` does not apply (see
+    `_EDGE_MIN_EXEMPT_PURPOSES`). `ΔG>0` alone is the admission bar for
+    generating the candidate at all; the controller's own `argmax`
+    (weighing `delta_ev + lambda_g*g_after`) decides whether it's
+    actually worth choosing over other candidates, same as any other
+    purpose."""
+    side = Side.UP if portfolio.U <= portfolio.D else Side.DOWN
+    asks = asks_up if side is Side.UP else asks_down
+    if not asks:
+        return []
+
+    u, d, c = portfolio.U, portfolio.D, portfolio.C
+    x0 = max(0.0, (d - u) if side is Side.UP else (u - d))
+    if x0 <= 0:
+        return []  # already at parity or overrepresented - no buffer opportunity in this direction
+
+    g_current = min(u, d) - c
+    cum_qty = 0.0
+    cum_cost = 0.0
+    boundary_qty = 0.0
+    for level in asks[: cfg.max_taker_depth_levels]:
+        c_i = level.price + fee_config.taker_fee(1.0, level.price)
+        boundary_qty, keep_going = _risk_boundary_step(u, d, c, g_current, side, x0, cum_qty, cum_cost, level.size, c_i)
+        cum_qty += level.size
+        cum_cost += level.size * c_i
+        if not keep_going:
+            break
+
+    # A small safety margin (matching generate_hedge_candidate's own
+    # x_min*1.0001 pattern) since `boundary_qty` alone lands exactly on
+    # the ΔG=0 crossing - chained floating-point arithmetic can put the
+    # literal boundary a few ULPs on the wrong (non-positive-ΔG) side.
+    target_qty = min(x0, boundary_qty) * 0.999
+    if target_qty <= 0:
+        return []
+    walk = walk_depth(asks, target_qty, limit_price=1.0, fee_config=fee_config)
+    if walk.filled_shares <= 0:
+        return []
+    k_x = walk.total_paid
+    if delta_g_directional(u, d, side, walk.filled_shares, k_x) <= 0:
+        return []  # cost exceeds the parity gain even at the peak quantity (e.g. a very expensive book)
+
+    return [evaluate_taker_candidate(
+        f"{action_id_prefix}_1", side, OrderPurpose.BUFFER_BUILD, walk.filled_shares, limit_price=1.0,
+        asks=asks, portfolio=portfolio, q=q, fee_config=fee_config, cfg=cfg,
+    )]
 
 
 def wait_candidate(action_id: str, portfolio: PortfolioState) -> CandidateAction:

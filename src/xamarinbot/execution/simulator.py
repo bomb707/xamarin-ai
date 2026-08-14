@@ -82,13 +82,14 @@ class TakerOrderQueue:
 
     @property
     def exposure(self) -> PendingExposure:
-        """The aggregate `PendingExposure` (Phase 12B Tranche 1.2 item 5)
-        from every order this queue is still tracking - `worst_case_qty`
-        callers can add on top of confirmed `PortfolioState` for a
-        risk-admission check. With the conservative single-pending gate
-        in `try_submit` below, this sums over at most one order today,
-        but the accounting itself generalizes."""
-        return exposure_from_pending_takers(self._pending)
+        """The aggregate `PendingExposure` (Phase 12B Tranche 1.2 item 5,
+        corrected in Tranche 2A) from every order this queue is still
+        tracking - callers build a `portfolio.exposure.RiskView` from
+        this (plus any open maker exposure) for hard-admission checks.
+        With the conservative single-pending gate in `try_submit` below,
+        this sums over at most one order today, but the accounting
+        itself generalizes."""
+        return exposure_from_pending_takers(self._pending, self.sim.fee_config)
 
     def try_submit(
         self,

@@ -11,8 +11,11 @@ from hypothesis import given, settings, strategies as st
 from xamarinbot.execution.config import ExecutionConfig
 from xamarinbot.feeds.base import BookLevel, BookSnapshot
 from xamarinbot.optimizer.candidates import (
+    delta_ev_directional,
+    dynamic_maker_sizing,
     evaluate_maker_candidate,
     evaluate_taker_candidate,
+    generate_buffer_build_candidates,
     maker_price_grid,
     taker_max_execution_price,
     taker_quantities,
@@ -473,3 +476,230 @@ def test_optimizer_never_violates_g_min_across_random_states(u, d, c, q, g_min, 
         f"chosen candidate {decision.chosen.action_id} has g_after={decision.chosen.g_after} "
         f"< effective_floor={effective_floor} (g_min={g_min}, starting G={portfolio.G})"
     )
+
+
+# --------------------------------------------------------------------------
+# Phase 12B Tranche 2B: BUFFER_BUILD candidates - generated independent of
+# a g_min breach, may have negative delta_ev (edge_min exempt), always
+# have delta_g > 0 by construction. Contrasted with a plain ALPHA
+# candidate, which can have the opposite combination (positive EV,
+# negative/breaching G).
+# --------------------------------------------------------------------------
+
+
+def test_delta_ev_directional_matches_the_general_delta_ev_formula_for_one_sided_fills():
+    """DeltaEV_U(x)=q*x-K_U(x) must equal the general q*deltaU+(1-q)*deltaD-deltaC
+    formula for a pure one-sided fill (delta_D=0) - the identity
+    evaluate_taker_candidate silently relies on."""
+    assert math.isclose(delta_ev_directional(Side.UP, x=10.0, k_x=4.0, q=0.6), 0.6 * 10.0 - 4.0)
+    assert math.isclose(delta_ev_directional(Side.DOWN, x=10.0, k_x=4.0, q=0.6), 0.4 * 10.0 - 4.0)
+
+
+def test_buffer_build_generates_candidate_with_positive_delta_g_even_when_delta_ev_is_negative():
+    """The reviewer's exact case: G comfortably above g_min, a cheap
+    opposite-side buffer opportunity available, q low enough that buying
+    the underrepresented side has negative standalone EV - BUFFER_BUILD
+    must still generate and admit the candidate (delta_g > 0 is its own
+    admission bar, not delta_ev > 0)."""
+    portfolio = PortfolioState(U=0.0, D=100.0, C=0.0)  # D overrepresented - buying UP raises min(U,D)
+    cfg = OneStepConfig(g_min=-1_000_000.0)  # risk floor not the binding constraint here
+    low_q = 0.1  # strongly favors DOWN - buying UP is a bad bet standalone
+    asks_up = (BookLevel(0.50, 500.0),)
+
+    candidates = generate_buffer_build_candidates("buffer_build", portfolio, asks_up, (), low_q, FEE, cfg)
+
+    assert candidates, "expected at least one BUFFER_BUILD candidate"
+    first = candidates[0]
+    assert first.purpose is OrderPurpose.BUFFER_BUILD
+    assert first.g_after > portfolio.G  # genuine settlement-geometry improvement
+    assert first.delta_ev < 0.0  # negative standalone EV, same SS17 allowance as HEDGE
+    assert first.is_valid  # not rejected merely for having negative EV - edge_min doesn't apply
+    assert "edge_min" not in first.violated_constraints
+
+
+def test_buffer_build_generates_nothing_when_already_the_overrepresented_side():
+    """Buying the side that's already >= the other side can never raise
+    min(U,D) (delta_g_directional's own proof) - no candidate should be
+    offered in that direction."""
+    portfolio = PortfolioState(U=100.0, D=0.0, C=0.0)  # U already overrepresented
+    cfg = OneStepConfig(g_min=-1_000_000.0)
+    # side selection buys the UNDERrepresented side (D here) - give it an
+    # empty down book so there's nothing to walk, proving no candidate
+    # materializes rather than incorrectly falling back to buying UP.
+    candidates = generate_buffer_build_candidates("buffer_build", portfolio, (), (), 0.9, FEE, cfg)
+    assert candidates == []
+
+
+def test_buffer_build_is_exempt_from_edge_min():
+    portfolio = PortfolioState(U=0.0, D=100.0, C=0.0)
+    cfg = OneStepConfig(g_min=-1_000_000.0, edge_min=1_000_000.0)  # impossibly high bar
+    candidates = generate_buffer_build_candidates("buffer_build", portfolio, (BookLevel(0.50, 500.0),), (), 0.1, FEE, cfg)
+    assert candidates
+    assert "edge_min" not in candidates[0].violated_constraints
+
+
+def test_alpha_candidate_can_have_positive_ev_and_negative_g_independently():
+    """Contrast case for the BUFFER_BUILD test above: an ordinary ALPHA
+    taker candidate with clearly positive EV (q=0.9 against a 0.5 ask)
+    but a tight g_min floor it breaches - proving delta_ev and g_after
+    are independent axes for ALPHA too, and that positive EV alone does
+    not exempt a candidate from the hard g_min gate."""
+    portfolio = PortfolioState()
+    cfg = OneStepConfig(g_min=0.0)  # any spend at all breaches this from a flat start
+    candidate = evaluate_taker_candidate("t1", Side.UP, OrderPurpose.ALPHA, 100.0, 0.99, ASKS, portfolio, q=0.9, fee_config=FEE, cfg=cfg)
+    assert candidate.delta_ev > 0.0  # clearly positive expected value
+    assert candidate.g_after < 0.0  # and clearly below the g_min=0.0 floor
+    assert not candidate.is_valid
+    assert "g_min" in candidate.violated_constraints
+
+
+def test_buffer_build_controller_wiring_is_off_by_default_and_on_when_enabled():
+    portfolio = PortfolioState(U=0.0, D=100.0, C=0.0)
+    book_up = BookSnapshot(Side.UP, bids=(), asks=(BookLevel(0.50, 500.0),), ts=0.0, recv_ts=0.0)
+    book_down = BookSnapshot(Side.DOWN, bids=(), asks=(), ts=0.0, recv_ts=0.0)
+
+    cfg_off = OneStepConfig(g_min=-1_000_000.0)  # enable_buffer_build defaults False
+    controller_off = OneStepController(cfg_off, ExecutionConfig(), FEE)
+    decision_off = controller_off.decide("r0", 10.0, portfolio, q=0.1, permitted_actions=frozenset({SeedAction.WAIT}), book_up=book_up, book_down=book_down, tick_size=0.01, is_fresh=True)
+    assert all(c.purpose is not OrderPurpose.BUFFER_BUILD for c in decision_off.candidates)
+
+    cfg_on = OneStepConfig(g_min=-1_000_000.0, enable_buffer_build=True)
+    controller_on = OneStepController(cfg_on, ExecutionConfig(), FEE)
+    decision_on = controller_on.decide("r0", 10.0, portfolio, q=0.1, permitted_actions=frozenset({SeedAction.WAIT}), book_up=book_up, book_down=book_down, tick_size=0.01, is_fresh=True)
+    assert any(c.purpose is OrderPurpose.BUFFER_BUILD for c in decision_on.candidates), (
+        "BUFFER_BUILD must be generated even under a WAIT-only regime - a portfolio-level decision, not directional"
+    )
+
+
+# --------------------------------------------------------------------------
+# Phase 12B Tranche 2C: soft regime control - candidates from a
+# regime-disfavored family are still generated (penalized, not absent),
+# while the existing hard-gate ablation mode is unaffected.
+# --------------------------------------------------------------------------
+
+
+def test_hard_regime_gate_still_produces_no_candidate_for_a_disallowed_family():
+    """Compatibility check: cfg.soft_regime defaults False, so a family
+    absent from permitted_actions must still produce literally zero
+    candidates - the exact pre-Tranche-2C behavior, unchanged."""
+    cfg = OneStepConfig(g_min=-1_000_000.0)  # soft_regime=False (default)
+    controller = OneStepController(cfg, ExecutionConfig(), FEE)
+    decision = controller.decide(
+        "r0", 10.0, PortfolioState(), q=0.9, permitted_actions=frozenset({SeedAction.WAIT}),
+        book_up=_up_book(), book_down=_down_book(), tick_size=0.01, is_fresh=True,
+    )
+    assert all(c.mode is OrderMode.WAIT for c in decision.candidates)
+
+
+def test_soft_regime_generates_disfavored_candidates_with_a_selection_penalty():
+    """With soft_regime=True, a family the regime does NOT permit must
+    still be generated (not silently absent), tagged with
+    regime_prior_penalty as its selection_penalty - proving the candidate
+    is now visible to the optimizer's argmax, even if outweighed."""
+    cfg = OneStepConfig(g_min=-1_000_000.0, soft_regime=True, regime_prior_penalty=5.0)
+    controller = OneStepController(cfg, ExecutionConfig(), FEE)
+    decision = controller.decide(
+        "r0", 10.0, PortfolioState(), q=0.9, permitted_actions=frozenset({SeedAction.WAIT}),
+        book_up=_up_book(), book_down=_down_book(), tick_size=0.01, is_fresh=True,
+    )
+    taker_up_candidates = [c for c in decision.candidates if c.action_id.startswith("taker_up_")]
+    assert taker_up_candidates, "TAKER_UP must still be generated under soft_regime even though WAIT-only was permitted"
+    assert all(math.isclose(c.selection_penalty, 5.0) for c in taker_up_candidates)
+
+
+def test_soft_regime_can_still_select_a_strong_enough_disfavored_candidate():
+    """The whole point of soft mode: a regime-disfavored candidate can
+    still win selection if its edge clears the penalty - proving the
+    penalty is subtracted from the *selection score*, not an absolute veto."""
+    cfg = OneStepConfig(g_min=-1_000_000.0, soft_regime=True, regime_prior_penalty=0.01)  # tiny penalty
+    controller = OneStepController(cfg, ExecutionConfig(), FEE)
+    decision = controller.decide(
+        "r0", 10.0, PortfolioState(), q=0.9, permitted_actions=frozenset({SeedAction.WAIT}),
+        book_up=_up_book(), book_down=_down_book(), tick_size=0.01, is_fresh=True,
+    )
+    assert decision.chosen.mode is not OrderMode.WAIT, "a strong-edge candidate must be able to beat WAIT despite a small regime penalty"
+
+
+def test_permitted_family_never_gets_a_penalty_under_soft_regime():
+    cfg = OneStepConfig(g_min=-1_000_000.0, soft_regime=True, regime_prior_penalty=5.0)
+    controller = OneStepController(cfg, ExecutionConfig(), FEE)
+    permitted = frozenset({SeedAction.TAKER_UP, SeedAction.WAIT})
+    decision = controller.decide("r0", 10.0, PortfolioState(), q=0.9, permitted_actions=permitted, book_up=_up_book(), book_down=_down_book(), tick_size=0.01, is_fresh=True)
+    taker_up_candidates = [c for c in decision.candidates if c.action_id.startswith("taker_up_")]
+    assert taker_up_candidates
+    assert all(c.selection_penalty == 0.0 for c in taker_up_candidates)
+
+
+# --------------------------------------------------------------------------
+# Phase 12B Tranche 2D: dynamic maker price/quantity/TTL - grids derived
+# from (q, tau, sigma, G, R) rather than OneStepConfig's fixed constants,
+# gated behind cfg.dynamic_maker (default False, preserving Phases 8-12B's
+# exact fixed-constant behavior).
+# --------------------------------------------------------------------------
+
+
+def test_dynamic_maker_sizing_shrinks_quantity_and_ttl_as_volatility_rises():
+    cfg = OneStepConfig(g_min=-1_000_000.0, maker_quantity=20.0, maker_horizon_s=10.0)
+    portfolio = PortfolioState()
+    qty_calm, ttl_calm, _ = dynamic_maker_sizing(q=0.6, side=Side.UP, tau=30.0, sigma=0.0, portfolio=portfolio, cfg=cfg)
+    qty_stormy, ttl_stormy, _ = dynamic_maker_sizing(q=0.6, side=Side.UP, tau=30.0, sigma=3.0, portfolio=portfolio, cfg=cfg)
+    assert qty_stormy < qty_calm, "higher sigma must damp resting quantity, not just leave it fixed"
+    assert ttl_stormy < ttl_calm, "higher sigma must shorten TTL"
+
+
+def test_dynamic_maker_sizing_widens_price_offset_grid_with_volatility():
+    cfg = OneStepConfig(g_min=-1_000_000.0)
+    portfolio = PortfolioState()
+    _, _, offsets_calm = dynamic_maker_sizing(q=0.6, side=Side.UP, tau=30.0, sigma=0.0, portfolio=portfolio, cfg=cfg)
+    _, _, offsets_stormy = dynamic_maker_sizing(q=0.6, side=Side.UP, tau=30.0, sigma=3.0, portfolio=portfolio, cfg=cfg)
+    assert len(offsets_stormy) > len(offsets_calm), "higher sigma must widen (not narrow) the price-offset grid"
+
+
+def test_dynamic_maker_sizing_caps_quantity_at_the_remaining_risk_budget():
+    cfg = OneStepConfig(g_min=-5.0, maker_quantity=1_000.0)
+    portfolio = PortfolioState(U=0.0, D=0.0, C=0.0)  # G=0, risk_budget = 0 - (-5) = 5
+    qty, _, _ = dynamic_maker_sizing(q=0.6, side=Side.UP, tau=30.0, sigma=0.0, portfolio=portfolio, cfg=cfg)
+    assert qty <= 5.0, "quantity must never exceed the current risk budget (G - g_min), regardless of maker_quantity"
+
+
+def test_dynamic_maker_sizing_ttl_never_exceeds_tau():
+    cfg = OneStepConfig(g_min=-1_000_000.0, maker_horizon_s=1_000.0)
+    portfolio = PortfolioState()
+    _, ttl, _ = dynamic_maker_sizing(q=0.6, side=Side.UP, tau=2.0, sigma=0.0, portfolio=portfolio, cfg=cfg)
+    assert ttl <= 2.0, "TTL must not outlive the round (tau) even when maker_horizon_s is large"
+
+
+def test_dynamic_maker_controller_wiring_is_off_by_default_and_matches_fixed_constants():
+    """cfg.dynamic_maker defaults False - even when a caller passes
+    nonzero tau/sigma, maker candidates must use the exact fixed
+    maker_quantity/maker_horizon_s/maker_price_offsets_ticks constants,
+    byte-identical to a call that omits tau/sigma entirely."""
+    cfg = OneStepConfig(g_min=-1_000_000.0, maker_quantity=20.0, maker_horizon_s=10.0)  # dynamic_maker=False
+    controller = OneStepController(cfg, ExecutionConfig(), FEE)
+    permitted = frozenset({SeedAction.MAKER_UP, SeedAction.WAIT})
+
+    decision_no_vol_args = controller.decide("r0", 10.0, PortfolioState(), q=0.6, permitted_actions=permitted, book_up=_up_book(), book_down=_down_book(), tick_size=0.01, is_fresh=True)
+    decision_with_vol_args = controller.decide("r0", 10.0, PortfolioState(), q=0.6, permitted_actions=permitted, book_up=_up_book(), book_down=_down_book(), tick_size=0.01, is_fresh=True, tau=30.0, sigma=5.0)
+
+    maker_up_no_vol = [c for c in decision_no_vol_args.candidates if c.action_id.startswith("maker_up_")]
+    maker_up_with_vol = [c for c in decision_with_vol_args.candidates if c.action_id.startswith("maker_up_")]
+    assert maker_up_no_vol and maker_up_with_vol
+    assert all(math.isclose(c.qty, 20.0) for c in maker_up_no_vol)
+    assert all(math.isclose(c.qty, 20.0) for c in maker_up_with_vol), "sigma=5.0 must be ignored entirely while dynamic_maker=False"
+    assert all(math.isclose(c.ttl_s, 10.0) for c in maker_up_with_vol)
+
+
+def test_dynamic_maker_controller_wiring_uses_dynamic_sizing_when_enabled():
+    cfg = OneStepConfig(g_min=-1_000_000.0, maker_quantity=20.0, maker_horizon_s=10.0, dynamic_maker=True)
+    controller = OneStepController(cfg, ExecutionConfig(), FEE)
+    permitted = frozenset({SeedAction.MAKER_UP, SeedAction.WAIT})
+    portfolio = PortfolioState()
+
+    expected_qty, expected_ttl, expected_offsets = dynamic_maker_sizing(q=0.6, side=Side.UP, tau=30.0, sigma=3.0, portfolio=portfolio, cfg=cfg)
+    decision = controller.decide("r0", 10.0, portfolio, q=0.6, permitted_actions=permitted, book_up=_up_book(), book_down=_down_book(), tick_size=0.01, is_fresh=True, tau=30.0, sigma=3.0)
+
+    maker_up = [c for c in decision.candidates if c.action_id.startswith("maker_up_")]
+    assert maker_up, "dynamic_maker=True must not suppress maker candidate generation"
+    assert all(math.isclose(c.qty, expected_qty) for c in maker_up)
+    assert all(math.isclose(c.ttl_s, expected_ttl) for c in maker_up)
+    assert not any(math.isclose(c.qty, 20.0) for c in maker_up), "fixed maker_quantity must not leak through once dynamic_maker=True"
