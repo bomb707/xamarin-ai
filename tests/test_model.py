@@ -24,7 +24,7 @@ from xamarinbot.model.metrics import (
     settlement_accuracy,
 )
 from xamarinbot.model.registry import ModelRegistry, PromotionGateError, make_artifact
-from xamarinbot.model.walkforward import time_ordered_split
+from xamarinbot.model.walkforward import round_ordered_split, time_ordered_split
 from xamarinbot.synthetic.rounds import generate_synthetic_dataset
 
 # --------------------------------------------------------------------------
@@ -104,6 +104,67 @@ def test_walkforward_training_window_matches_train_slice_bounds():
     start, end = split.training_window
     assert start == min(e.decision_ts for e in split.train)
     assert end == max(e.decision_ts for e in split.train)
+
+
+# --------------------------------------------------------------------------
+# round_ordered_split (Phase 12B Tranche 1.2 item 8): the round-aware
+# drop-in replacement for time_ordered_split, for callers outside the main
+# walk-forward pipeline that must still not split a round across the
+# fit/calibration/test boundary.
+# --------------------------------------------------------------------------
+
+
+def _fake_multi_example_rounds(n_rounds: int, examples_per_round: int = 5) -> list[Example]:
+    """Several examples per round, all sharing that round's own y label -
+    the shape a real round actually has (every decision-point example
+    within one round shares that round's single eventual outcome)."""
+    examples = []
+    order = list(range(n_rounds))
+    random.Random(2).shuffle(order)
+    for i in order:
+        round_id = f"round-{i}"
+        y = i % 2
+        for j in range(examples_per_round):
+            examples.append(Example(round_id=round_id, decision_ts=i * 100.0 + j, features=None, x=[float(i)], y=y))
+    return examples
+
+
+def test_round_ordered_split_never_splits_a_single_round_across_slices():
+    examples = _fake_multi_example_rounds(n_rounds=20, examples_per_round=5)
+    split = round_ordered_split(examples, train_frac=0.6, val_frac=0.2)
+
+    train_rids = {e.round_id for e in split.train}
+    val_rids = {e.round_id for e in split.validation}
+    test_rids = {e.round_id for e in split.test}
+    assert train_rids.isdisjoint(val_rids)
+    assert train_rids.isdisjoint(test_rids)
+    assert val_rids.isdisjoint(test_rids)
+    assert len(split.train) + len(split.validation) + len(split.test) == len(examples)
+
+
+def test_round_ordered_split_is_chronological_by_round():
+    examples = _fake_multi_example_rounds(n_rounds=20, examples_per_round=5)
+    split = round_ordered_split(examples, train_frac=0.6, val_frac=0.2)
+    assert max(e.decision_ts for e in split.train) < min(e.decision_ts for e in split.validation)
+    assert max(e.decision_ts for e in split.validation) < min(e.decision_ts for e in split.test)
+
+
+def test_round_ordered_split_matches_time_ordered_split_when_one_example_per_round():
+    """Sanity/equivalence check: when every round contributes exactly one
+    example (as time_ordered_split implicitly assumes), the two split
+    functions must produce identical results."""
+    examples = _fake_examples(100)
+    by_round = round_ordered_split(examples, train_frac=0.6, val_frac=0.2)
+    by_time = time_ordered_split(examples, train_frac=0.6, val_frac=0.2)
+    assert [e.round_id for e in by_round.train] == [e.round_id for e in by_time.train]
+    assert [e.round_id for e in by_round.validation] == [e.round_id for e in by_time.validation]
+    assert [e.round_id for e in by_round.test] == [e.round_id for e in by_time.test]
+
+
+def test_round_ordered_split_rejects_invalid_fractions():
+    examples = _fake_multi_example_rounds(n_rounds=10)
+    with pytest.raises(ValueError):
+        round_ordered_split(examples, train_frac=0.7, val_frac=0.4)
 
 
 # --------------------------------------------------------------------------

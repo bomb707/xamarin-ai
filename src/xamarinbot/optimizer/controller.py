@@ -64,33 +64,36 @@ class OneStepController:
             return OneStepDecision(round_id, decision_ts, wait, tuple(candidates), skip_reason="stale_data")
 
         idx = 0
-        # Phase 12B audit items 7/8/10: candidate quantities and the
-        # worst-price cap are now both derived from the actual book +
-        # current risk/position/spend budgets (taker_sizing_boundaries),
-        # not raw depth-level sums evaluated against an unconstraining
-        # limit_price=1.0. p_max is None only when no level clears
-        # min_marginal_edge at all, in which case there is nothing to
-        # generate for that side this decision.
+        # Phase 12B audit items 7/8/10, Tranche 1.2 item 3: candidate
+        # quantities and each quantity's OWN hard, risk-safe worst-price
+        # limit are derived from the actual book + current risk/position/
+        # spend budgets (taker_sizing_boundaries), not raw depth-level
+        # sums evaluated against an unconstraining limit_price=1.0 or a
+        # single shared depth/marginal-edge boundary. p_max is None only
+        # when no level clears min_marginal_edge at all, in which case
+        # there is nothing to generate for that side this decision.
         if SeedAction.TAKER_UP in permitted_actions and book_up is not None and book_up.asks:
-            sizing = taker_sizing_boundaries(book_up.asks, q, self.fee_config, self.cfg, portfolio, Side.UP)
+            sizing = taker_sizing_boundaries(book_up.asks, q, self.fee_config, self.cfg, portfolio, Side.UP, tick_size)
             if sizing.p_max is not None:
                 for qty in sizing.quantities:
                     idx += 1
+                    limit_price = sizing.max_execution_price_by_qty.get(qty, sizing.p_max)
                     candidates.append(
                         evaluate_taker_candidate(
-                            f"taker_up_{idx}", Side.UP, OrderPurpose.ALPHA, qty, limit_price=sizing.p_max,
+                            f"taker_up_{idx}", Side.UP, OrderPurpose.ALPHA, qty, limit_price=limit_price,
                             asks=book_up.asks, portfolio=portfolio, q=q, fee_config=self.fee_config, cfg=self.cfg,
                         )
                     )
 
         if SeedAction.TAKER_DOWN in permitted_actions and book_down is not None and book_down.asks:
-            sizing = taker_sizing_boundaries(book_down.asks, 1.0 - q, self.fee_config, self.cfg, portfolio, Side.DOWN)
+            sizing = taker_sizing_boundaries(book_down.asks, 1.0 - q, self.fee_config, self.cfg, portfolio, Side.DOWN, tick_size)
             if sizing.p_max is not None:
                 for qty in sizing.quantities:
                     idx += 1
+                    limit_price = sizing.max_execution_price_by_qty.get(qty, sizing.p_max)
                     candidates.append(
                         evaluate_taker_candidate(
-                            f"taker_down_{idx}", Side.DOWN, OrderPurpose.ALPHA, qty, limit_price=sizing.p_max,
+                            f"taker_down_{idx}", Side.DOWN, OrderPurpose.ALPHA, qty, limit_price=limit_price,
                             asks=book_down.asks, portfolio=portfolio, q=q, fee_config=self.fee_config, cfg=self.cfg,
                         )
                     )

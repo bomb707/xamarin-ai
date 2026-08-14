@@ -69,3 +69,20 @@ def fit_platt(q_raw: list[float], y: list[int]) -> PlattCalibrator:
     X = [[_logit(q)] for q in q_raw]
     model = fit_logistic_regression(X, y, feature_set_name="platt", column_names=("logit_q",), l2=0.0, lr=0.3, n_iters=300)
     return PlattCalibrator(model=model)
+
+
+@dataclass(frozen=True)
+class IdentityCalibrator:
+    """Pass-through calibrator: returns `q_raw` unchanged. Used only when
+    a genuine calibration fit is not possible - Phase 12B Tranche 1.2 item
+    7: fitting Platt/isotonic on a one-class calibration set (e.g. every
+    example labeled UP) would silently produce a degenerate, actively
+    wrong calibrator (a constant output near 0 or 1, since the fit has no
+    contrast to learn from), not a genuinely-uncalibrated-but-honest one.
+    `CalibratedModel.calibration_version` records this state explicitly
+    (`model.calibrated.UNCALIBRATED_INSUFFICIENT_CLASS_DIVERSITY`) so it
+    is visible/auditable, never silently indistinguishable from "properly
+    calibrated."."""
+
+    def transform(self, q_raw: float) -> float:
+        return q_raw

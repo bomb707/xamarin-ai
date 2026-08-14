@@ -32,7 +32,7 @@ from xamarinbot.model.calibrated import CalibratedModel, fit_calibrated_model
 from xamarinbot.model.dataset import build_examples_multi
 from xamarinbot.model.features import FeatureSet
 from xamarinbot.mpc.scenario import TransitionModel, build_transition_model
-from xamarinbot.portfolio.state import FeeConfig
+from xamarinbot.portfolio.state import FeeConfig, Side
 from xamarinbot.regime.classifier import RegimeClassifier
 from xamarinbot.synthetic.rounds import SyntheticRoundResult
 from xamarinbot.walkforward.ablations import AblationSpec, RoundResult, run_ablation_round
@@ -53,7 +53,9 @@ _CALIBRATION_HOLDOUT_FRAC = 0.2
 
 
 def _split_rounds_for_fit_and_calibration(
-    train_round_ids: tuple[str, ...], calibration_holdout_frac: float
+    train_round_ids: tuple[str, ...],
+    calibration_holdout_frac: float,
+    round_outcomes: dict[str, Side] | None = None,
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """Splits a window's own `train_round_ids` into a chronologically
     earlier fit sub-range and a later calibration sub-range, at ROUND
@@ -73,12 +75,35 @@ def _split_rounds_for_fit_and_calibration(
     `train_round_ids` is already chronologically ordered (guaranteed by
     `rolling_windows()` slicing `round_ids_chronological`), so a simple
     index split preserves TRAIN_i -> VALIDATE_i chronology within the
-    window's own train segment."""
+    window's own train segment.
+
+    Phase 12B Tranche 1.2 item 7: with `round_outcomes` given (maps
+    round_id -> settlement `Side`), the trailing calibration block
+    expands backward, one round at a time, until it contains both UP and
+    DOWN outcomes - a small default holdout (e.g. `n_train=6,
+    calibration_holdout_frac=0.2` usually yields exactly one calibration
+    round) is otherwise likely to land on a single-class window purely by
+    chance, since every decision example from one round shares that
+    round's one settlement outcome. Expansion always leaves at least one
+    round for the raw model fit; if diversity still can't be achieved
+    even using every available round, `fit_calibrated_model`'s own
+    one-class guard is the final backstop (falls back to
+    `IdentityCalibrator`/`UNCALIBRATED_INSUFFICIENT_CLASS_DIVERSITY`
+    rather than inventing calibration)."""
     n = len(train_round_ids)
     if n <= 1:
         return train_round_ids, ()
     n_calib = max(1, round(n * calibration_holdout_frac))
     n_calib = min(n_calib, n - 1)  # always leave at least one round to fit on
+
+    if round_outcomes is not None:
+        for candidate_n_calib in range(n_calib, n):  # up to n-1, always keeping >=1 fit round
+            calib_ids = train_round_ids[n - candidate_n_calib:]
+            outcomes = {round_outcomes[rid] for rid in calib_ids if rid in round_outcomes}
+            n_calib = candidate_n_calib
+            if len(outcomes) >= 2:
+                break
+
     n_fit = n - n_calib
     return train_round_ids[:n_fit], train_round_ids[n_fit:]
 
@@ -157,8 +182,13 @@ def fit_window_artifacts(
     # (Phase 12B Tranche 1.1 item 1) - never window.validate_round_ids or
     # window.test_round_ids, only a chronologically-earlier/later
     # partition of this window's own train_round_ids, with every example
-    # from a given round landing entirely in one side of the split.
-    fit_round_ids, calib_round_ids = _split_rounds_for_fit_and_calibration(window.train_round_ids, _CALIBRATION_HOLDOUT_FRAC)
+    # from a given round landing entirely in one side of the split. The
+    # calibration block expands backward for class diversity where
+    # possible (Phase 12B Tranche 1.2 item 7).
+    round_outcomes = {r.round_id: r.outcome for r in train_rounds}
+    fit_round_ids, calib_round_ids = _split_rounds_for_fit_and_calibration(
+        window.train_round_ids, _CALIBRATION_HOLDOUT_FRAC, round_outcomes
+    )
     fit_round_id_set, calib_round_id_set = set(fit_round_ids), set(calib_round_ids)
 
     models: dict[str, CalibratedModel | None] = {}

@@ -35,7 +35,7 @@ from xamarinbot.events.replay import ReplayClock
 from xamarinbot.events.store import EventStore
 from xamarinbot.events.types import EventType
 from xamarinbot.execution.config import ExecutionConfig
-from xamarinbot.execution.simulator import ExecutionSimulator
+from xamarinbot.execution.simulator import ExecutionSimulator, TakerOrderQueue
 from xamarinbot.features.config import FeatureConfig
 from xamarinbot.features.engine import compute
 from xamarinbot.features.types import FeatureVector
@@ -110,9 +110,18 @@ class ShadowRunner:
         # event_time gate - see module docstring.
         live_cursor = MockFeedCursor(self.store, self.round_id, preloaded=events, time_attr="recv_ts")
         book_feed = MockBookFeed(live_cursor)
+        # Dedicated cursor/book_feed for fetching the actual causal book at
+        # a delayed taker order's matched_ts, only at resolve time (Phase
+        # 12B Tranche 1.2 items 1/2) - gated on recv_ts like the main
+        # cursor above, since this runner must never act on data it
+        # hasn't actually "received" yet, even when resolving a pending
+        # order.
+        revalidation_cursor = MockFeedCursor(self.store, self.round_id, preloaded=events, time_attr="recv_ts")
+        revalidation_book_feed = MockBookFeed(revalidation_cursor)
         regime_clf = RegimeClassifier(round_id=self.round_id)
         one_step = OneStepController(self.one_step_cfg, self.exec_cfg, self.fee_config)
         sim = ExecutionSimulator(self.round_id, self.fee_config, self.exec_cfg)
+        queue = TakerOrderQueue(sim)
         portfolio = PortfolioState()
         records: list[ShadowDecisionRecord] = []
         n_reconnects = 0
@@ -123,8 +132,17 @@ class ShadowRunner:
         market_config = next(e.payload for e in events if e.event_type is EventType.MARKET_CONFIG)
         tick_size = market_config["tick_size"]
 
+        def _book_at(pending) -> tuple:
+            revalidation_cursor.advance_to(pending.matched_ts)
+            book = revalidation_book_feed.get_snapshot(self.round_id, pending.side)
+            return book.asks if book is not None else ()
+
         for decision_ts in clock.decision_points(heartbeat=self.cfg.heartbeat_s):
             live_cursor.advance_to(decision_ts)
+
+            for pending, taker_result in queue.resolve_ready(decision_ts, _book_at):
+                if taker_result.walk.filled_shares > 0:
+                    portfolio = apply_fill(portfolio, Fill(pending.side, taker_result.walk.avg_price, taker_result.walk.filled_shares, LiquidityRole.TAKER, taker_result.walk.total_fee))
 
             if self.fault.should_disconnect(decision_ts):
                 # Simulated outage: this decision point is skipped entirely
@@ -163,16 +181,21 @@ class ShadowRunner:
             records.append(_record_for(self.round_id, decision_ts, chosen, elapsed_ms, missed, pending_reconnect_ack))
             pending_reconnect_ack = False
 
-            if chosen.mode is OrderMode.FAK and chosen.qty > 0:
-                # Phase 12B audit items 13/E/L: real submit->resolve
-                # lifecycle, not a direct pre-evaluation-walk-to-Fill
-                # shortcut - see ExecutionSimulator.execute_taker.
+            if chosen.mode is OrderMode.FAK and chosen.qty > 0 and not queue.has_pending:
+                # Phase 12B audit items 13/E/L, Tranche 1.2 items 1/2/5:
+                # real submit->(delay)->resolve lifecycle via the shared
+                # TakerOrderQueue, not a direct pre-evaluation-walk-to-Fill
+                # shortcut, and never resolved/mutated before matched_ts.
+                # `not queue.has_pending` is the conservative item 5
+                # admission gate: at most one PENDING_DELAY taker at a time.
                 order_seq += 1
                 asks = book_up.asks if chosen.side is Side.UP else book_down.asks
                 limit_price = chosen.max_execution_price if chosen.max_execution_price is not None else chosen.price
-                _, taker_result = sim.execute_taker(f"{self.round_id}-o{order_seq}", chosen.side, chosen.qty, limit_price, asks, decision_ts)
-                if taker_result.walk.filled_shares > 0:
-                    portfolio = apply_fill(portfolio, Fill(chosen.side, taker_result.walk.avg_price, taker_result.walk.filled_shares, LiquidityRole.TAKER, taker_result.walk.total_fee))
+                pending = queue.try_submit(f"{self.round_id}-o{order_seq}", chosen.side, chosen.qty, limit_price, asks, decision_ts)
+                if pending is not None and not pending.was_delayed:
+                    taker_result = sim.resolve_taker(pending)
+                    if taker_result.walk.filled_shares > 0:
+                        portfolio = apply_fill(portfolio, Fill(chosen.side, taker_result.walk.avg_price, taker_result.walk.filled_shares, LiquidityRole.TAKER, taker_result.walk.total_fee))
             elif chosen.mode is OrderMode.POST_ONLY:
                 order_seq += 1
                 order_state = sim.submit_maker_order(f"{self.round_id}-o{order_seq}", chosen.side, chosen.qty, chosen.price, decision_ts)

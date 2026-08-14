@@ -15,7 +15,7 @@ from xamarinbot.features.config import FeatureConfig
 from xamarinbot.model.calibrated import fit_calibrated_model
 from xamarinbot.model.dataset import build_examples_multi
 from xamarinbot.model.features import COMBINED_LEAD_LAG
-from xamarinbot.model.walkforward import time_ordered_split
+from xamarinbot.model.walkforward import round_ordered_split
 from xamarinbot.portfolio.state import FeeConfig, Side
 from xamarinbot.synthetic.rounds import generate_synthetic_dataset
 from xamarinbot.walkforward.ablations import MANDATORY_ABLATIONS, RoundResult, run_ablation_round
@@ -163,7 +163,7 @@ def trained_model(feature_cfg):
     results = generate_synthetic_dataset(store, n_rounds=8)
     by_fs = build_examples_multi(store, results, feature_cfg, [COMBINED_LEAD_LAG], heartbeat_s=HEARTBEAT_S)
     examples = by_fs[COMBINED_LEAD_LAG.name]
-    split = time_ordered_split(examples, train_frac=0.6, val_frac=0.2)
+    split = round_ordered_split(examples, train_frac=0.6, val_frac=0.2)
     return fit_calibrated_model(split.train, split.validation, COMBINED_LEAD_LAG)
 
 
@@ -241,39 +241,93 @@ def test_ablations_6_7_8_now_trade_after_taker_sizing_fix(eval_dataset, feature_
         assert sum(r.n_actions for r in totals) > 0, f"{name} expected to trade now that taker sizing is risk/depth/marginal-edge-aware"
 
 
-def test_controller_round_resolves_delayed_taker_orders_via_matched_ts_not_submit_ts(eval_dataset, feature_cfg, fee_config, trained_model):
-    """Phase 12B Tranche 1.1 item 7 integration proof: with a nonzero
-    taker_delay_ms, _run_controller_round (reached via run_ablation_round,
-    the real walk-forward harness entry point) must route taker fills
-    through the genuine submit->PENDING_DELAY->resolve_pending lifecycle,
-    not resolve them synchronously at submit_ts. Proven by spying on
-    ExecutionSimulator.resolve_pending and asserting every call only ever
-    happens at or after that order's own matched_ts, with matched_ts
-    genuinely later than submit_ts - the exact invariant the previous
-    (buggy) execute_taker violated by resolving unconditionally inline."""
+def _spy_on_resolve_taker():
+    """Shared helper: patches ExecutionSimulator.resolve_taker to record
+    every call's (submit_ts, matched_ts, now_ts, asks_at_match is not
+    None), while still delegating to the real implementation. Returns
+    (patch_context_manager, calls_list)."""
     from unittest.mock import patch
 
     import xamarinbot.execution.simulator as simulator_mod
 
+    calls: list[tuple[float, float, float]] = []
+    real_resolve = simulator_mod.ExecutionSimulator.resolve_taker
+
+    def spy(self, pending, asks_at_match=None, now_ts=None):
+        if not pending.is_resolved and asks_at_match is not None and now_ts is not None:
+            calls.append((pending.submit_ts, pending.matched_ts, now_ts))
+        return real_resolve(self, pending, asks_at_match, now_ts)
+
+    return patch.object(simulator_mod.ExecutionSimulator, "resolve_taker", spy), calls
+
+
+def test_controller_round_resolves_delayed_taker_orders_via_matched_ts_not_submit_ts(eval_dataset, feature_cfg, fee_config, trained_model):
+    """Phase 12B Tranche 1.1 item 7 / Tranche 1.2 item 1 integration proof:
+    with a nonzero taker_delay_ms, _run_controller_round (reached via
+    run_ablation_round, the real walk-forward harness entry point for
+    every V2 ablation arm) must route taker fills through the genuine
+    submit->PENDING_DELAY->resolve_taker lifecycle, not resolve them
+    synchronously at submit_ts. Proven by spying on
+    ExecutionSimulator.resolve_taker and asserting every call only ever
+    happens at or after that order's own matched_ts, with matched_ts
+    genuinely later than submit_ts - the exact invariant the previous
+    (buggy) execute_taker violated by resolving unconditionally inline."""
     store, results = eval_dataset
     exec_cfg = ExecutionConfig(taker_delay_ms=250.0)
     spec = next(s for s in MANDATORY_ABLATIONS if s.name == "6_portfolio_control_taker_only")
 
-    calls = []
-    real_resolve = simulator_mod.ExecutionSimulator.resolve_pending
-
-    def spy(self, order, result, now_ts):
-        calls.append((order.submit_ts, result.matched_ts, now_ts))
-        return real_resolve(self, order, result, now_ts)
-
-    with patch.object(simulator_mod.ExecutionSimulator, "resolve_pending", spy):
+    patcher, calls = _spy_on_resolve_taker()
+    with patcher:
         for r in results:
             run_ablation_round(spec, store, r.round_id, r.p0, r.outcome, feature_cfg, fee_config, exec_cfg, trained_model, None)
 
-    assert calls, "expected at least one delayed taker order to be resolved via resolve_pending"
+    assert calls, "expected at least one delayed taker order to be resolved via resolve_taker"
     for submit_ts, matched_ts, now_ts in calls:
         assert matched_ts > submit_ts  # genuinely delayed, not an immediate no-op resolve
         assert now_ts >= matched_ts  # never resolved before its own matched_ts arrives
+
+
+def test_supervisor_controller_round_resolves_delayed_taker_orders_via_matched_ts_not_submit_ts(eval_dataset, feature_cfg, fee_config, trained_model):
+    """Same proof as above, for the supervisor-enabled ablation arm
+    (Phase 12B Tranche 1.2 item 12's explicit "supervisor execution path
+    does not mutate portfolio before matched_ts" requirement) - #7 shares
+    the exact same _run_controller_round FAK dispatch/TakerOrderQueue path
+    as #6, just with OrderSupervisor also active for maker orders."""
+    store, results = eval_dataset
+    exec_cfg = ExecutionConfig(taker_delay_ms=250.0)
+    spec = next(s for s in MANDATORY_ABLATIONS if s.name == "7_maker_taker_cancel_replace")
+
+    patcher, calls = _spy_on_resolve_taker()
+    with patcher:
+        for r in results:
+            run_ablation_round(spec, store, r.round_id, r.p0, r.outcome, feature_cfg, fee_config, exec_cfg, trained_model, None)
+
+    assert calls, "expected at least one delayed taker order to be resolved via resolve_taker"
+    for submit_ts, matched_ts, now_ts in calls:
+        assert matched_ts > submit_ts
+        assert now_ts >= matched_ts
+
+
+def test_baseline_round_resolves_delayed_taker_orders_via_matched_ts_not_submit_ts(eval_dataset, feature_cfg, fee_config):
+    """Phase 12B Tranche 1.2 item 1: the baseline ablation arm previously
+    still misused delayed results (called execute_taker and immediately
+    consumed .walk regardless of delay). Baseline and V2 must share
+    identical execution chronology for the comparison between them to be
+    fair - proven here the same way as the V2 arm above."""
+    store, results = eval_dataset
+    exec_cfg = ExecutionConfig(taker_delay_ms=250.0)
+    spec = MANDATORY_ABLATIONS[0]
+    assert spec.controller == "baseline"
+
+    patcher, calls = _spy_on_resolve_taker()
+    with patcher:
+        for r in results:
+            run_ablation_round(spec, store, r.round_id, r.p0, r.outcome, feature_cfg, fee_config, exec_cfg, None, None)
+
+    assert calls, "expected at least one delayed baseline taker order to be resolved via resolve_taker"
+    for submit_ts, matched_ts, now_ts in calls:
+        assert matched_ts > submit_ts
+        assert now_ts >= matched_ts
 
 
 def test_supervisor_receives_recomputed_economics_not_placeholders(eval_dataset, feature_cfg, fee_config, exec_cfg, trained_model):

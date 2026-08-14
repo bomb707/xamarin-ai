@@ -20,10 +20,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from xamarinbot.model.calibration import IsotonicCalibrator, PlattCalibrator, fit_platt
+from xamarinbot.model.calibration import IdentityCalibrator, IsotonicCalibrator, PlattCalibrator, fit_platt
 from xamarinbot.model.dataset import Example
 from xamarinbot.model.features import FeatureSet
 from xamarinbot.model.logistic import LogisticModel, fit_logistic_regression
+
+UNCALIBRATED_INSUFFICIENT_CLASS_DIVERSITY = "identity-uncalibrated-insufficient-class-diversity"
 
 
 @dataclass(frozen=True)
@@ -39,8 +41,17 @@ class CalibratedModel:
     item 26/Tranche 4)."""
 
     raw_model: LogisticModel
-    calibrator: PlattCalibrator | IsotonicCalibrator
+    calibrator: PlattCalibrator | IsotonicCalibrator | IdentityCalibrator
     calibration_version: str
+
+    @property
+    def is_calibrated(self) -> bool:
+        """False when `calibration_version` records the Phase 12B
+        Tranche 1.2 item 7 fallback (an `IdentityCalibrator` standing in
+        because the validation split lacked class diversity to calibrate
+        from) - callers that need to know whether `predict_proba` is
+        genuinely calibrated, not just raw-passthrough, should check this."""
+        return self.calibration_version != UNCALIBRATED_INSUFFICIENT_CLASS_DIVERSITY
 
     def predict_proba(self, x: list[float]) -> float:
         return self.calibrator.transform(self.raw_model.predict_proba(x))
@@ -70,8 +81,17 @@ def fit_calibrated_model(
     y_train = [e.y for e in train_examples]
     raw_model = fit_logistic_regression(X_train, y_train, feature_set.name, feature_set.column_names)
 
-    q_val_raw = [raw_model.predict_proba(e.x) for e in validate_examples]
     y_val = [e.y for e in validate_examples]
+    if len(set(y_val)) < 2:
+        # Phase 12B Tranche 1.2 item 7: a one-class calibration set would
+        # make Platt silently fit a degenerate, actively wrong constant
+        # calibrator - fall back to pass-through and record that state
+        # explicitly rather than inventing calibration.
+        return CalibratedModel(
+            raw_model=raw_model, calibrator=IdentityCalibrator(), calibration_version=UNCALIBRATED_INSUFFICIENT_CLASS_DIVERSITY
+        )
+
+    q_val_raw = [raw_model.predict_proba(e.x) for e in validate_examples]
     calibrator = fit_platt(q_val_raw, y_val)
 
     return CalibratedModel(raw_model=raw_model, calibrator=calibrator, calibration_version=calibration_version)

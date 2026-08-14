@@ -33,7 +33,7 @@ from xamarinbot.feeds.mock import MockBookFeed, MockFeedCursor
 from xamarinbot.model.calibrated import fit_calibrated_model
 from xamarinbot.model.dataset import build_examples_multi
 from xamarinbot.model.features import COMBINED_LEAD_LAG, design_vector
-from xamarinbot.model.walkforward import time_ordered_split
+from xamarinbot.model.walkforward import round_ordered_split
 from xamarinbot.mpc.config import MPCConfig
 from xamarinbot.mpc.controller import MPCController
 from xamarinbot.mpc.scenario import build_transition_model
@@ -55,7 +55,7 @@ def train_q_model(feature_cfg: FeatureConfig):
     train_results = generate_synthetic_dataset(train_store, n_rounds=N_TRAIN_ROUNDS)
     by_fs = build_examples_multi(train_store, train_results, feature_cfg, [COMBINED_LEAD_LAG], heartbeat_s=HEARTBEAT_S)
     examples = by_fs[COMBINED_LEAD_LAG.name]
-    split = time_ordered_split(examples, train_frac=0.6, val_frac=0.2)
+    split = round_ordered_split(examples, train_frac=0.6, val_frac=0.2)
     return fit_calibrated_model(split.train, split.validation, COMBINED_LEAD_LAG)
 
 

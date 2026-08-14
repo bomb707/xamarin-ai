@@ -84,60 +84,31 @@ def walk_depth(levels: tuple[BookLevel, ...], requested_shares: float, limit_pri
 
 @dataclass(frozen=True)
 class TakerOrderResult:
+    """The FINAL, actual fill outcome of a taker order. Phase 12B Tranche
+    1.2 item 2: this must never be constructed from a future book at
+    submission time for a delayed order - see
+    `execution/simulator.py::ExecutionSimulator.resolve_taker`, the only
+    place a `TakerOrderResult` for a delayed order is ever produced, and
+    only once the actual causal book at `matched_ts` is genuinely known
+    (i.e. the caller's own simulated clock has reached `matched_ts`)."""
+
     submit_ts: float
     matched_ts: float
     was_delayed: bool
     walk: DepthWalkResult
-    repriced: bool  # book at revalidation differed from book at submission (delayed orders only)
+    repriced: bool  # book at resolution differed from book at submission (delayed orders only)
     walk_at_submission: DepthWalkResult | None  # what would have filled with no delay, for slippage reporting
 
 
-def simulate_taker_order(
-    asks_at_submission: tuple[BookLevel, ...],
-    requested_shares: float,
-    limit_price: float,
-    fee_config: FeeConfig,
-    submit_ts: float,
-    taker_delay_ms: float = 0.0,
-    asks_at_revalidation: tuple[BookLevel, ...] | None = None,
-) -> TakerOrderResult:
-    """Simulates one FAK taker order. If `taker_delay_ms > 0` (crypto/
-    finance up-down markets with the 250ms delay enabled, Strategy doc
-    SS2.2), the *caller* is responsible for supplying the book as it stood
-    `taker_delay_ms` later (`asks_at_revalidation`) - obtained from replay
-    by querying the causal event store at submit_ts + delay, exactly like
-    the real exchange's matching engine would use the book at that later
-    instant. This is not a causality violation of the *strategy's*
-    decision (which only ever sees data up to submit_ts) - it's the
-    simulated *exchange* correctly modeling what actually determines the
-    fill, per "revalidation/repricing risk."
-
-    "the order is pending and cannot be canceled" during the delay window
-    is enforced by order_state.py, not here - this function only computes
-    the eventual fill.
-    """
-    walk_at_submission = walk_depth(asks_at_submission, requested_shares, limit_price, fee_config)
-
-    if taker_delay_ms <= 0:
-        return TakerOrderResult(
-            submit_ts=submit_ts,
-            matched_ts=submit_ts,
-            was_delayed=False,
-            walk=walk_at_submission,
-            repriced=False,
-            walk_at_submission=None,
-        )
-
-    matched_ts = submit_ts + taker_delay_ms / 1000.0
-    effective_asks = asks_at_revalidation if asks_at_revalidation is not None else asks_at_submission
-    walk_final = walk_depth(effective_asks, requested_shares, limit_price, fee_config)
-    repriced = effective_asks != asks_at_submission
-
-    return TakerOrderResult(
-        submit_ts=submit_ts,
-        matched_ts=matched_ts,
-        was_delayed=True,
-        walk=walk_final,
-        repriced=repriced,
-        walk_at_submission=walk_at_submission,
-    )
+def walk_at_submission(
+    asks_at_submission: tuple[BookLevel, ...], requested_shares: float, limit_price: float, fee_config: FeeConfig
+) -> DepthWalkResult:
+    """What would fill right now, against the book already visible at
+    `submit_ts` - always legitimate, present-time information, computed
+    the same way regardless of whether this order will end up delayed.
+    Phase 12B Tranche 1.2 item 2: this is deliberately the ONLY fill
+    computation `ExecutionSimulator.submit_taker` performs for a delayed
+    order - it must never be treated as the order's actual eventual fill,
+    only used as a diagnostic (`TakerOrderResult.walk_at_submission`, for
+    slippage reporting) once the order is later resolved."""
+    return walk_depth(asks_at_submission, requested_shares, limit_price, fee_config)

@@ -14,6 +14,7 @@ from xamarinbot.optimizer.candidates import (
     evaluate_maker_candidate,
     evaluate_taker_candidate,
     maker_price_grid,
+    taker_max_execution_price,
     taker_quantities,
     taker_sizing_boundaries,
     wait_candidate,
@@ -125,6 +126,79 @@ def test_taker_sizing_uses_exact_side_aware_g_when_buying_the_underrepresented_s
     assert any(q > old_wrong_cap for q in sizing.quantities), sizing.quantities  # strictly more than the old (wrong) flat-budget cap
     assert any(math.isclose(q, exact_boundary, rel_tol=1e-6) for q in sizing.quantities), sizing.quantities
     assert max(sizing.quantities) <= exact_boundary + 1e-6  # never offers more than the exact risk-feasible boundary
+
+
+# --------------------------------------------------------------------------
+# Phase 12B Tranche 1.2 item 3: taker_max_execution_price - each
+# candidate's own hard, risk-safe worst-price limit, distinct from the
+# shared depth/marginal-edge p_max.
+# --------------------------------------------------------------------------
+
+
+def test_taker_max_execution_price_is_tighter_than_g_min_breaching_price():
+    """The exact scenario named in the reviewer's prompt: p_submit=0.50,
+    p_later=0.80, fee_rate=0.07. A quantity sized to be exactly risk-safe
+    at 0.50 must get a derived hard limit below 0.80, even though 0.80
+    individually still clears min_marginal_edge."""
+    fee_config = FeeConfig(crypto_fee_rate=0.07)
+    portfolio = PortfolioState()
+    cfg = OneStepConfig(g_min=-100.0, min_marginal_edge=0.0)
+    c_submit = 0.50 + fee_config.taker_fee(1.0, 0.50)
+    x = (portfolio.G - cfg.g_min) / c_submit
+
+    hard_limit = taker_max_execution_price(portfolio, Side.UP, x, q_effective=0.85, fee_config=fee_config, cfg=cfg, tick_size=0.01)
+    assert hard_limit is not None
+    assert hard_limit < 0.80
+    assert hard_limit <= 0.51  # close to the submission price, not materially looser
+
+
+def test_taker_max_execution_price_is_none_when_infeasible_at_any_price():
+    portfolio = PortfolioState(U=0.0, D=0.0, C=0.0)
+    cfg = OneStepConfig(g_min=0.0)  # any spend at all breaches this from a flat start
+    result = taker_max_execution_price(portfolio, Side.UP, x=10.0, q_effective=0.9, fee_config=FEE, cfg=cfg, tick_size=0.01)
+    assert result is None
+
+
+def test_taker_max_execution_price_respects_spend_cap_too():
+    portfolio = PortfolioState()
+    cfg = OneStepConfig(g_min=-1_000_000.0, spend_cap=5.0, min_marginal_edge=0.0)  # risk floor loose, spend_cap tight
+    x = 100.0
+    hard_limit = taker_max_execution_price(portfolio, Side.UP, x, q_effective=0.9, fee_config=FEE, cfg=cfg, tick_size=0.01)
+    assert hard_limit is not None
+    # spend_cap=5.0 over 100 shares caps the per-share all-in cost at 0.05
+    assert hard_limit <= 0.06
+
+
+def test_taker_max_execution_price_floors_to_the_tick_grid():
+    portfolio = PortfolioState()
+    cfg = OneStepConfig(g_min=-1_000_000.0, min_marginal_edge=0.0)
+    hard_limit = taker_max_execution_price(portfolio, Side.UP, x=10.0, q_effective=0.6789, fee_config=FEE, cfg=cfg, tick_size=0.01)
+    assert hard_limit is not None
+    scaled = hard_limit / 0.01
+    assert math.isclose(scaled, round(scaled), abs_tol=1e-6)  # an exact multiple of the tick size
+
+
+def test_taker_sizing_boundaries_max_execution_price_by_qty_never_exceeds_p_max():
+    """End-to-end within taker_sizing_boundaries: every quantity's own
+    hard limit must be at most the shared depth/marginal-edge p_max."""
+    asks = (BookLevel(0.50, 500.0),)
+    cfg = OneStepConfig(g_min=-50.0, min_marginal_edge=0.0)
+    portfolio = PortfolioState()
+
+    sizing = taker_sizing_boundaries(asks, q_effective=0.9, fee_config=FEE, cfg=cfg, portfolio=portfolio, side=Side.UP, tick_size=0.01)
+    assert sizing.p_max is not None
+    for qty, price in sizing.max_execution_price_by_qty.items():
+        assert price <= sizing.p_max + 1e-9
+
+
+def test_taker_sizing_boundaries_uses_tick_size_default_when_not_supplied():
+    """Backward-compatible default (tick_size=0.01) so existing callers
+    that don't pass it keep working unchanged."""
+    asks = (BookLevel(0.50, 500.0),)
+    cfg = OneStepConfig(g_min=-1_000_000.0)
+    portfolio = PortfolioState()
+    sizing = taker_sizing_boundaries(asks, q_effective=0.9, fee_config=FEE, cfg=cfg, portfolio=portfolio, side=Side.UP)
+    assert sizing.quantities  # runs without error, produces candidates as before
 
 
 def test_taker_sizing_boundaries_are_wired_into_controller_candidate_generation():

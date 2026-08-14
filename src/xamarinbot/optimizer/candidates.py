@@ -21,7 +21,7 @@ several different ad hoc formulas.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from xamarinbot.execution.config import ExecutionConfig
 from xamarinbot.execution.maker import fill_probability, q_fill
@@ -61,15 +61,26 @@ class TakerSizing:
     """Phase 12B audit items 8 (boundary-aware sizing) and 10 (worst-price
     protection), computed together in one pass since both fall out of the
     same level-by-level walk. `quantities` are the candidate order sizes
-    to evaluate (deduped, ascending); `p_max` is the derived worst
-    acceptable execution price - the price of the last book level whose
-    own marginal edge still clears `cfg.min_marginal_edge` - meant to
-    replace a hardcoded `limit_price=1.0` (which is not real worst-price
-    protection, since prices are probabilities in [0,1] and 1.0 is
-    effectively unconstraining)."""
+    to evaluate (deduped, ascending); `p_max` is the depth/marginal-edge-
+    derived worst acceptable execution price - the price of the last book
+    level whose own marginal edge still clears `cfg.min_marginal_edge` -
+    meant to replace a hardcoded `limit_price=1.0` (which is not real
+    worst-price protection, since prices are probabilities in [0,1] and
+    1.0 is effectively unconstraining).
+
+    `max_execution_price_by_qty` (Phase 12B Tranche 1.2 item 3) maps each
+    of `quantities` to its OWN hard, risk-safe execution price limit -
+    `min(p_max, taker_max_execution_price(...))` - since `p_max` alone
+    does not protect `g_min`/`spend_cap` against an adverse repricing
+    during a taker delay window (a deeper, pricier level can individually
+    clear `min_marginal_edge` while collectively breaching the hard risk
+    floor once revalidated against a moved book). Callers evaluating a
+    specific quantity should use this map, not the shared `p_max`, as the
+    candidate's actual submitted/evaluated limit price."""
 
     quantities: tuple[float, ...]
     p_max: float | None
+    max_execution_price_by_qty: dict[float, float] = field(default_factory=dict)
 
 
 def _risk_boundary_step(
@@ -120,6 +131,86 @@ def _risk_boundary_step(
     return ref_x + frac * (level_end - ref_x), False
 
 
+def _invert_all_in_cost(c_max: float, fee_config: FeeConfig) -> float | None:
+    """Largest `p` in `[0,1]` with `p + fee_config.taker_fee(1, p) <= c_max`,
+    found by monotonic binary search rather than a hardcoded analytic
+    inverse (Phase 12B Tranche 1.2 item 3) - stays correct under any
+    `FeeConfig.taker_fee` formula, not coupled to the current
+    `shares*rate*p*(1-p)` fallback specifically. Assumes the all-in-cost
+    function `p -> p + feePerShare(p)` is non-decreasing in `p`, true of
+    the standard fee formula at any realistic fee rate. Returns `None` if
+    even `p=0` exceeds `c_max` (nothing is affordable)."""
+
+    def all_in(p: float) -> float:
+        return p + fee_config.taker_fee(1.0, p)
+
+    if c_max < 0.0 or all_in(0.0) > c_max:
+        return None
+    lo, hi = 0.0, 1.0
+    if all_in(hi) <= c_max:
+        return hi
+    for _ in range(60):
+        mid = (lo + hi) / 2.0
+        if all_in(mid) <= c_max:
+            lo = mid
+        else:
+            hi = mid
+    return lo
+
+
+def taker_max_execution_price(
+    portfolio: PortfolioState,
+    side: Side,
+    x: float,
+    q_effective: float,
+    fee_config: FeeConfig,
+    cfg: OneStepConfig,
+    tick_size: float,
+) -> float | None:
+    """Derives the hard, candidate-specific worst-price limit for a taker
+    candidate of quantity `x` on `side` (Phase 12B Tranche 1.2 item 3):
+    the largest execution price such that filling all `x` shares at (up
+    to) that price stays both `g_min`-safe and `spend_cap`-safe, while
+    still respecting the `min_marginal_edge` floor:
+
+        K_s^G(x) = min(U+x,D) - C - g_min          (UP; DOWN symmetric via directional_projected_g)
+        K^B      = spend_cap - C                    (only when spend_cap is set)
+        K_max,s(x) = min(K_s^G(x), K^B)
+        q_s = q_effective                            (q for UP, 1-q for DOWN, by this module's convention)
+        c_max,s(x) = min(q_s - min_marginal_edge, K_max,s(x) / x)
+
+    `c_max,s(x)` (the maximum fee-inclusive per-share cost) is then
+    inverted into a raw exchange price via `_invert_all_in_cost` and
+    floored to the valid tick grid. This replaces `TakerSizing.p_max`
+    (the last book level whose own marginal edge still clears
+    `min_marginal_edge`) as the actual submitted/evaluated limit price -
+    `p_max` alone does not protect `g_min`/`spend_cap` against an adverse
+    repricing during a taker delay window, since a deeper, more expensive
+    level can individually clear `min_marginal_edge` while collectively
+    breaching the hard risk floor once revalidated against a moved book.
+
+    Returns `None` if `x` is not feasible at any positive price."""
+    if x <= 0:
+        return None
+    k_g = directional_projected_g(portfolio.U, portfolio.D, portfolio.C, side, x, 0.0) - cfg.g_min
+    k_max = k_g
+    if cfg.spend_cap is not None:
+        k_max = min(k_max, cfg.spend_cap - portfolio.C)
+    if k_max <= 0:
+        return None
+
+    c_max = min(q_effective - cfg.min_marginal_edge, k_max / x)
+    if c_max <= 0:
+        return None
+
+    p = _invert_all_in_cost(c_max, fee_config)
+    if p is None or p <= 0:
+        return None
+
+    ticks = math.floor(p / tick_size + 1e-9)
+    return max(0.0, round(ticks * tick_size, 10))
+
+
 def taker_sizing_boundaries(
     asks: tuple[BookLevel, ...],
     q_effective: float,
@@ -127,6 +218,7 @@ def taker_sizing_boundaries(
     cfg: OneStepConfig,
     portfolio: PortfolioState,
     side: Side,
+    tick_size: float = 0.01,
 ) -> TakerSizing:
     """Generates economically meaningful candidate quantities from the
     union of boundaries named in Phase 12B audit item 7: exchange minimum
@@ -223,7 +315,18 @@ def taker_sizing_boundaries(
         if capped >= cfg.taker_min_size - 1e-9 and capped > 1e-9:
             quantities.add(round(capped, 6))
 
-    return TakerSizing(tuple(sorted(quantities)), p_max)
+    final_quantities = tuple(sorted(quantities))
+    # Phase 12B Tranche 1.2 item 3: each quantity gets its OWN hard,
+    # risk-safe execution price limit, not the shared depth/marginal-edge
+    # p_max alone - see taker_max_execution_price's docstring.
+    max_execution_price_by_qty: dict[float, float] = {}
+    for qty in final_quantities:
+        hard_price = taker_max_execution_price(portfolio, side, qty, q_effective, fee_config, cfg, tick_size)
+        if hard_price is None:
+            continue
+        max_execution_price_by_qty[qty] = min(p_max, hard_price) if p_max is not None else hard_price
+
+    return TakerSizing(final_quantities, p_max, max_execution_price_by_qty)
 
 
 def maker_price_grid(best_bid: float, best_ask: float, tick_size: float, offsets_ticks: tuple[int, ...]) -> list[tuple[float, int]]:

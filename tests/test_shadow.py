@@ -16,7 +16,7 @@ from xamarinbot.feeds.mock import MockFeedCursor, MockTWAPFeed
 from xamarinbot.model.calibrated import fit_calibrated_model
 from xamarinbot.model.dataset import build_examples_multi
 from xamarinbot.model.features import COMBINED_LEAD_LAG
-from xamarinbot.model.walkforward import time_ordered_split
+from xamarinbot.model.walkforward import round_ordered_split
 from xamarinbot.optimizer.config import OneStepConfig
 from xamarinbot.portfolio.state import FeeConfig
 from xamarinbot.shadow.config import ShadowConfig
@@ -103,7 +103,7 @@ def trained_model(feature_cfg):
     results = generate_synthetic_dataset(store, n_rounds=8)
     by_fs = build_examples_multi(store, results, feature_cfg, [COMBINED_LEAD_LAG], heartbeat_s=HEARTBEAT_S)
     examples = by_fs[COMBINED_LEAD_LAG.name]
-    split = time_ordered_split(examples, train_frac=0.6, val_frac=0.2)
+    split = round_ordered_split(examples, train_frac=0.6, val_frac=0.2)
     return fit_calibrated_model(split.train, split.validation, COMBINED_LEAD_LAG)
 
 
@@ -160,6 +160,59 @@ def test_shadow_runner_24_7_reconnect_stability_survives_simulated_outage(eval_d
     # the first decision right after an outage is flagged reconnected=True
     first_after = min(t for t in recorded_ts if t > max(disconnect_ts))
     assert next(rec for rec in result.records if rec.decision_ts == first_after).reconnected is True
+
+
+def test_shadow_runner_resolves_delayed_taker_orders_via_matched_ts_not_submit_ts(eval_dataset, feature_cfg, fee_config, one_step_cfg, trained_model):
+    """Phase 12B Tranche 1.2 items 1/12: ShadowRunner previously still
+    misused delayed results (called execute_taker and immediately
+    consumed .walk regardless of delay). Proven by spying on
+    ExecutionSimulator.resolve_taker and asserting every call only ever
+    happens at or after that order's own matched_ts.
+
+    This dataset/model combination's regime classifier only ever permits
+    WAIT under ShadowRunner's strict recv_ts gate (a known, pre-existing,
+    documented artifact of this synthetic generator - see
+    test_recv_ts_gate_collapses_z_spot_when_canonical_horizon_matches_tick_spacing
+    above), so OneStepController.decide is monkeypatched here to force a
+    FAK decision every call - isolating the dispatch/lifecycle wiring
+    under test from the emergent (and here, degenerate) regime behavior."""
+    from unittest.mock import patch
+
+    import xamarinbot.execution.simulator as simulator_mod
+    from xamarinbot.optimizer.controller import OneStepController, OneStepDecision
+    from xamarinbot.optimizer.types import CandidateAction, OrderMode
+    from xamarinbot.portfolio.math import OrderPurpose
+    from xamarinbot.portfolio.state import Side
+
+    store, results = eval_dataset
+    delayed_exec_cfg = ExecutionConfig(taker_delay_ms=250.0)
+
+    def forced_decide(self, round_id, decision_ts, portfolio, q, permitted_actions, book_up, book_down, tick_size, is_fresh):
+        forced = CandidateAction(
+            action_id="forced_taker_up", purpose=OrderPurpose.ALPHA, side=Side.UP, mode=OrderMode.FAK,
+            price=0.99, qty=5.0, ttl_s=0.0, expected_fill=5.0, delta_ev=1.0, g_after=0.0,
+            pi_u_after=0.0, pi_d_after=0.0, violated_constraints=(), max_execution_price=0.99,
+        )
+        return OneStepDecision(round_id, decision_ts, forced, (forced,), skip_reason=None)
+
+    calls = []
+    real_resolve = simulator_mod.ExecutionSimulator.resolve_taker
+
+    def spy(self, pending, asks_at_match=None, now_ts=None):
+        if not pending.is_resolved and asks_at_match is not None and now_ts is not None:
+            calls.append((pending.submit_ts, pending.matched_ts, now_ts))
+        return real_resolve(self, pending, asks_at_match, now_ts)
+
+    with patch.object(simulator_mod.ExecutionSimulator, "resolve_taker", spy), \
+         patch.object(OneStepController, "decide", forced_decide):
+        for r in results:
+            runner = ShadowRunner(store, r.round_id, r.p0, feature_cfg, fee_config, delayed_exec_cfg, one_step_cfg, trained_model, COMBINED_LEAD_LAG, ShadowConfig())
+            runner.run()
+
+    assert calls, "expected at least one delayed taker order to be resolved via resolve_taker"
+    for submit_ts, matched_ts, now_ts in calls:
+        assert matched_ts > submit_ts
+        assert now_ts >= matched_ts
 
 
 def test_shadow_runner_controller_deadline_missed_falls_back_to_wait(eval_dataset, feature_cfg, fee_config, exec_cfg, one_step_cfg, trained_model):

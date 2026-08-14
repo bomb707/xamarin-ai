@@ -162,9 +162,11 @@ def max_directional_spend(g_current: float, g_min: float) -> float:
     itself as `x` grows, and this flat formula understates how much can
     safely be bought (see the regression case in
     `test_taker_sizing_uses_exact_side_aware_g_when_buying_the_underrepresented_side`:
-    U=0, D=100, C=50, g_min=-100 - this formula caps spend at $100
-    although buying 100 UP shares at ~$0.5175/share all-in is actually
-    risk-feasible, since it also raises `min(U,D)` from 0 toward 100).
+    U=0, D=100, C=50, g_min=-100 - the flat budget here is
+    G_current - g_min = (min(0,100)-50) - (-100) = $50, capping spend at
+    ~96.6 shares, although buying 100 UP shares at ~$0.5175/share all-in
+    is actually risk-feasible, since it also raises `min(U,D)` from 0
+    toward 100).
     Use `directional_projected_g` for the exact, side-aware formula that
     holds in every case; `optimizer/candidates.py::taker_sizing_boundaries`
     is the source of truth for taker quantity feasibility and does not use

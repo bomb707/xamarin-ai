@@ -17,7 +17,7 @@ from xamarinbot.events.replay import ReplayClock
 from xamarinbot.events.store import EventStore
 from xamarinbot.events.types import EventType
 from xamarinbot.execution.config import ExecutionConfig
-from xamarinbot.execution.simulator import ExecutionSimulator
+from xamarinbot.execution.simulator import ExecutionSimulator, TakerOrderQueue
 from xamarinbot.features.config import FeatureConfig
 from xamarinbot.features.engine import compute
 from xamarinbot.features.types import FeatureVector
@@ -27,7 +27,7 @@ from xamarinbot.journal.writer import JournalWriter
 from xamarinbot.model.calibrated import fit_calibrated_model
 from xamarinbot.model.dataset import build_examples_multi
 from xamarinbot.model.features import COMBINED_LEAD_LAG, design_vector
-from xamarinbot.model.walkforward import time_ordered_split
+from xamarinbot.model.walkforward import round_ordered_split
 from xamarinbot.optimizer.candidates import evaluate_maker_candidate, maker_price_grid
 from xamarinbot.optimizer.config import OneStepConfig
 from xamarinbot.optimizer.controller import OneStepController
@@ -52,7 +52,7 @@ def train_q_model(feature_cfg: FeatureConfig):
     train_results = generate_synthetic_dataset(train_store, n_rounds=N_TRAIN_ROUNDS)
     by_fs = build_examples_multi(train_store, train_results, feature_cfg, [COMBINED_LEAD_LAG], heartbeat_s=HEARTBEAT_S)
     examples = by_fs[COMBINED_LEAD_LAG.name]
-    split = time_ordered_split(examples, train_frac=0.6, val_frac=0.2)
+    split = round_ordered_split(examples, train_frac=0.6, val_frac=0.2)
     return fit_calibrated_model(split.train, split.validation, COMBINED_LEAD_LAG)
 
 
@@ -61,10 +61,16 @@ def run_round(store, round_id, p0, feature_cfg, model, controller_cfg, superviso
     clock = ReplayClock(store, round_id)
     cursor = MockFeedCursor(store, round_id, preloaded=events)
     book_feed = MockBookFeed(cursor)
+    # Dedicated cursor/book_feed for fetching the actual causal book at a
+    # delayed taker order's matched_ts, only at resolve time (Phase 12B
+    # Tranche 1.2 items 1/2).
+    revalidation_cursor = MockFeedCursor(store, round_id, preloaded=events)
+    revalidation_book_feed = MockBookFeed(revalidation_cursor)
     regime_clf = RegimeClassifier(round_id=round_id)
     controller = OneStepController(controller_cfg, exec_cfg, fee_config)
     supervisor = OrderSupervisor(supervisor_cfg)
     sim = ExecutionSimulator(round_id, fee_config, exec_cfg)
+    queue = TakerOrderQueue(sim)
     portfolio = PortfolioState()
     stats = {"placed": 0, "expired_filled": 0, "expired_unfilled": 0}
 
@@ -73,8 +79,18 @@ def run_round(store, round_id, p0, feature_cfg, model, controller_cfg, superviso
     recompute_cfg = OneStepConfig(g_min=supervisor_cfg.g_min, edge_min=supervisor_cfg.edge_min)
     order_seq = 0
 
+    def _book_at(pending) -> tuple:
+        revalidation_cursor.advance_to(pending.matched_ts)
+        book = revalidation_book_feed.get_snapshot(round_id, pending.side)
+        return book.asks if book is not None else ()
+
     for decision_ts in clock.decision_points(heartbeat=HEARTBEAT_S):
         cursor.advance_to(decision_ts)
+
+        for pending, taker_result in queue.resolve_ready(decision_ts, _book_at):
+            if taker_result.walk.filled_shares > 0:
+                portfolio = apply_fill(portfolio, Fill(pending.side, taker_result.walk.avg_price, taker_result.walk.filled_shares, LiquidityRole.TAKER, taker_result.walk.total_fee))
+
         fv = compute(events, round_id, decision_ts, p0, feature_cfg)
         if not isinstance(fv, FeatureVector):
             continue
@@ -139,14 +155,19 @@ def run_round(store, round_id, p0, feature_cfg, model, controller_cfg, superviso
 
         # 3) place a new order if the one-step controller wants a maker candidate
         decision = controller.decide(round_id, decision_ts, portfolio, q, snapshot.permitted_actions, book_up, book_down, tick_size, is_fresh=True)
-        if decision.chosen.mode is OrderMode.FAK and decision.chosen.qty > 0:
-            # Phase 12B audit items 13/E/L: real submit->resolve lifecycle.
+        if decision.chosen.mode is OrderMode.FAK and decision.chosen.qty > 0 and not queue.has_pending:
+            # Phase 12B audit items 13/E/L, Tranche 1.2 items 1/2/5: real
+            # submit->(delay)->resolve lifecycle via the shared
+            # TakerOrderQueue - never mutated before matched_ts, and at
+            # most one PENDING_DELAY taker outstanding at a time.
             order_seq += 1
             asks = book_up.asks if decision.chosen.side is Side.UP else book_down.asks
             limit_price = decision.chosen.max_execution_price if decision.chosen.max_execution_price is not None else decision.chosen.price
-            _, taker_result = sim.execute_taker(f"{round_id}-o{order_seq}", decision.chosen.side, decision.chosen.qty, limit_price, asks, decision_ts)
-            if taker_result.walk.filled_shares > 0:
-                portfolio = apply_fill(portfolio, Fill(decision.chosen.side, taker_result.walk.avg_price, taker_result.walk.filled_shares, LiquidityRole.TAKER, taker_result.walk.total_fee))
+            new_pending = queue.try_submit(f"{round_id}-o{order_seq}", decision.chosen.side, decision.chosen.qty, limit_price, asks, decision_ts)
+            if new_pending is not None and not new_pending.was_delayed:
+                taker_result = sim.resolve_taker(new_pending)
+                if taker_result.walk.filled_shares > 0:
+                    portfolio = apply_fill(portfolio, Fill(decision.chosen.side, taker_result.walk.avg_price, taker_result.walk.filled_shares, LiquidityRole.TAKER, taker_result.walk.total_fee))
         elif decision.chosen.mode is OrderMode.POST_ONLY:
             order_seq += 1
             order_id = f"{round_id}-o{order_seq}"

@@ -16,6 +16,21 @@ any ablation "beats" another - see docs/PHASE_STATUS.md and
 docs/PHASE_12B_AUDIT.md for why synthetic data specifically cannot
 support such claims.
 
+Scope note (Phase 12B Tranche 1.2 item 11): the two things this demo
+runs are deliberately separate and must not be conflated. (1) The
+ablation matrix (`run_walk_forward_ablations`) evaluates each window's
+TEST segment against the 8 *fixed* `MANDATORY_ABLATIONS` configs - no
+parameter selection happens there. (2) The edge_min sweep/stability
+section below reports `Metric(VALIDATE_i, theta)` for a fixed grid of
+theta values, per window - it does NOT compute
+`Config*_i = argmax_theta Metric(VALIDATE_i, theta)` and then evaluate
+that selected config against `TEST_i`. That full closed-loop selection
+procedure is not implemented anywhere in this repo yet; it belongs to
+the later real-data calibration tranche (Tranche 4), once there is real
+data to calibrate against. Do not describe this demo's synthetic output
+as evidence that such a selection loop was run, and do not promote any
+parameter value because it produced a better synthetic-PnL number here.
+
 Usage: python scripts/run_walk_forward_ablation_demo.py [n_rounds]
 """
 from __future__ import annotations

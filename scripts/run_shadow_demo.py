@@ -35,7 +35,7 @@ from xamarinbot.features.config import FeatureConfig
 from xamarinbot.model.calibrated import fit_calibrated_model
 from xamarinbot.model.dataset import build_examples_multi
 from xamarinbot.model.features import COMBINED_LEAD_LAG
-from xamarinbot.model.walkforward import time_ordered_split
+from xamarinbot.model.walkforward import round_ordered_split
 from xamarinbot.optimizer.config import OneStepConfig
 from xamarinbot.portfolio.state import FeeConfig
 from xamarinbot.reports.shadow_report import build_daily_shadow_report, format_daily_shadow_report, format_parity_report
@@ -56,7 +56,7 @@ def train_q_model(feature_cfg: FeatureConfig):
     results = generate_synthetic_dataset(store, n_rounds=N_TRAIN_ROUNDS)
     by_fs = build_examples_multi(store, results, feature_cfg, [COMBINED_LEAD_LAG], heartbeat_s=HEARTBEAT_S)
     examples = by_fs[COMBINED_LEAD_LAG.name]
-    split = time_ordered_split(examples, train_frac=0.6, val_frac=0.2)
+    split = round_ordered_split(examples, train_frac=0.6, val_frac=0.2)
     return fit_calibrated_model(split.train, split.validation, COMBINED_LEAD_LAG)
 
 

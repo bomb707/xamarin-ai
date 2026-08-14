@@ -35,7 +35,7 @@ from xamarinbot.model.features import COMBINED_LEAD_LAG, SPOT_ONLY, TWAP_ONLY
 from xamarinbot.model.logistic import fit_logistic_regression
 from xamarinbot.model.metrics import brier_score, calibration_by_group, calibration_table, log_loss, settlement_accuracy
 from xamarinbot.model.registry import ModelRegistry, PromotionGateError, make_artifact
-from xamarinbot.model.walkforward import time_ordered_split
+from xamarinbot.model.walkforward import round_ordered_split
 from xamarinbot.synthetic.rounds import generate_synthetic_dataset
 
 HEARTBEAT_S = 10.0
@@ -73,7 +73,7 @@ def main() -> None:
 
     for fs in FEATURE_SETS:
         examples = by_feature_set[fs.name]
-        split = time_ordered_split(examples, train_frac=0.6, val_frac=0.2)
+        split = round_ordered_split(examples, train_frac=0.6, val_frac=0.2)
         if not split.train or not split.validation or not split.test:
             print(f"{fs.name:<20} insufficient examples to split (n={len(examples)}) - skipping")
             continue

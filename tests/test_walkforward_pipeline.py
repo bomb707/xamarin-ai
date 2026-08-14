@@ -15,10 +15,15 @@ from xamarinbot.events.store import EventStore
 from xamarinbot.execution.config import ExecutionConfig
 from xamarinbot.features.config import FeatureConfig
 from xamarinbot.model.features import COMBINED_LEAD_LAG, SPOT_ONLY, TWAP_ONLY
-from xamarinbot.portfolio.state import FeeConfig
+from xamarinbot.portfolio.state import FeeConfig, Side
 from xamarinbot.synthetic.rounds import generate_synthetic_dataset
 from xamarinbot.walkforward.ablations import MANDATORY_ABLATIONS
-from xamarinbot.walkforward.pipeline import fit_window_artifacts, run_walk_forward_ablations, LeakageTrace
+from xamarinbot.walkforward.pipeline import (
+    LeakageTrace,
+    _split_rounds_for_fit_and_calibration,
+    fit_window_artifacts,
+    run_walk_forward_ablations,
+)
 from xamarinbot.walkforward.windows import rolling_windows
 
 
@@ -155,3 +160,61 @@ def test_calibrator_fit_round_ids_are_disjoint_from_model_fit_round_ids_within_a
         "a round_id was consumed by both the raw-model fit and the calibrator fit - "
         "R_modelFit ∩ R_calibration must be empty"
     )
+
+
+# --------------------------------------------------------------------------
+# Phase 12B Tranche 1.2 item 7: the calibration block expands backward for
+# class diversity where possible, and never invents calibration when it
+# genuinely can't be achieved.
+# --------------------------------------------------------------------------
+
+
+def test_split_expands_calibration_window_backward_until_both_classes_present():
+    round_ids = tuple(f"r{i}" for i in range(10))
+    # Naive holdout (frac=0.2 of 10 -> 2 rounds) would land on r8,r9, both UP.
+    outcomes = {rid: Side.UP for rid in round_ids}
+    outcomes["r7"] = Side.DOWN  # only reachable by expanding one round further back
+
+    fit_ids, calib_ids = _split_rounds_for_fit_and_calibration(round_ids, 0.2, outcomes)
+
+    assert "r7" in calib_ids
+    assert {outcomes[rid] for rid in calib_ids} == {Side.UP, Side.DOWN}
+    assert fit_ids and set(fit_ids).isdisjoint(calib_ids)
+
+
+def test_split_stops_expanding_at_one_remaining_fit_round_when_diversity_is_unreachable():
+    round_ids = tuple(f"r{i}" for i in range(6))
+    outcomes = {rid: Side.UP for rid in round_ids}  # every round UP - diversity is impossible
+
+    fit_ids, calib_ids = _split_rounds_for_fit_and_calibration(round_ids, 0.2, outcomes)
+
+    assert len(fit_ids) == 1  # expansion stops leaving exactly one fit round, never zero
+    assert len(fit_ids) + len(calib_ids) == len(round_ids)
+
+
+def test_split_without_round_outcomes_keeps_original_fixed_fraction_behavior():
+    """Backward-compatible default: omitting round_outcomes (or passing
+    None) must reproduce the exact pre-item-7 fixed-fraction split."""
+    round_ids = tuple(f"r{i}" for i in range(10))
+    fit_ids, calib_ids = _split_rounds_for_fit_and_calibration(round_ids, 0.2)
+    assert len(calib_ids) == 2
+    assert fit_ids == round_ids[:8]
+    assert calib_ids == round_ids[8:]
+
+
+def test_fit_window_artifacts_produces_a_genuinely_calibrated_model_not_identity_fallback():
+    """End-to-end: on a real synthetic dataset with enough rounds, the
+    per-window calibration split (with backward expansion) should
+    ordinarily reach class diversity and produce a real Platt calibrator,
+    not silently fall back to IdentityCalibrator."""
+    store, results = _dataset(n_rounds=18)
+    round_ids = [r.round_id for r in results]
+    windows = rolling_windows(round_ids, n_train=10, n_validate=3, n_test=3)
+    assert windows
+    feature_cfg = FeatureConfig()
+    trace = LeakageTrace()
+
+    artifacts = fit_window_artifacts(windows[0], results, store, feature_cfg, [TWAP_ONLY], trace)
+    model = artifacts.models_by_feature_set[TWAP_ONLY.name]
+    assert model is not None
+    assert model.is_calibrated, f"expected genuine calibration, got fallback version {model.calibration_version!r}"

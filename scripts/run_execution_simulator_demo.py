@@ -57,27 +57,31 @@ def main() -> None:
             order_id = f"{result.round_id}-taker-{j}"
 
             if use_delay:
-                revalidation_ts = decision_ts + DELAY_MS / 1000.0
-                cursor.advance_to(revalidation_ts)
-                book_later = book_feed.get_snapshot(result.round_id, Side.UP)
-                asks_later = book_later.asks if book_later else book.asks
-                cursor.advance_to(decision_ts)  # restore - caller (this loop) owns the cursor
-                order, taker_result = sim.submit_taker_order(
+                # Phase 12B Tranche 1.2 item 2: submit_taker() never sees
+                # the future book - it only computes what's knowable at
+                # decision_ts. The actual causal book at matched_ts is
+                # fetched separately, only once resolving, and handed to
+                # resolve_taker() explicitly - the eventual fill does not
+                # exist anywhere before that call.
+                pending = sim.submit_taker(
                     order_id, Side.UP, ORDER_SIZE, limit_price=0.99,
-                    asks_at_submission=book.asks, submit_ts=decision_ts,
-                    taker_delay_ms=DELAY_MS, asks_at_revalidation=asks_later,
+                    asks_at_submission=book.asks, submit_ts=decision_ts, taker_delay_ms=DELAY_MS,
                 )
                 # pending-delay no-cancel check, before resolving
-                cancel_attempt = order.cancel(decision_ts + 0.01)
+                cancel_attempt = pending.order_state.cancel(decision_ts + 0.01)
                 if not cancel_attempt.accepted:
                     n_cancel_rejected_pending += 1
-                sim.resolve_pending(order, taker_result, taker_result.matched_ts)
+                cursor.advance_to(pending.matched_ts)
+                book_later = book_feed.get_snapshot(result.round_id, Side.UP)
+                asks_later = book_later.asks if book_later else ()
+                cursor.advance_to(decision_ts)  # restore - caller (this loop) owns the cursor
+                taker_result = sim.resolve_taker(pending, asks_later, pending.matched_ts)
             else:
-                order, taker_result = sim.submit_taker_order(
+                pending = sim.submit_taker(
                     order_id, Side.UP, ORDER_SIZE, limit_price=0.99,
-                    asks_at_submission=book.asks, submit_ts=decision_ts,
-                    taker_delay_ms=0.0,
+                    asks_at_submission=book.asks, submit_ts=decision_ts, taker_delay_ms=0.0,
                 )
+                taker_result = sim.resolve_taker(pending)  # already resolved at submission - no delay to wait on
             all_taker_results.append(taker_result)
 
             # maker order demo: place at the best bid, check reproducible fill draw

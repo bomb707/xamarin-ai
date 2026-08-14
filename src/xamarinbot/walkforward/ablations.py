@@ -27,7 +27,7 @@ from xamarinbot.events.replay import ReplayClock
 from xamarinbot.events.store import EventStore
 from xamarinbot.events.types import EventType
 from xamarinbot.execution.config import ExecutionConfig
-from xamarinbot.execution.simulator import ExecutionSimulator
+from xamarinbot.execution.simulator import ExecutionSimulator, TakerOrderQueue
 from xamarinbot.features.config import FeatureConfig
 from xamarinbot.features.engine import compute
 from xamarinbot.features.types import FeatureVector
@@ -143,15 +143,19 @@ def _run_baseline_round(
     second lookback cursor for spot, matching the one already used here
     for `clob_mid_prev`.
 
-    Items 13/E/L: fills are now routed through the same
-    `ExecutionSimulator.execute_taker` real depth-walk lifecycle every V2
-    arm uses (`_run_controller_round` below), instead of assuming the
-    baseline's full requested quantity always fills completely at its
-    quoted limit price - a materially easier execution assumption than
-    every other ablation arm had, confirmed and fixed together with the
-    other two baseline-harness bugs above so all arms share one execution
-    engine per item L ("same book + same latency + same depth + same fee
-    model... only strategy decisions should differ")."""
+    Items 13/E/L, Tranche 1.2 item 1: fills are now routed through the
+    same `ExecutionSimulator.submit_taker`/`resolve_taker` real depth-walk
+    lifecycle every V2 arm uses (`_run_controller_round` below), via the
+    shared `TakerOrderQueue`, instead of assuming the baseline's full
+    requested quantity always fills completely at its quoted limit price
+    - a materially easier execution assumption than every other ablation
+    arm had, confirmed and fixed together with the other two baseline-
+    harness bugs above so all arms share one execution engine per item L
+    ("same book + same latency + same depth + same fee model... only
+    strategy decisions should differ"). Baseline and V2 sharing the exact
+    same chronological delay/resolution lifecycle (not just the same
+    depth-walk math) matters specifically because they are compared
+    head-to-head."""
     events = store.all_events(round_id)
     clock = ReplayClock(store, round_id)
     cursor = MockFeedCursor(store, round_id, preloaded=events)
@@ -160,8 +164,15 @@ def _run_baseline_round(
     prev_book_feed = MockBookFeed(prev_clob_cursor)
     prev_spot_cursor = MockFeedCursor(store, round_id, preloaded=events)
     prev_spot_feed = MockSpotFeed(prev_spot_cursor)
+    # Dedicated cursor/book_feed for fetching the actual causal book at a
+    # delayed taker order's matched_ts, only at resolve time (Phase 12B
+    # Tranche 1.2 item 2) - kept separate from the decision-time cursor
+    # above since it advances to a different timestamp.
+    revalidation_cursor = MockFeedCursor(store, round_id, preloaded=events)
+    revalidation_book_feed = MockBookFeed(revalidation_cursor)
     portfolio = PortfolioState()
     sim = ExecutionSimulator(round_id, fee_config, exec_cfg)
+    queue = TakerOrderQueue(sim)
     n_actions = 0
     n_attempts = 0
     order_seq = 0
@@ -169,8 +180,19 @@ def _run_baseline_round(
     market_config = next(e.payload for e in events if e.event_type is EventType.MARKET_CONFIG)
     round_start_ts = market_config["start_ts"]
 
+    def _book_at(pending) -> tuple:
+        revalidation_cursor.advance_to(pending.matched_ts)
+        book = revalidation_book_feed.get_snapshot(round_id, pending.side)
+        return book.asks if book is not None else ()
+
     for decision_ts in clock.decision_points(heartbeat=HEARTBEAT_S):
         cursor.advance_to(decision_ts)
+
+        for pending, taker_result in queue.resolve_ready(decision_ts, _book_at):
+            if taker_result.walk.filled_shares > 0:
+                portfolio = apply_fill(portfolio, Fill(pending.side, taker_result.walk.avg_price, taker_result.walk.filled_shares, LiquidityRole.TAKER, taker_result.walk.total_fee))
+                n_actions += 1
+
         twap_obs, spot_obs = twap_feed.get_latest(round_id), spot_feed.get_latest(round_id)
         if twap_obs is None or spot_obs is None:
             continue
@@ -194,15 +216,17 @@ def _run_baseline_round(
             is_fresh=True,
         )
         result = baseline_decide(inputs, portfolio.U, portfolio.D, portfolio.C, cfg)
-        if result.order is not None:
+        if result.order is not None and not queue.has_pending:
             n_attempts += 1
             order_seq += 1
             book = book_up if result.order.side is Side.UP else book_down
             asks = book.asks if book is not None else ()
-            _, taker_result = sim.execute_taker(f"{round_id}-o{order_seq}", result.order.side, result.order.quantity, result.order.price, asks, decision_ts)
-            if taker_result.walk.filled_shares > 0:
-                portfolio = apply_fill(portfolio, Fill(result.order.side, taker_result.walk.avg_price, taker_result.walk.filled_shares, result.order.role, taker_result.walk.total_fee))
-                n_actions += 1
+            pending = queue.try_submit(f"{round_id}-o{order_seq}", result.order.side, result.order.quantity, result.order.price, asks, decision_ts)
+            if pending is not None and not pending.was_delayed:
+                taker_result = sim.resolve_taker(pending)
+                if taker_result.walk.filled_shares > 0:
+                    portfolio = apply_fill(portfolio, Fill(result.order.side, taker_result.walk.avg_price, taker_result.walk.filled_shares, result.order.role, taker_result.walk.total_fee))
+                    n_actions += 1
     return portfolio, n_actions, n_attempts
 
 
@@ -222,10 +246,11 @@ def _run_controller_round(
     cursor = MockFeedCursor(store, round_id, preloaded=events)
     book_feed = MockBookFeed(cursor)
     # Dedicated cursor/book_feed for fetching the actual causal book at a
-    # delayed taker order's matched_ts (Phase 12B Tranche 1.1 item 7) -
-    # kept separate from the main decision-time cursor above since it
-    # advances to a different timestamp, mirroring the prev_cursor pattern
-    # already used for baseline lookback in this same module.
+    # delayed taker order's matched_ts, only at resolve time (Phase 12B
+    # Tranche 1.2 item 2) - kept separate from the main decision-time
+    # cursor above since it advances to a different timestamp, mirroring
+    # the prev_cursor pattern already used for baseline lookback in this
+    # same module.
     revalidation_cursor = MockFeedCursor(store, round_id, preloaded=events)
     revalidation_book_feed = MockBookFeed(revalidation_cursor)
     regime_clf = RegimeClassifier(round_id=round_id)
@@ -233,31 +258,30 @@ def _run_controller_round(
     mpc = MPCController(spec.mpc_cfg, transition_model or TransitionModel(probabilities={}), one_step) if spec.controller == "mpc" else None
     supervisor = OrderSupervisor(SupervisorConfig(g_min=spec.one_step_cfg.g_min, edge_min=spec.one_step_cfg.edge_min)) if spec.use_supervisor else None
     sim = ExecutionSimulator(round_id, fee_config, exec_cfg)
+    queue = TakerOrderQueue(sim)
     portfolio = PortfolioState()
     n_actions = 0
     n_attempts = 0
     order_seq = 0
-    pending: list = []  # (OrderState, TakerOrderResult) awaiting their matched_ts
 
     market_config = next(e.payload for e in events if e.event_type is EventType.MARKET_CONFIG)
     tick_size = market_config["tick_size"]
+
+    def _book_at(pending) -> tuple:
+        revalidation_cursor.advance_to(pending.matched_ts)
+        book = revalidation_book_feed.get_snapshot(round_id, pending.side)
+        return book.asks if book is not None else ()
 
     for decision_ts in clock.decision_points(heartbeat=HEARTBEAT_S):
         cursor.advance_to(decision_ts)
 
         # Resolve any delayed taker orders whose matched_ts has arrived -
         # never mutate portfolio for a fill whose matched_ts is still in
-        # the future (Phase 12B Tranche 1.1 item 7).
-        still_pending = []
-        for order, result in pending:
-            if decision_ts >= result.matched_ts:
-                sim.resolve_pending(order, result, decision_ts)
-                if order.filled_shares > 0:
-                    portfolio = apply_fill(portfolio, Fill(order.side, result.walk.avg_price, order.filled_shares, LiquidityRole.TAKER, result.walk.total_fee))
-                    n_actions += 1
-            else:
-                still_pending.append((order, result))
-        pending = still_pending
+        # the future (Phase 12B Tranche 1.1 item 7 / Tranche 1.2 item 2).
+        for pending, taker_result in queue.resolve_ready(decision_ts, _book_at):
+            if taker_result.walk.filled_shares > 0:
+                portfolio = apply_fill(portfolio, Fill(pending.side, taker_result.walk.avg_price, taker_result.walk.filled_shares, LiquidityRole.TAKER, taker_result.walk.total_fee))
+                n_actions += 1
 
         fv = compute(events, round_id, decision_ts, p0, feature_cfg)
         if not isinstance(fv, FeatureVector):
@@ -314,35 +338,28 @@ def _run_controller_round(
             one_step_decision = one_step.decide(round_id, decision_ts, portfolio, q, permitted, book_up, book_down, tick_size, True)
             chosen = one_step_decision.chosen
 
-        if chosen.mode is OrderMode.FAK and chosen.qty > 0:
-            # Phase 12B audit items 13/E/L, Tranche 1.1 item 7: route
-            # through the real submit->(delay/revalidation)->resolve
-            # lifecycle instead of directly converting the candidate's own
-            # pre-evaluation walk estimate into a Fill - see
-            # ExecutionSimulator.execute_taker. A genuinely delayed order
-            # is queued in `pending` and only mutates portfolio once this
-            # loop's own decision_ts reaches its matched_ts (resolved at
-            # the top of the loop above), using the actual causal book
-            # fetched at that future timestamp - never the submission book.
+        if chosen.mode is OrderMode.FAK and chosen.qty > 0 and not queue.has_pending:
+            # Phase 12B audit items 13/E/L, Tranche 1.1 item 7, Tranche 1.2
+            # items 1/2/5: route through the real submit->(delay)->resolve
+            # lifecycle via the shared TakerOrderQueue instead of directly
+            # converting the candidate's own pre-evaluation walk estimate
+            # into a Fill. A genuinely delayed order is queued and only
+            # mutates portfolio once this loop's own decision_ts reaches
+            # its matched_ts (resolved at the top of the loop above),
+            # using the actual causal book fetched only then - never the
+            # submission book, and never computed/leaked at submit time.
+            # The `not queue.has_pending` guard is the conservative item 5
+            # admission gate: at most one PENDING_DELAY taker outstanding.
             n_attempts += 1
             order_seq += 1
             asks = book_up.asks if chosen.side is Side.UP else book_down.asks
             limit_price = chosen.max_execution_price if chosen.max_execution_price is not None else chosen.price
-            revalidation_asks = None
-            if exec_cfg.taker_delay_ms > 0:
-                matched_ts = decision_ts + exec_cfg.taker_delay_ms / 1000.0
-                revalidation_cursor.advance_to(matched_ts)
-                revalidation_book = revalidation_book_feed.get_snapshot(round_id, chosen.side)
-                revalidation_asks = revalidation_book.asks if revalidation_book is not None else ()
-            order, taker_result = sim.execute_taker(
-                f"{round_id}-o{order_seq}", chosen.side, chosen.qty, limit_price, asks, decision_ts,
-                revalidation_asks=revalidation_asks,
-            )
-            if taker_result.was_delayed:
-                pending.append((order, taker_result))
-            elif taker_result.walk.filled_shares > 0:
-                portfolio = apply_fill(portfolio, Fill(chosen.side, taker_result.walk.avg_price, taker_result.walk.filled_shares, LiquidityRole.TAKER, taker_result.walk.total_fee))
-                n_actions += 1
+            new_pending = queue.try_submit(f"{round_id}-o{order_seq}", chosen.side, chosen.qty, limit_price, asks, decision_ts)
+            if new_pending is not None and not new_pending.was_delayed:
+                taker_result = sim.resolve_taker(new_pending)
+                if taker_result.walk.filled_shares > 0:
+                    portfolio = apply_fill(portfolio, Fill(chosen.side, taker_result.walk.avg_price, taker_result.walk.filled_shares, LiquidityRole.TAKER, taker_result.walk.total_fee))
+                    n_actions += 1
         elif chosen.mode is OrderMode.POST_ONLY and supervisor is not None:
             order_seq += 1
             order_state = sim.submit_maker_order(f"{round_id}-o{order_seq}", chosen.side, chosen.qty, chosen.price, decision_ts)
