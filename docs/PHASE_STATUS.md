@@ -4,10 +4,10 @@ Tracks implementation status against the two source specs:
 - `Xamarinbot_V2_Detailed_Development_Roadmap.docx` ("Roadmap")
 - `Xamarinbot_V2_Detailed_Strategy_and_Mathematical_Model.docx` ("Strategy")
 
-This build covers **Roadmap Phases 0-11** (the foundation layers the
+This build covers **Roadmap Phases 0-12** (the foundation layers the
 roadmap itself says must exist before any predictive complexity, per its
 "Roadmap principle" and SS22.1 "Recommended immediate next sprint").
-Phases 12-14 are **not implemented** - they are listed below as explicitly
+Phases 13-14 are **not implemented** - they are listed below as explicitly
 future work, not silently dropped.
 
 ## Implemented
@@ -26,6 +26,7 @@ future work, not silently dropped.
 | Phase 9 - Proactive Maker/Taker Place-Cancel-Replace | Done | [supervisor/](../src/xamarinbot/supervisor/). `OrderSupervisor` is a thin policy layer over Phase 7's `OrderState` mechanics: it never computes EV/G itself (the caller re-evaluates each tracked order via Phase 8's `evaluate_maker_candidate` and passes the numbers in), keeping it a single, testable place implementing Strategy doc SS16's trigger table (edge failure, regime flip, risk breach, time compression, feed staleness -> cancel; book displacement -> replace, gated by a churn threshold) rather than duplicating EV math a second time. **All four roadmap-named verification scenarios are direct tests**: rapid regime flip (plus its rate-limiting counterpart - a *second* flip inside the minimum action interval must not thrash), partial fill then cancel (the partial fill survives, only the remainder is canceled), tick-size change with an open order (a `REPLACE` after a tick-size change prices on the new grid, not the stale one), and feed-stale-while-resting (cancels regardless of how good the order otherwise looks - checked first, before every other trigger). Cancel-regret analytics (`reports/supervisor_report.py`) are explicitly post-hoc-only, using a documented approximation (did the touch price cross the canceled order's price afterward) rather than a full counterfactual fill simulation. |
 | Phase 10 - Short-Horizon MPC | Done | [mpc/](../src/xamarinbot/mpc/). `MPCController` is a generalization of Phase 8's `OneStepController`, not a parallel implementation - at `horizon_steps<=1` it must (and does, exactly, bit-for-bit) reduce to a plain one-step decision. Continuation value at each hypothetical future state is estimated by recursively calling the greedy one-step policy itself (a standard rollout-policy approximation), over a small discrete scenario tree that evolves only `GapRegime` (not the full 54-state `RegimeState`) using a transition model estimated from Phase 6's own `RegimeTransition` records over a causal replay - "historical state transitions," synthetic for now. **All three roadmap-named verification items are direct tests**: degenerate-horizon equivalence (checked across several states/portfolios, not just one), timeout fallback (a zero time budget forces the plain one-step decision), and scenario-probability sanity checks (every state's next-state distribution sums to 1.0 and is bounded in [0,1], including the top-k-truncation-then-renormalize path). A real bug turned up mid-build: continuation projections initially reused the *undepleted* original book at every step, so a large taker fill's continuation value double-counted the exact liquidity it had just consumed - fixed by depleting the relevant side's book by the chosen candidate's fill before recursing, with a dedicated regression test. |
 | Phase 11 - Walk-Forward Calibration and Ablations | Done (synthetic data) | [walkforward/](../src/xamarinbot/walkforward/). `windows.py` builds rolling train/validate/test splits that are chronologically disjoint *within* each window (a smaller-than-default `step` can legitimately reuse a round as one window's test and a later window's train/validate - documented in the module and covered by a test that checks this doesn't cross a single window's own ordering); `bootstrap.py` gives resampled confidence intervals on PnL reusing Phase 2's `seeded_random` for reproducibility; `ablations.py` runs the **exact 8 mandatory ablations from Strategy doc SS20.1** over the identical causal replay harness, requiring two real additions to the optimizer that Phases 8-10 never needed: SS17 hedge-candidate generation (`generate_hedge_candidate`, gated by `enable_portfolio_repair`) and SS18's actual risk-adjusted selection objective (`lambda_g`, since pure `ev_after` ranking can *never* select a hedge - SS17 hedges have negative standalone EV by construction and always lose to WAIT at `lambda_g=0`). `sensitivity.py` sweeps one `OneStepConfig` field at a time and reports the *full* curve, not just the argmax, plus a `parameter_stability_across_windows` check (does the best value drift between walk-forward windows - instability there is itself the finding). **Both roadmap-named verification items are automated**: "no test-period tuning" is a direct test that spies on every round_id `sweep_parameter` is ever handed and asserts none belong to any window's `test_round_ids`; bootstrap CI correctness is covered by dedicated tests (point estimate = plain mean, lower<=upper, deterministic per seed key, degenerate at n<=1, widens with variance). Ablations 6-8 report **zero non-wait actions** on this synthetic dataset - two distinct, diagnosed-not-guessed findings, not bugs, pinned down by a regression test and detailed in "Notable bugs" below. |
+| Phase 12 - Shadow / Paper Trading | Done (synthetic data) | [shadow/](../src/xamarinbot/shadow/). `ShadowRunner` reuses Phase 1's exact pluggable feed interfaces (mock/replay today; real adapters once credentials exist), so this is the same code that would run against a live stream, not a separate implementation to swap in later. The one genuinely new mechanism: `MockFeedCursor` gained a `time_attr` field (`feeds/mock.py`) so a cursor can gate causal visibility on `recv_ts` (true wire-arrival time) instead of Phase 2's `event_time` (source_ts-preferring, and therefore mildly optimistic relative to when data actually arrived) - `ShadowRunner` is the one place in the codebase that must use the stricter gate, since "no timestamp leakage" for a genuinely live system means never acting on data before it's actually arrived. SS21's Latency gate ("Controller misses deadline -> Fallback to simpler one-step/WAIT policy") is a direct per-decision check (`decide_elapsed_ms > decision_deadline_ms` forces WAIT); 24/7 reconnect stability is exercised via `FaultInjector`, a demo/test-only simulated outage that the runner must survive without crashing or wedging. `shadow/parity.py`'s `compare_live_vs_replay` isolates exactly the causal-gate difference by evaluating both decision streams against an identical frozen `PortfolioState()` (matching Phase 8-10's own demo convention), so a fill-timing divergence downstream can never masquerade as a causal-gating mismatch upstream. **All roadmap-named verification items are automated**: no-timestamp-leakage (a hand-crafted event with `source_ts < recv_ts` proven invisible before its true arrival), 24/7 reconnect stability (outage injection mid-round, runner completes and resumes), controller-deadline-met (a 0ms deadline forces every decision to WAIT; a 10s deadline never misses). The live-vs-replay parity rate on this synthetic dataset is ~96% - not a bug, but a real, fully-diagnosed finding about feature-parameter fragility under a genuinely live gate; see the dedicated finding below. |
 
 Supporting pieces built to make Phases 0-10 demonstrable end-to-end:
 - `journal/` - SS20 schema (all entities declared; market_config, feed_event,
@@ -54,12 +55,15 @@ Supporting pieces built to make Phases 0-10 demonstrable end-to-end:
 - `reports/walkforward_report.py` - the Phase 11 ablation matrix (mean PnL +
   bootstrap CI + fill rate per ablation) and sensitivity/stability table
   formatting.
+- `reports/shadow_report.py` - the Phase 12 daily shadow report (decision
+  latency percentiles, reconnects, missed deadlines, mean hypothetical G)
+  and live-vs-replay parity report formatting.
 - `scripts/run_baseline_replay.py`, `scripts/run_feature_engine_demo.py`,
   `scripts/run_model_training_demo.py`, `scripts/run_regime_classifier_demo.py`,
   `scripts/run_execution_simulator_demo.py`, `scripts/run_one_step_controller_demo.py`,
   `scripts/run_order_supervisor_demo.py`, `scripts/run_mpc_controller_demo.py`,
-  `scripts/run_walk_forward_ablation_demo.py` -
-  wire the above into nine end-to-end causal pipelines you can run today.
+  `scripts/run_walk_forward_ablation_demo.py`, `scripts/run_shadow_demo.py` -
+  wire the above into ten end-to-end causal pipelines you can run today.
   `run_baseline_replay.py` still simplifies fills to same-tick-at-decision-
   price - it predates Phase 7 and was never retrofitted with
   `ExecutionSimulator`, unlike `run_one_step_controller_demo.py` and
@@ -77,6 +81,7 @@ PYTHONPATH=src python scripts/run_one_step_controller_demo.py [n_eval_rounds]
 PYTHONPATH=src python scripts/run_order_supervisor_demo.py [n_eval_rounds]
 PYTHONPATH=src python scripts/run_mpc_controller_demo.py [n_eval_rounds]
 PYTHONPATH=src python scripts/run_walk_forward_ablation_demo.py [n_rounds]
+PYTHONPATH=src python scripts/run_shadow_demo.py [n_rounds]
 ```
 Tests: `PYTHONPATH=src pytest -q` (or `pip install -e .[dev]` first)
 
@@ -84,11 +89,10 @@ Tests: `PYTHONPATH=src pytest -q` (or `pip install -e .[dev]` first)
 
 | Phase | What it needs |
 |---|---|
-| Phase 12 - Shadow / Paper Trading | Requires live feeds (Phase 1's real adapters, verified) running continuously. |
 | Phase 13 - Limited Live Rollout | Requires Phase 12 passing its exit gate, plus a funded, authenticated Polymarket account. **Do not attempt without explicit, deliberate operator sign-off** - this phase risks real capital. |
 | Phase 14 - Adaptive Optimization | Requires an accumulated live/shadow event log to calibrate against. |
 
-## Known reconstruction gaps (Phase 0 baseline, Phase 4 features, Phase 5 model, Phase 6 regime, Phase 7 execution, Phase 8 optimizer, Phase 9 supervisor, Phase 10 MPC, Phase 11 walk-forward/ablations)
+## Known reconstruction gaps (Phase 0 baseline, Phase 4 features, Phase 5 model, Phase 6 regime, Phase 7 execution, Phase 8 optimizer, Phase 9 supervisor, Phase 10 MPC, Phase 11 walk-forward/ablations, Phase 12 shadow)
 
 The source docs describe some behaviors *narratively*, not with exact
 formulas. This build's choices are documented at the point of
@@ -249,6 +253,21 @@ implementation and repeated here for visibility:
     `tau` interactions - deliberately excluding CLOB/OFI features so #4 is
     a genuine "TWAP + current-BTC" ablation distinct from #5's full
     `COMBINED_LEAD_LAG`, which also carries `z_clob`/`ofi`).
+22. **Paper executor reuses Phase 7's `ExecutionSimulator` unmodified**
+    ([shadow/runner.py](../src/xamarinbot/shadow/runner.py)) - the Roadmap
+    asks for "a parallel paper executor with realistic delay/queue
+    assumptions"; rather than build a second execution model, `ShadowRunner`
+    calls the exact same `submit_maker_order`/`draw_maker_fill`/taker-fee
+    machinery Phases 8-11 already use, so "realistic" here means "as
+    realistic as Phase 7's existing simulator," not a new, separately-
+    calibrated live-specific model.
+23. **What counts as a live "reconnect"** ([shadow/runner.py](../src/xamarinbot/shadow/runner.py)) -
+    the mock feeds have no real socket to lose, so `FaultInjector` stands
+    in for a genuine outage by making the runner skip a decision point
+    entirely and call `reconnect()` (a no-op on every mock adapter, a real
+    reconnect handshake on the real ones) - this exercises the runner's
+    survive-and-resume control flow, not real network-failure behavior,
+    which can't be tested without live credentials.
 
 None of these gaps affect the Phase 3 math kernel, which implements the
 source docs' formulas exactly.
@@ -342,6 +361,53 @@ below):
   would be needed before this ablation comparison says anything about
   cancel/replace's true value versus simply reflecting this synthetic
   generator's flip frequency.
+
+**Phase 12 demo finding worth flagging (not a bug) - the dominant driver
+of the ~96% live-vs-replay parity rate**: `run_shadow_demo.py` shows the
+shadow (recv_ts-gated) decision stream choosing WAIT at effectively every
+decision point, even on rounds where offline replay finds 20+ non-WAIT
+actions - initially looked exactly like a bug in the new `time_attr`
+plumbing, so it was traced rather than assumed. Root cause, confirmed by
+directly comparing the two "latest spot observation" lookups both z_spot
+and the regime classifier depend on: `FeatureConfig.canonical_horizon_s`
+(1.0s) exactly equals this synthetic generator's spot-tick spacing (also
+1.0s). Under `event_time` gating (offline), the observation "now" and the
+observation "1 canonical horizon ago" are two different ticks, so Z_spot's
+momentum is a real, nonzero number. Under `recv_ts` gating (shadow), the
+very latest tick hasn't "arrived" yet at any whole-second decision
+timestamp (recv_ts = source_ts + a small fixed offset, always > 0), so
+"now" resolves to the *same* prior tick as "1 horizon ago" - confirmed
+directly: at `decision_ts=1000.0` on `synthetic-round-0002`, both lookups
+returned the identical `(source_ts=999.0, value=80790.51...)` observation.
+`log(x/x) = 0.0` exactly, every single time a decision point lands on a
+whole second (effectively always, since this generator ticks on whole
+seconds) - so Z_spot is deterministically zero, `spot_direction` is always
+`FLAT`, and regime rule #1 ("Either leg FLAT -> WAIT") locks the controller
+into WAIT for the entire round, regardless of what the CLOB/gap features
+are doing. This is *not* a bug in `time_attr`/`ShadowRunner` - both gates
+are behaving exactly as specified, and this is precisely the class of
+issue Phase 12 exists to surface before it reaches live capital: a feature
+parameter with *zero* safety margin against any nonzero feed-arrival
+latency, however small. It only fully saturates to 100% because this
+synthetic generator's tick spacing (1.0s) exactly coincides with
+`canonical_horizon_s` (1.0s); real market data ticks far more irregularly,
+so this exact total lockout is a synthetic-data artifact, but the
+*underlying fragility* (a momentum lookback with no margin above expected
+feed latency) is real and would need `canonical_horizon_s` tuned with a
+safety margin above measured live latency before Phase 13. Deliberately
+left unfixed here rather than widening `canonical_horizon_s` - that's a
+Phase 4/5 model parameter with cross-cutting effects on Phase 5's already-
+calibrated model and Phase 11's ablation numbers, out of scope for a
+Phase 12 change. The overall ~96% parity rate is still meaningfully above
+this "always WAIT" floor because a large majority of offline decisions are
+already WAIT too (the two streams agree by coincidence, not because the
+underlying cause is rare); the ~4% of genuine mismatches are attributable
+to a second, smaller, and separate effect - a `BOOK_DELTA` right at a
+decision boundary not yet "arrived" live can flip `z_clob` enough to
+change which maker candidate wins (confirmed directly: `z_clob=0.0` offline
+vs `0.80` live at one such boundary) - which is the kind of small,
+occasional, and expected live/replay divergence Phase 12's parity report
+is meant to catch and quantify.
 
 ## Notable bugs caught during Phase 0/4/5/7/8/9/10/11 build-out (fixed, worth knowing about)
 
@@ -519,6 +585,13 @@ production**:
   ablations 6-8 "zero actions" finding and the `edge_min=0.0`/`lambda_g=0.01`
   tuning are both dataset-specific artifacts of this synthetic generator's
   regime-flip frequency and book-depth sizing, not general conclusions.
+- Before trusting Phase 12's parity numbers against a real feed, re-tune
+  `FeatureConfig.canonical_horizon_s` with a safety margin above measured
+  real feed-arrival latency - see the Phase 12 finding above; this
+  synthetic dataset's exact 1.0s-tick/1.0s-horizon coincidence is a
+  synthetic-data artifact, but the underlying fragility (zero margin
+  against nonzero arrival lag) is real and must be checked against actual
+  live latency, not assumed away.
 - Resolve the `_map_tokens_to_sides` gap in `polymarket_clob.py`.
 - Confirm the Chainlink Data Streams auth handshake against Chainlink's own
   docs (not Polymarket's).

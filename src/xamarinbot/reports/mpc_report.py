@@ -19,7 +19,7 @@ class LatencyBenchmarkReport:
         return self.n_fallback / self.n_calls if self.n_calls else 0.0
 
 
-def _percentile(sorted_values: list[float], pct: float) -> float:
+def percentile(sorted_values: list[float], pct: float) -> float:
     if not sorted_values:
         return 0.0
     idx = min(len(sorted_values) - 1, math.ceil(pct / 100.0 * len(sorted_values)) - 1)
@@ -31,9 +31,9 @@ def build_latency_benchmark(elapsed_ms_samples: list[float], fallback_flags: lis
     return LatencyBenchmarkReport(
         n_calls=len(elapsed_ms_samples),
         n_fallback=sum(fallback_flags),
-        p50_ms=_percentile(ordered, 50),
-        p95_ms=_percentile(ordered, 95),
-        p99_ms=_percentile(ordered, 99),
+        p50_ms=percentile(ordered, 50),
+        p95_ms=percentile(ordered, 95),
+        p99_ms=percentile(ordered, 99),
         max_ms=ordered[-1] if ordered else 0.0,
     )
 

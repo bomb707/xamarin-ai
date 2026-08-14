@@ -41,12 +41,21 @@ class MockFeedCursor:
     rather than re-querying SQLite and re-sorting on every single
     events_up_to() call, which is what every mock feed does at every
     decision point.
+
+    `time_attr` selects which Event timestamp gates causal visibility:
+    "event_time" (the default - source_ts, falling back to recv_ts) is
+    Phase 2's offline-replay gate. "recv_ts" is the strictly-true live
+    constraint (Roadmap Phase 12) - a real system can only ever act on data
+    it has actually received over the wire, and since recv_ts is always
+    >= source_ts, gating on event_time alone is mildly optimistic relative
+    to true wire-arrival time. See shadow/ and docs/PHASE_STATUS.md.
     """
 
     store: EventStore
     round_id: str
     now: float = float("-inf")
     preloaded: list[Event] | None = None
+    time_attr: str = "event_time"
     _by_type: dict[EventType, list[Event]] = field(default_factory=dict, repr=False, init=False)
     _times_by_type: dict[EventType, list[float]] = field(default_factory=dict, repr=False, init=False)
 
@@ -55,10 +64,14 @@ class MockFeedCursor:
         for e in events:
             self._by_type.setdefault(e.event_type, []).append(e)
         for event_type, evs in self._by_type.items():
-            self._times_by_type[event_type] = [e.event_time for e in evs]
+            evs.sort(key=lambda e: getattr(e, self.time_attr))
+            self._times_by_type[event_type] = [getattr(e, self.time_attr) for e in evs]
 
     def advance_to(self, t: float) -> None:
         self.now = t
+
+    def time_of(self, e: Event) -> float:
+        return getattr(e, self.time_attr)
 
     def events_up_to(self, event_type: EventType) -> list[Event]:
         import bisect
@@ -196,8 +209,14 @@ class MockBookFeed(BookFeed):
                 + self._cursor.all_of_type(EventType.BOOK_DELTA)
                 if e.payload.get("side") == side.value
             ]
+            # Merge order always follows true exchange/causal order
+            # (sort_key, event_time-based) - only the bisect *threshold*
+            # below (how far into that ordered list "now" has reached)
+            # depends on the cursor's time_attr, so a recv_ts-gated cursor
+            # still applies deltas in the order they truly happened, just
+            # delayed by however long each one took to arrive.
             events.sort(key=lambda e: e.sort_key)
-            cache = _BookSideCache(merged=events, times=[e.event_time for e in events])
+            cache = _BookSideCache(merged=events, times=[self._cursor.time_of(e) for e in events])
             self._side_cache[side] = cache
         return cache
 
