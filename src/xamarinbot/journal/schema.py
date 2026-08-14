@@ -140,6 +140,21 @@ class RegimeTransitionRecord:
 
 
 @dataclass(frozen=True)
+class SupervisorDecisionRecord:
+    """Phase 9 (OrderSupervisor) - populated by supervisor/supervisor.py.
+    Another addition beyond SS20's original table, same rationale as
+    regime_transition."""
+
+    round_id: str
+    order_id: str
+    decision_ts: float
+    action: str  # HOLD / CANCEL / REPLACE
+    reason: str | None
+    side: str
+    price: float
+
+
+@dataclass(frozen=True)
 class AuditRecord:
     round_id: str
     decision_ts: float

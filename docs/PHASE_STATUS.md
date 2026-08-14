@@ -4,9 +4,9 @@ Tracks implementation status against the two source specs:
 - `Xamarinbot_V2_Detailed_Development_Roadmap.docx` ("Roadmap")
 - `Xamarinbot_V2_Detailed_Strategy_and_Mathematical_Model.docx` ("Strategy")
 
-This build covers **Roadmap Phases 0-8** (the foundation layers the roadmap
+This build covers **Roadmap Phases 0-9** (the foundation layers the roadmap
 itself says must exist before any predictive complexity, per its "Roadmap
-principle" and SS22.1 "Recommended immediate next sprint"). Phases 9-14 are
+principle" and SS22.1 "Recommended immediate next sprint"). Phases 10-14 are
 **not implemented** - they are listed below as explicitly future work, not
 silently dropped.
 
@@ -23,8 +23,9 @@ silently dropped.
 | Phase 6 - Seed Regime / Middle-Ground State Machine | Done | [regime/](../src/xamarinbot/regime/). `classify_seed_action` is a complete, exhaustively-tested 54-cell mapping (6 `GapRegime` buckets x 3 CLOB directions x 3 spot directions) extending the Strategy doc SS8 table's 5 example rows + catch-all - see "Known reconstruction gaps" for exactly how the un-named cells were filled in. `ActionPermissionMatrix` always includes WAIT alongside any directional candidate; the module has no import dependency on the portfolio math kernel or anything order-placing (Phase 6 exit gate: "no matrix entry directly bypasses EV/risk gates" - every action here is a candidate family only). `RegimeClassifier` is stateful per round, logs every transition with dwell time, and substitutes CANCEL for WAIT specifically when a prior directional thesis just lapsed. Gated by the new `FeatureFlags.use_regime_seed_policy` flag (off by default) alongside the existing baseline policy, per "keep the original baseline rule available as a separate policy." |
 | Phase 7 - Order-Book and Execution Simulator | Done | [execution/](../src/xamarinbot/execution/). `walk_depth` builds the taker cost curve over real multi-level `BookSnapshot` depth (reused from Phase 1, not reinvented) with FAK partial-fill semantics falling out naturally - whatever isn't filled by the walk simply isn't, no resting remainder. The 250ms delay model requires the *caller* to supply the book at both submission and revalidation time (from causal replay), correctly modeling "revalidation/repricing risk" without the *strategy* seeing future data - only the simulated exchange does, exactly as a real matching engine would. `OrderState` is a real lifecycle state machine (`PENDING_DELAY -> OPEN/PARTIALLY_FILLED -> FILLED/CANCELED`); a real bug here (fills were applied eagerly at submission regardless of delay, silently defeating the pending-delay-no-cancel behavior) is documented below. The maker fill-probability/adverse-selection model (`rho(p,h)`, `q_fill`) is explicitly an uncalibrated placeholder - no real fill data exists to estimate it from (Roadmap's own step: "Estimate q_fill / maker adverse selection from historical fills" - not possible yet). Stochastic maker fills reuse Phase 2's `seeded_random` for reproducibility, exactly the use case it was built for. |
 | Phase 8 - One-Step Semi-Controlled Optimizer | Done | [optimizer/](../src/xamarinbot/optimizer/). `CandidateAction` matches Strategy doc SS23.3's interface almost verbatim. One EV formula (`EV_after = q*delta_U + (1-q)*delta_D - delta_C`) is used for every candidate, alpha or hedge, taker or maker - it reduces exactly to SS13's `DeltaEV_U`/`DeltaEV_D` for a certain taker fill and to SS14's maker EV core term once weighted by fill probability and evaluated with `q_fill` (Phase 7's adverse-selection adjustment) instead of raw `q`, rather than several ad hoc formulas per candidate type. Hard-constraint rejection reuses Phase 3's `evaluate_constraints` directly (not reimplemented) via a real `FillSimulationResult`; maker candidates are checked against their *if-filled* portfolio, conservatively, per SS16's "projected fill would push G below G_min -> Cancel/shrink." WAIT is always present and always valid, the guaranteed fallback. **Both roadmap-named verification items are automated**: `tests/test_optimizer.py`'s Hypothesis stress test (200 random portfolio/book/q combinations) asserts the chosen candidate never has `g_after` below `g_min` (accounting for the edge case where the *starting* portfolio is already below an unreachable `g_min` - no action, including WAIT, can fix that; see the test), and `scripts/run_one_step_controller_demo.py` runs the controller against the Phase 0 baseline over an identical causal replay. |
+| Phase 9 - Proactive Maker/Taker Place-Cancel-Replace | Done | [supervisor/](../src/xamarinbot/supervisor/). `OrderSupervisor` is a thin policy layer over Phase 7's `OrderState` mechanics: it never computes EV/G itself (the caller re-evaluates each tracked order via Phase 8's `evaluate_maker_candidate` and passes the numbers in), keeping it a single, testable place implementing Strategy doc SS16's trigger table (edge failure, regime flip, risk breach, time compression, feed staleness -> cancel; book displacement -> replace, gated by a churn threshold) rather than duplicating EV math a second time. **All four roadmap-named verification scenarios are direct tests**: rapid regime flip (plus its rate-limiting counterpart - a *second* flip inside the minimum action interval must not thrash), partial fill then cancel (the partial fill survives, only the remainder is canceled), tick-size change with an open order (a `REPLACE` after a tick-size change prices on the new grid, not the stale one), and feed-stale-while-resting (cancels regardless of how good the order otherwise looks - checked first, before every other trigger). Cancel-regret analytics (`reports/supervisor_report.py`) are explicitly post-hoc-only, using a documented approximation (did the touch price cross the canceled order's price afterward) rather than a full counterfactual fill simulation. |
 
-Supporting pieces built to make Phases 0-8 demonstrable end-to-end:
+Supporting pieces built to make Phases 0-9 demonstrable end-to-end:
 - `journal/` - SS20 schema (all entities declared; market_config, feed_event,
   portfolio_state, order_event, fill, settlement, audit, and now
   feature_state are populated).
@@ -44,14 +45,18 @@ Supporting pieces built to make Phases 0-8 demonstrable end-to-end:
 - `reports/regime_report.py` - the Phase 6 transition-statistics report:
   seed-action counts, top transition pairs, average dwell time per state.
 - `reports/execution_report.py` - the Phase 7 taker slippage/delay report.
+- `reports/supervisor_report.py` - the Phase 9 cancel/replace analytics
+  (action/reason counts, cancel regret rate).
 - `scripts/run_baseline_replay.py`, `scripts/run_feature_engine_demo.py`,
   `scripts/run_model_training_demo.py`, `scripts/run_regime_classifier_demo.py`,
-  `scripts/run_execution_simulator_demo.py`, `scripts/run_one_step_controller_demo.py` -
-  wire the above into six end-to-end causal pipelines you can run today.
+  `scripts/run_execution_simulator_demo.py`, `scripts/run_one_step_controller_demo.py`,
+  `scripts/run_order_supervisor_demo.py` - wire the above into seven
+  end-to-end causal pipelines you can run today.
   `run_baseline_replay.py` still simplifies fills to same-tick-at-decision-
   price - it predates Phase 7 and was never retrofitted with
-  `ExecutionSimulator`, unlike `run_one_step_controller_demo.py`, which
-  uses it properly for both taker depth-walking and stochastic maker fills.
+  `ExecutionSimulator`, unlike `run_one_step_controller_demo.py` and
+  `run_order_supervisor_demo.py`, which use it properly for both taker
+  depth-walking and stochastic maker fills.
 
 Run them:
 ```
@@ -61,6 +66,7 @@ PYTHONPATH=src python scripts/run_model_training_demo.py [n_rounds]
 PYTHONPATH=src python scripts/run_regime_classifier_demo.py [n_rounds]
 PYTHONPATH=src python scripts/run_execution_simulator_demo.py [n_rounds]
 PYTHONPATH=src python scripts/run_one_step_controller_demo.py [n_eval_rounds]
+PYTHONPATH=src python scripts/run_order_supervisor_demo.py [n_eval_rounds]
 ```
 Tests: `PYTHONPATH=src pytest -q` (or `pip install -e .[dev]` first)
 
@@ -68,14 +74,13 @@ Tests: `PYTHONPATH=src pytest -q` (or `pip install -e .[dev]` first)
 
 | Phase | What it needs |
 |---|---|
-| Phase 9 - Proactive Maker/Taker Place-Cancel-Replace | `OrderSupervisor`, cancel/replace predicates, churn rate-limiting. |
 | Phase 10 - Short-Horizon MPC | Scenario tree, receding-horizon optimization, latency-bounded fallback. |
 | Phase 11 - Walk-Forward Calibration and Ablations | Requires Phases 4-10 plus **real historical data** (see below). |
 | Phase 12 - Shadow / Paper Trading | Requires live feeds (Phase 1's real adapters, verified) running continuously. |
 | Phase 13 - Limited Live Rollout | Requires Phase 12 passing its exit gate, plus a funded, authenticated Polymarket account. **Do not attempt without explicit, deliberate operator sign-off** - this phase risks real capital. |
 | Phase 14 - Adaptive Optimization | Requires an accumulated live/shadow event log to calibrate against. |
 
-## Known reconstruction gaps (Phase 0 baseline, Phase 4 features, Phase 5 model, Phase 6 regime, Phase 7 execution, Phase 8 optimizer)
+## Known reconstruction gaps (Phase 0 baseline, Phase 4 features, Phase 5 model, Phase 6 regime, Phase 7 execution, Phase 8 optimizer, Phase 9 supervisor)
 
 The source docs describe some behaviors *narratively*, not with exact
 formulas. This build's choices are documented at the point of
@@ -179,9 +184,42 @@ implementation and repeated here for visibility:
     the resting size at that price level when placing exactly at the
     current touch, and 0 for any price the book doesn't already show a
     level at - a simplification, not a queue model.
+15. **Trigger priority order and `churn_threshold`/rate-limit values** ([supervisor/supervisor.py](../src/xamarinbot/supervisor/supervisor.py), [supervisor/config.py](../src/xamarinbot/supervisor/config.py)) -
+    SS16's table doesn't specify what happens when multiple triggers fire
+    at once; this build checks feed-staleness and risk-breach first (hard
+    safety gates), then regime flip, edge failure, time compression, and
+    finally book displacement (replace) - a defensible but not
+    doc-mandated ordering. `churn_threshold` and `min_action_interval_s`
+    are named by the roadmap ("Replace only when the new expected value
+    exceeds the old order by a churn threshold," "Rate-limit cancel/
+    replace") without values or formulas; both are flat, uncalibrated
+    placeholders here.
+16. **Cancel regret as a crossing-price proxy** ([reports/supervisor_report.py](../src/xamarinbot/reports/supervisor_report.py)) -
+    "canceled orders that would have filled profitably" would need a full
+    counterfactual fill simulation (queue position, competing orders) to
+    answer precisely; this build approximates it as "did the touch price
+    cross the canceled order's price within a lookback window afterward,"
+    documented in the module docstring as a proxy, not a fill simulation.
 
 None of these gaps affect the Phase 3 math kernel, which implements the
 source docs' formulas exactly.
+
+**Phase 9 demo finding worth flagging**: in `run_order_supervisor_demo.py`,
+100% of placed maker orders get canceled via `REGIME_FLIP` before ever
+reaching their TTL, across every heartbeat tested (10s and 5s both gave
+the same result) - no order ever survives to fill or expire naturally.
+This isn't a supervisor bug; it's the direct, compounding consequence of
+two things already documented above: regime dwell times are typically
+1-3s (Phase 6), so almost any sampling interval will catch at least one
+flip before a maker order's ~10s horizon elapses, and the supervisor
+correctly cancels immediately per SS16 ("Regime flip ... -> Cancel
+immediately") with no hesitation or grace period. It's a legitimate,
+sharp demonstration that the trigger fires exactly as specified - but it
+also means this demo can't yet show a REPLACE or a natural fill/expiry in
+its own output (both are exercised directly in `tests/test_supervisor.py`
+instead, with hand-constructed scenarios). Real historical data - where
+regimes presumably don't flip on every single tick - would be needed to
+see a more varied trigger mix in the demo itself.
 
 **Phase 8 demo finding worth flagging**: in `run_one_step_controller_demo.py`,
 the Phase 0 baseline strategy took 0 positions across the sampled rounds
@@ -209,7 +247,7 @@ relative to simpler baselines") exists to catch - real historical data,
 where TWAP isn't definitionally the whole story, is needed before this
 comparison means anything about real edge.
 
-## Notable bugs caught during Phase 0/4/5/7/8 build-out (fixed, worth knowing about)
+## Notable bugs caught during Phase 0/4/5/7/8/9 build-out (fixed, worth knowing about)
 
 Building each phase exercised the previous phases' pipeline far more
 heavily than their own build-out did, and surfaced real bugs versus just
@@ -263,6 +301,15 @@ reported to the user in earlier sessions:
   is "never worse than the floor or the starting point, whichever is
   looser," not "always at or above an arbitrary configured floor
   regardless of where you started."
+- **(Phase 9)** `SupervisorDecision.reason` had no default value, so the
+  `REPLACE` branch of `review_order` - which constructs a decision with
+  only `order_id` and `action` (a replace has no `CancelReason`) - raised
+  `TypeError: missing 1 required positional argument: 'reason'` the first
+  time a book-displacement scenario actually exercised that code path
+  (`test_tick_size_change_with_open_order_replace_uses_new_grid`). Every
+  `CANCEL` branch happened to pass all three positional args, so this went
+  unnoticed until a test hit the one branch that didn't. Fixed by giving
+  `reason` a default of `None`.
 
 - The order book generator recomputed "the previous tick's ask price" from
   a formula that mixed the current tick's TWAP with the previous tick's
