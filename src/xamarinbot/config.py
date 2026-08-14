@@ -29,5 +29,6 @@ class FeatureFlags:
     phase is implemented and its exit gate passes."""
 
     use_baseline_v1: bool = True
+    use_regime_seed_policy: bool = False  # Phase 6 - candidate source only, not wired into execution yet
     use_one_step_controller: bool = False  # Phase 8 - not yet implemented
     use_mpc_controller: bool = False  # Phase 10 - not yet implemented

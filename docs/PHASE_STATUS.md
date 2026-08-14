@@ -4,9 +4,9 @@ Tracks implementation status against the two source specs:
 - `Xamarinbot_V2_Detailed_Development_Roadmap.docx` ("Roadmap")
 - `Xamarinbot_V2_Detailed_Strategy_and_Mathematical_Model.docx` ("Strategy")
 
-This build covers **Roadmap Phases 0-5** (the foundation layers the roadmap
+This build covers **Roadmap Phases 0-6** (the foundation layers the roadmap
 itself says must exist before any predictive complexity, per its "Roadmap
-principle" and SS22.1 "Recommended immediate next sprint"). Phases 6-14 are
+principle" and SS22.1 "Recommended immediate next sprint"). Phases 7-14 are
 **not implemented** - they are listed below as explicitly future work, not
 silently dropped.
 
@@ -20,8 +20,9 @@ silently dropped.
 | Phase 3 - Exact Portfolio Mathematics Kernel | Done | [portfolio/](../src/xamarinbot/portfolio/). 100% of Strategy-doc identities covered by property tests (`tests/test_portfolio_math.py`, Hypothesis). No dependency on predictor or exchange client (verified by import graph). |
 | Phase 4 - Feature Engineering (TWAP/spot/CLOB/time) | Done | [features/](../src/xamarinbot/features/). `compute()` is a pure, stateless function of a causal event list - the same code path for live and replay by construction, and future events in the input list are filtered out internally rather than trusted from the caller. All SS5-SS7 formulas (`G_T`, `G_S`, `L`, `V_T,model`, `Z_gap`, `L_clob`, `Z_clob`, OFI) implemented; two formulas the source docs don't pin down exactly (`Z_clob`'s robust_scale estimator, realized-volatility scaling convention) are documented inline and in "Known reconstruction gaps" below. Missing/stale inputs return an explicit `InvalidFeatureState`, never a silent default. |
 | Phase 5 - Probability Model and Calibration | Done | [model/](../src/xamarinbot/model/). Pure-Python L2-regularized logistic regression (no numpy/sklearn dependency - see "Known reconstruction gaps"), fit on a chronological (not random) train split, calibrated on validation via Platt or isotonic, evaluated on a held-out test split with Brier/log-loss/accuracy. `ModelRegistry` freezes model + feature_version + training_window + metrics and gates promotion on a Brier threshold - matches the exit gate "No production use until calibration is acceptable." TWAP-only / spot-only / combined lead-lag models are all built from a single shared `FeatureVector` computation per decision point (not recomputed per model). |
+| Phase 6 - Seed Regime / Middle-Ground State Machine | Done | [regime/](../src/xamarinbot/regime/). `classify_seed_action` is a complete, exhaustively-tested 54-cell mapping (6 `GapRegime` buckets x 3 CLOB directions x 3 spot directions) extending the Strategy doc SS8 table's 5 example rows + catch-all - see "Known reconstruction gaps" for exactly how the un-named cells were filled in. `ActionPermissionMatrix` always includes WAIT alongside any directional candidate; the module has no import dependency on the portfolio math kernel or anything order-placing (Phase 6 exit gate: "no matrix entry directly bypasses EV/risk gates" - every action here is a candidate family only). `RegimeClassifier` is stateful per round, logs every transition with dwell time, and substitutes CANCEL for WAIT specifically when a prior directional thesis just lapsed. Gated by the new `FeatureFlags.use_regime_seed_policy` flag (off by default) alongside the existing baseline policy, per "keep the original baseline rule available as a separate policy." |
 
-Supporting pieces built to make Phases 0-5 demonstrable end-to-end:
+Supporting pieces built to make Phases 0-6 demonstrable end-to-end:
 - `journal/` - SS20 schema (all entities declared; market_config, feed_event,
   portfolio_state, order_event, fill, settlement, audit, and now
   feature_state are populated).
@@ -35,15 +36,18 @@ Supporting pieces built to make Phases 0-5 demonstrable end-to-end:
 - `reports/leadlag_report.py` - the Phase 4 / SS22.1 empirical table: P(UP)
   and realized edge by gap bucket x spot direction x CLOB direction x time
   bucket.
+- `reports/regime_report.py` - the Phase 6 transition-statistics report:
+  seed-action counts, top transition pairs, average dwell time per state.
 - `scripts/run_baseline_replay.py`, `scripts/run_feature_engine_demo.py`,
-  `scripts/run_model_training_demo.py` - wire the above into three
-  end-to-end causal pipelines you can run today.
+  `scripts/run_model_training_demo.py`, `scripts/run_regime_classifier_demo.py` -
+  wire the above into four end-to-end causal pipelines you can run today.
 
 Run them:
 ```
 PYTHONPATH=src python scripts/run_baseline_replay.py [n_rounds]
 PYTHONPATH=src python scripts/run_feature_engine_demo.py [n_rounds]
 PYTHONPATH=src python scripts/run_model_training_demo.py [n_rounds]
+PYTHONPATH=src python scripts/run_regime_classifier_demo.py [n_rounds]
 ```
 Tests: `PYTHONPATH=src pytest -q` (or `pip install -e .[dev]` first)
 
@@ -51,9 +55,8 @@ Tests: `PYTHONPATH=src pytest -q` (or `pip install -e .[dev]` first)
 
 | Phase | What it needs |
 |---|---|
-| Phase 6 - Seed Regime / Middle-Ground State Machine | `RegimeClassifier`, `ActionPermissionMatrix` from Strategy doc SS8's table. |
 | Phase 7 - Order-Book and Execution Simulator | Depth walking, 250ms taker delay/revalidation, FAK partial fills, maker queue/fill model. **This is what today's Phase-0 demo simplifies away** - every fill in `run_baseline_replay.py` is assumed to execute completely at the decision-time limit price. |
-| Phase 8 - One-Step Semi-Controlled Optimizer | Candidate generation + EV/G scoring using the Phase 3 kernel + Phase 5 `q`. |
+| Phase 8 - One-Step Semi-Controlled Optimizer | Candidate generation + EV/G scoring using the Phase 3 kernel, Phase 5 `q`, and Phase 6's permitted-action sets. |
 | Phase 9 - Proactive Maker/Taker Place-Cancel-Replace | `OrderSupervisor`, cancel/replace predicates, churn rate-limiting. |
 | Phase 10 - Short-Horizon MPC | Scenario tree, receding-horizon optimization, latency-bounded fallback. |
 | Phase 11 - Walk-Forward Calibration and Ablations | Requires Phases 4-10 plus **real historical data** (see below). |
@@ -61,7 +64,7 @@ Tests: `PYTHONPATH=src pytest -q` (or `pip install -e .[dev]` first)
 | Phase 13 - Limited Live Rollout | Requires Phase 12 passing its exit gate, plus a funded, authenticated Polymarket account. **Do not attempt without explicit, deliberate operator sign-off** - this phase risks real capital. |
 | Phase 14 - Adaptive Optimization | Requires an accumulated live/shadow event log to calibrate against. |
 
-## Known reconstruction gaps (Phase 0 baseline, Phase 4 features, Phase 5 model)
+## Known reconstruction gaps (Phase 0 baseline, Phase 4 features, Phase 5 model, Phase 6 regime)
 
 The source docs describe some behaviors *narratively*, not with exact
 formulas. This build's choices are documented at the point of
@@ -110,6 +113,26 @@ implementation and repeated here for visibility:
    memorizes it instead of learning a smooth curve. Platt's 2-parameter
    fit doesn't have that failure mode at this data scale. Real historical
    data with more genuine label noise may make isotonic viable.
+9. **The 54-cell action matrix** ([regime/matrix.py](../src/xamarinbot/regime/matrix.py)) -
+   Strategy doc SS8's table gives 5 example rows (synchronized bullish/
+   bearish, CLOB-pullback maker cases, and one near-center reversal case)
+   plus a catch-all "any region, conflict/stale -> WAIT/CANCEL", not all 54
+   combinations of 6 `GapRegime` buckets x 3 CLOB directions x 3 spot
+   directions. The un-named cells are filled in by a documented, symmetric
+   extension of the table's own stated logic (mirroring the near-center
+   reversal case to the negative side; WAIT for any FLAT leg; WAIT for
+   synchronized fast signals that strongly oppose the gap regime; WAIT for
+   three-way conflicts) - see the module docstring for the full reasoning,
+   since this is this build's biggest interpretive gap-fill so far.
+10. **GapRegime bucket boundaries** ([regime/matrix.py](../src/xamarinbot/regime/matrix.py)) -
+    SS8's table names only 3 regions (positive/upper-middle, near-center,
+    negative/lower-middle) but Roadmap Phase 6's verification step asks to
+    "replay transitions around ±1/±0.5/0 seeds," implying finer breakpoints
+    than the table's 3 named regions use. This build splits each side at
+    ±1 into a "middle" and "strong" sub-bucket (6 buckets total) so every
+    named breakpoint is an actual state boundary, with the strong buckets
+    behaving identically to their middle counterpart wherever SS8 doesn't
+    distinguish further.
 
 None of these gaps affect the Phase 3 math kernel, which implements the
 source docs' formulas exactly.

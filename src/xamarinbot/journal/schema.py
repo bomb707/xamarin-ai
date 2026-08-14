@@ -6,6 +6,10 @@ and audit are implemented and populated starting Phase 0-2. feature_state
 (Phase 4), model_output (Phase 5) and candidate_action (Phase 8) are
 declared now, matching SS20's full entity list, but stay unused until those
 phases are built - see docs/PHASE_STATUS.md.
+
+regime_transition (Phase 6) is an addition beyond SS20's original table -
+the Roadmap's "Transition statistics report" deliverable needs somewhere to
+persist RegimeTransition events, and SS20 doesn't name a slot for them.
 """
 from __future__ import annotations
 
@@ -119,6 +123,20 @@ class SettlementRecord:
     outcome: str  # UP / DOWN
     payout: float
     realized_pnl: float
+
+
+@dataclass(frozen=True)
+class RegimeTransitionRecord:
+    """Phase 6 (Seed Regime State Machine) - populated by
+    regime/classifier.py. from_state is None for a round's first
+    observation."""
+
+    round_id: str
+    transition_ts: float
+    from_state: dict | None
+    to_state: dict
+    seed_action: str
+    dwell_time_s: float | None
 
 
 @dataclass(frozen=True)
