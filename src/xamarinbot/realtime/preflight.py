@@ -88,8 +88,14 @@ def attribution_summary(raw: RawEventStore) -> AttributionSummary:
             continue
         attributions.append(FailureAttribution.from_payload(e.payload))
 
+    # `RecorderMetrics.parse_failures` is a MONOTONIC session-wide counter,
+    # snapshotted into each round's result as that round finalizes. Every
+    # round in the batch therefore carries a running total, not its own
+    # count. Summing them would multiply one failure by the round count
+    # (measured: the eight rounds of a real batch report `events_received`
+    # 1640670, 1640672, 1640674, ... - the same counter at eight instants).
+    # The session total is the LAST snapshot, i.e. the maximum.
     session_total = 0
-    seen_sessions = set()
     for res in raw.round_results():
         blob = res.get("metrics_json")
         if not blob:
@@ -99,14 +105,7 @@ def attribution_summary(raw: RawEventStore) -> AttributionSummary:
         except json.JSONDecodeError:
             continue
         m = metrics.get("session_metrics") or metrics
-        # Every round in one recorder session carries the SAME session
-        # counters, so summing them would multiply the failure count by the
-        # round count. Take each distinct session once.
-        key = (m.get("session_id"), m.get("events_received"), m.get("parse_failures"))
-        if key in seen_sessions:
-            continue
-        seen_sessions.add(key)
-        session_total += int(m.get("parse_failures") or 0)
+        session_total = max(session_total, int(m.get("parse_failures") or 0))
 
     return AttributionSummary(
         attributions=tuple(attributions),

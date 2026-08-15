@@ -277,17 +277,36 @@ def test_a_real_capture_with_no_failures_needs_no_fallback(tmp_path):
 
 
 def test_session_counters_are_not_multiplied_by_the_round_count(tmp_path):
-    """Eight rounds in one session share ONE set of session counters. Summing
-    them would report eight failures where one happened."""
+    """`parse_failures` is a MONOTONIC session counter snapshotted into each
+    round as it finalizes - measured on a real batch, the eight rounds carry
+    `events_received` 1640670, 1640672, 1640674, ... i.e. one counter at
+    eight instants. Summing them would report eight failures where two
+    happened; the session total is the last snapshot."""
     raw = make_capture(tmp_path)
-    raw.upsert_round_result({
-        "round_id": ROUND, "reported_outcome": "UP", "reconstructed_outcome": "UP",
-        "label_agreement": 1,
-        "metrics_json": json.dumps({"session_metrics": {
-            "session_id": "s", "events_received": 10, "parse_failures": 2,
-        }}),
-    })
+    for i, rid in enumerate((ROUND, "round-2", "round-3")):
+        raw.upsert_round_result({
+            "round_id": rid, "reported_outcome": "UP", "reconstructed_outcome": "UP",
+            "label_agreement": 1,
+            "metrics_json": json.dumps({"session_metrics": {
+                "events_received": 1_640_670 + 2 * i, "parse_failures": 2,
+            }}),
+        })
     assert attribution_summary(raw).session_failure_count == 2
+
+
+def test_a_growing_session_counter_reports_its_final_value(tmp_path):
+    raw = make_capture(tmp_path)
+    for i, (rid, failures) in enumerate(
+        ((ROUND, 0), ("round-2", 1), ("round-3", 3))
+    ):
+        raw.upsert_round_result({
+            "round_id": rid, "reported_outcome": "UP", "reconstructed_outcome": "UP",
+            "label_agreement": 1,
+            "metrics_json": json.dumps({"session_metrics": {
+                "events_received": 100 + i, "parse_failures": failures,
+            }}),
+        })
+    assert attribution_summary(raw).session_failure_count == 3
 
 
 def test_an_unrecorded_failure_disqualifies_a_round_end_to_end(tmp_path):
