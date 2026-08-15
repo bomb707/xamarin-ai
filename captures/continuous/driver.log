@@ -67,3 +67,18 @@ CONTINUOUS REAL BTC 5-MINUTE CAPTURE
 ==============================================================================
 
 [continuous] batch 1 starting at 20260815T212034Z
+
+[continuous] signal 15 received - finishing the current batch, then stopping. Send again to abort immediately.
+==============================================================================
+CONTINUOUS REAL BTC 5-MINUTE CAPTURE
+  RECORDER ONLY - no orders, no credentials, no private key.
+  code sha     8f875de7574fcb782d687c3a7a4940e0de5255c1
+  pid          2708148   started 20260815T212143Z
+  python       3.12.3   recorder schema v2
+  batch size   8 rounds
+  output       captures/continuous/btc5m_<utc>.db
+  index        captures/continuous/INDEX.jsonl
+  until        interrupted
+==============================================================================
+
+[continuous] batch 1 starting at 20260815T212143Z
