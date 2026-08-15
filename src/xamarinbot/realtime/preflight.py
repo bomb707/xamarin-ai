@@ -133,6 +133,15 @@ def structured_failure_events(raw: RawEventStore) -> list[FailureAttribution]:
     """
     windows = round_windows(raw)
     out: list[FailureAttribution] = []
+    #: Reconstructed outages already covered, per stream. A watchdog stall is
+    #: immediately followed by the reconnect it triggers, and reconstructing
+    #: from the data gives BOTH events the same interval - they are one
+    #: outage seen twice, not two. A stream cannot be down twice at once, so
+    #: overlapping reconstructed intervals on the same stream are merged.
+    #: (Live A.0.2 captures never hit this: `StreamGapTracker.begin` is
+    #: idempotent while a gap is open, so the stall and its reconnect publish
+    #: a single `data_gap`.)
+    covered: dict[str, list[tuple[int, int]]] = {}
     for e in raw.events(topics=[Topic.RECORDER_CONTROL]):
         if e.event_type not in FAILURE_EVENT_TYPES:
             continue
@@ -147,8 +156,13 @@ def structured_failure_events(raw: RawEventStore) -> list[FailureAttribution]:
         start_ns, end_ns = reconstruct_gap_interval(raw, str(stream), at_ns)
         if end_ns - start_ns <= MATERIAL_GAP_NS:
             continue
+        norm = "rtds" if str(stream).startswith("rtds") else "clob"
+        seen = covered.setdefault(norm, [])
+        if any(start_ns <= s_end and end_ns >= s_start for s_start, s_end in seen):
+            continue
+        seen.append((start_ns, end_ns))
         gap = StreamGap(
-            stream="rtds" if str(stream).startswith("rtds") else "clob",
+            stream=norm,
             failure_kind=e.event_type,
             last_data_ns=start_ns,
             detected_ns=at_ns,

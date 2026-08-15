@@ -410,6 +410,51 @@ def test_a_harmless_reconnect_does_not_disqualify_a_round(tmp_path):
     assert evaluate_round(raw, ROUND, verify_projection_run=False).data_valid is True
 
 
+def test_a_stall_and_the_reconnect_it_triggers_are_one_outage(tmp_path):
+    """Measured on the real pre-A0.2 batch: four RTDS blackouts produced
+    four `stream_stalled` events and four `reconnect` events, and
+    reconstructing from the data gave all eight the SAME interval. They are
+    one outage seen twice - a stream cannot be down twice at once."""
+    import dataclasses
+
+    raw = make_capture(tmp_path, n=8)
+    b = RawEventBuilder(session_id="legacy")
+    at = START_NS + 45 * S
+    raw.write_batch([
+        dataclasses.replace(
+            b.build(Topic.RECORDER_CONTROL, "stream_stalled",
+                    {"stream": "rtds", "silent_for_s": 30.0}),
+            recv_wall_timestamp_ns=at),
+        dataclasses.replace(
+            b.build(Topic.RECORDER_CONTROL, "reconnect",
+                    {"generation": 1, "stream": "rtds"}),
+            recv_wall_timestamp_ns=at + 200_000_000),
+    ])
+    failures = structured_failure_events(raw)
+    assert len(failures) == 1, f"one outage, not {len(failures)}"
+
+
+def test_two_genuinely_separate_outages_stay_separate(tmp_path):
+    """Merging must not swallow distinct outages - only overlapping ones."""
+    import dataclasses
+
+    raw = make_eligible_capture(tmp_path)
+    b = RawEventBuilder(session_id="legacy")
+    raw.write_batch([
+        dataclasses.replace(
+            b.build(Topic.RECORDER_CONTROL, "stream_stalled", {"stream": "rtds"}),
+            recv_wall_timestamp_ns=START_NS + 50 * S),
+        dataclasses.replace(
+            b.build(Topic.RECORDER_CONTROL, "stream_stalled", {"stream": "rtds"}),
+            recv_wall_timestamp_ns=START_NS + 200 * S),
+    ])
+    intervals = {
+        (f.interval_start_ns, f.interval_end_ns)
+        for f in structured_failure_events(raw)
+    }
+    assert len(intervals) == len(structured_failure_events(raw))
+
+
 def test_the_reader_covers_every_failure_bearing_event_type():
     from xamarinbot.realtime.attribution import FAILURE_EVENT_TYPES
 
