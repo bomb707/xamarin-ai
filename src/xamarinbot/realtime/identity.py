@@ -38,6 +38,17 @@ LEGACY_RECORDER = "LEGACY_RECORDER"
 POST_A0_1_RECORDER = "POST_A0_1_RECORDER"
 
 
+#: The paths whose state decides whether the LOADED CODE is a commit.
+#:
+#: Deliberately not the whole tree. The recorder writes `captures/` as it
+#: runs - the index, the driver log, the batch manifests - so a whole-tree
+#: dirty check would be true from the recorder's own first write and stay
+#: true forever. A flag that is always on says nothing, and worse, it would
+#: make a genuinely uncommitted code change indistinguishable from the
+#: recorder having done its job.
+CODE_PATHS = ("src", "scripts", "tests", "devtools", "pyproject.toml")
+
+
 def _git(repo_root: Path, *args: str) -> str | None:
     try:
         out = subprocess.run(
@@ -72,7 +83,7 @@ class RecorderIdentity:
         """Snapshot the identity of the CURRENT process. Call once at startup."""
         root = Path(repo_root) if repo_root else Path(__file__).resolve().parents[3]
         sha = _git(root, "rev-parse", "HEAD")
-        status = _git(root, "status", "--porcelain")
+        status = _git(root, "status", "--porcelain", "--", *CODE_PATHS)
         return cls(
             recorder_code_sha=sha,
             recorder_code_dirty=bool(status),

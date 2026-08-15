@@ -31,3 +31,39 @@ CONTINUOUS REAL BTC 5-MINUTE CAPTURE
 [continuous] batch 8 starting at 20260815T202657Z
 
 [continuous] signal 15 received - finishing the current batch, then stopping. Send again to abort immediately.
+[continuous] batch 8 done in 53.3 min: 8 rounds (8 labelled), 1.39 GB -> btc5m_20260815T202657Z.db; 64 rounds accumulated
+
+[continuous] stopped after 8 batch(es), 64 rounds accumulated this session.
+==============================================================================
+CONTINUOUS CAPTURE STATUS
+==============================================================================
+  rounds captured        64
+  labelled               61
+  CONFIRMED (trainable)  61
+  LABEL_AMBIGUOUS        0  (excluded from training)
+  unresolved             3
+  label agreement        61/61 (100.0%)
+  chronological span     20260815T141000Z -> 20260815T211500Z (7.1h)
+  capture files          8  (12.7 GB)
+  index                  captures/continuous/INDEX.jsonl
+
+  GATE A READINESS (chronological TRAIN -> CALIBRATE -> FREEZE -> TEST)
+     100 trainable rounds  [##################            ] 61/100
+     200 trainable rounds  [#########                     ] 61/200
+     500 trainable rounds  [###                           ] 61/500
+
+  No q model may be fitted from this data until the approval gate.
+==============================================================================
+==============================================================================
+CONTINUOUS REAL BTC 5-MINUTE CAPTURE
+  RECORDER ONLY - no orders, no credentials, no private key.
+  code sha     fa1f09a9307373aed52ed9d0083f466ec3512caf  (DIRTY WORKING TREE)
+  pid          2707356   started 20260815T212034Z
+  python       3.12.3   recorder schema v2
+  batch size   8 rounds
+  output       captures/continuous/btc5m_<utc>.db
+  index        captures/continuous/INDEX.jsonl
+  until        interrupted
+==============================================================================
+
+[continuous] batch 1 starting at 20260815T212034Z

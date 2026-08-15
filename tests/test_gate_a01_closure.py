@@ -613,6 +613,16 @@ def test_a_dirty_working_tree_is_recorded_as_such():
     assert "recorder_code_dirty" in identity.as_dict()
 
 
+def test_the_dirty_flag_tracks_code_not_the_recorders_own_output():
+    """The recorder writes `captures/` while it runs. If that counted as a
+    dirty tree the flag would be true from the first batch onward and could
+    never distinguish an uncommitted code change from normal operation."""
+    from xamarinbot.realtime.identity import CODE_PATHS
+
+    assert "captures" not in CODE_PATHS
+    assert "src" in CODE_PATHS and "scripts" in CODE_PATHS
+
+
 def test_a_capture_round_trips_its_recorder_identity(tmp_path):
     raw = RawEventStore(str(tmp_path / "raw.db"))
     identity = RecorderIdentity.capture()
