@@ -265,14 +265,31 @@ def test_shadow_runner_24_7_reconnect_stability_survives_simulated_outage(eval_d
     result = runner.run()
 
     assert result.n_reconnects == len(disconnect_ts)
-    # decisions resume after the outage - not wedged, not truncated
     recorded_ts = {rec.decision_ts for rec in result.records}
-    assert recorded_ts.isdisjoint(disconnect_ts)
+
+    # Phase 12C item 10: an outage is RECORDED, not silently skipped - "a
+    # disconnect must not simply skip the decision while pretending existing
+    # resting orders remain safely supervised". Each disconnected decision
+    # point produces an explicit not-fresh, suppressed record placing no
+    # order, rather than vanishing from the decision stream.
+    assert disconnect_ts <= recorded_ts
+    outage_records = [rec for rec in result.records if rec.decision_ts in disconnect_ts]
+    assert len(outage_records) == len(disconnect_ts)
+    assert all(not rec.is_fresh for rec in outage_records)
+    assert all(rec.suppressed_by_freshness for rec in outage_records)
+    assert all(rec.action_id == "wait" and rec.qty == 0.0 for rec in outage_records)
+
+    # decisions resume after the outage - not wedged, not truncated
     later_ts = [t for t in all_ts if t > max(disconnect_ts)]
     assert any(t in recorded_ts for t in later_ts)
-    # the first decision right after an outage is flagged reconnected=True
-    first_after = min(t for t in recorded_ts if t > max(disconnect_ts))
-    assert next(rec for rec in result.records if rec.decision_ts == first_after).reconnected is True
+    # the first decision made on a RESTORED feed is flagged reconnected=True
+    # (the outage records themselves are the outage, not the recovery)
+    restored = [
+        rec for rec in sorted(result.records, key=lambda x: x.decision_ts)
+        if rec.decision_ts > max(disconnect_ts) and not rec.suppressed_by_freshness
+    ]
+    assert restored, "expected at least one normal decision after the outage"
+    assert restored[0].reconnected is True
 
 
 def test_shadow_runner_resolves_delayed_taker_orders_via_matched_ts_not_submit_ts(eval_dataset, feature_cfg, fee_config, one_step_cfg, trained_model):
@@ -464,7 +481,6 @@ def test_shadow_runner_dispatch_is_gated_by_aggregate_risk_view(eval_dataset, fe
         price=0.40, qty=5.0, ttl_s=600.0, expected_fill=2.5, delta_ev=1.0, g_after=0.0,
         pi_u_after=0.0, pi_d_after=0.0, violated_constraints=(),
     )
-    forced_decide = _forced_maker_then_wait_decide(forced_maker)
 
     def count_registrations(admits_return: bool) -> int:
         calls = {"n": 0}
@@ -473,6 +489,15 @@ def test_shadow_runner_dispatch_is_gated_by_aggregate_risk_view(eval_dataset, fe
         def spy_register(self, tracked):
             calls["n"] += 1
             return real_register(self, tracked)
+
+        # Phase 12C item 1 (test hygiene): build a FRESH forced-decision
+        # closure per invocation. `_forced_maker_then_wait_decide` carries
+        # a stateful `already_submitted` flag, so reusing one closure
+        # across the admits=True and admits=False runs made the second run
+        # return WAIT at every decision point - it would have "passed"
+        # with zero registrations no matter what RiskView did, testing
+        # nothing. Both branches must genuinely attempt the same candidate.
+        forced_decide = _forced_maker_then_wait_decide(forced_maker)
 
         with patch.object(exposure_mod.RiskView, "admits", return_value=admits_return), \
              patch.object(supervisor_mod.OrderSupervisor, "register", spy_register), \
@@ -497,9 +522,15 @@ def test_shadow_runner_controller_deadline_missed_falls_back_to_wait(eval_datase
     cfg = ShadowConfig(decision_deadline_ms=0.0)
     runner = ShadowRunner(store, r.round_id, r.p0, feature_cfg, fee_config, exec_cfg, one_step_cfg, trained_model, COMBINED_LEAD_LAG, cfg)
     result = runner.run()
-    assert len(result.records) > 0
-    assert result.n_missed_deadlines == len(result.records)
-    assert all(rec.missed_deadline and rec.action_id == "wait" for rec in result.records)
+    # Phase 12C item 10: the record stream now also contains decision points
+    # suppressed before the controller ever ran (missing/stale inputs), and
+    # those cannot "miss a deadline" they never started. The latency gate is
+    # asserted over exactly the decisions that DID run the controller.
+    ran = [rec for rec in result.records if not rec.suppressed_by_freshness]
+    assert len(ran) > 0
+    assert result.n_missed_deadlines == len(ran)
+    assert all(rec.missed_deadline and rec.action_id == "wait" for rec in ran)
+    assert all(rec.action_id == "wait" for rec in result.records)
 
 
 def test_shadow_runner_generous_deadline_never_misses(eval_dataset, feature_cfg, fee_config, exec_cfg, one_step_cfg, trained_model):

@@ -102,7 +102,19 @@ def compare_live_vs_replay(
     recv_ts-gated live view) against what the offline, event_time-gated
     replay would choose at the identical decision_ts - both against a
     frozen zero portfolio, per the module docstring."""
-    non_deadline_records = [r for r in shadow_records if not r.missed_deadline]
+    # Phase 12C item 10: a decision suppressed because an input was missing
+    # or stale is excluded for exactly the reason a deadline-missed decision
+    # is - its WAIT reflects the freshness gate, not the causal-view
+    # difference this report exists to isolate. Comparing it against
+    # offline's economically-chosen action would report a "mismatch" caused
+    # by the gate itself. (Offline replay, gated on event_time rather than
+    # recv_ts, can legitimately have enough history to compute features at a
+    # timestamp where the shadow does not - so these are not merely
+    # symmetric no-ops on both sides.)
+    non_deadline_records = [
+        r for r in shadow_records
+        if not r.missed_deadline and not r.suppressed_by_freshness
+    ]
     decision_ts_set = {r.decision_ts for r in non_deadline_records}
     offline = _offline_decisions_at(decision_ts_set, store, round_id, p0, feature_cfg, fee_config, exec_cfg, one_step_cfg, model, feature_set)
 

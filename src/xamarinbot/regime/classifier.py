@@ -60,6 +60,16 @@ class RegimeClassifier:
     _last_directional_action: SeedAction | None = field(default=None, init=False)
     _regime_start_ts: float | None = field(default=None, init=False)
 
+    @property
+    def current_state(self) -> RegimeState | None:
+        """The last classified state, or None before the first observation.
+
+        Added for Phase 12C item 10: when a decision point is reached with
+        stale or missing inputs, the runner still has to review its resting
+        orders, and it must do so against the last state it genuinely
+        classified rather than fabricating one."""
+        return self._state
+
     def observe(self, fv: FeatureVector) -> RegimeSnapshot:
         state = state_for(fv, self.cfg)
         seed_action = classify_seed_action(state)

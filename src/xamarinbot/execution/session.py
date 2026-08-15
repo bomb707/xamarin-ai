@@ -164,9 +164,29 @@ class TradingSession:
                 if replace_risk_view.admits(replacement.exposure, self.cfg.g_min, self.cfg.spend_cap, self.cfg.position_limit, is_recovery_candidate=is_recovery_purpose(tracked.purpose)):
                     result = self.supervisor.apply_replace(decision, decision_ts, self._next_order_id(), replacement.price, replacement.qty)
                     if result and result.new_order is not None:
+                        # Phase 12C item 12: a replacement is a NEW order
+                        # with a NEW thesis. Every field below comes from
+                        # the replacement's own re-evaluation at
+                        # `decision_ts`; none is inherited from the order
+                        # that was just canceled. Previously
+                        # `fair_value_at_submit` was copied straight off
+                        # `tracked` (the canceled order's stale fair value,
+                        # priced against a q that had since moved - which
+                        # is exactly the drift that triggered the REPLACE)
+                        # and `g_after_if_fill_at_submit` was `current.g_after`,
+                        # the re-evaluation of the OLD order's price/size
+                        # rather than the replacement's. Every downstream
+                        # cancel predicate the supervisor evaluates - edge
+                        # failure against `ev_at_submit`, risk breach
+                        # against `g_after_if_fill_at_submit`, fair-value
+                        # drift - was therefore being judged against a
+                        # thesis the new order never had.
                         self.supervisor.register(TrackedOrder(
-                            result.new_order, regime_state, tracked.purpose, q, tracked.fair_value_at_submit,
-                            current.g_after, replacement.delta_ev, replacement.ttl_s, decision_ts, decision_ts,
+                            result.new_order, regime_state, tracked.purpose,
+                            replacement.q, replacement.fair_value,
+                            replacement.g_after_if_fill, replacement.delta_ev,
+                            replacement.ttl_s, decision_ts, decision_ts,
+                            expected_delta_g_at_submit=replacement.expected_delta_g,
                         ))
                 # else: the replacement itself would breach aggregate risk
                 # - hold the original order rather than tear it up with
@@ -223,5 +243,6 @@ class TradingSession:
             self.supervisor.register(TrackedOrder(
                 order_state, regime_state, chosen.purpose, q, fair_value,
                 chosen.g_after, chosen.delta_ev, chosen.ttl_s or self.cfg.maker_horizon_s, decision_ts, decision_ts,
+                expected_delta_g_at_submit=chosen.expected_delta_g,
             ))
             self.n_maker_placed += 1

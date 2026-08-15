@@ -5,7 +5,7 @@ import json
 import sqlite3
 from typing import Any
 
-from xamarinbot.events.types import Event, EventType
+from xamarinbot.events.types import Event, EventType, causal_sort
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS events (
@@ -56,15 +56,16 @@ class EventStore:
         )
 
     def all_events(self, round_id: str | None = None) -> list[Event]:
-        """All events, deterministically ordered per Event.sort_key."""
+        """All events, deterministically ordered per `causal_sort` -
+        `Event.sort_key` plus Phase 12C item 13's per-order_id guarantee
+        that no FILL/CANCEL/ORDER_STATUS precedes its own ORDER_SUBMIT."""
         if round_id is None:
             rows = self._conn.execute("SELECT * FROM events").fetchall()
         else:
             rows = self._conn.execute(
                 "SELECT * FROM events WHERE round_id = ?", (round_id,)
             ).fetchall()
-        events = [self._row_to_event(row) for row in rows]
-        return sorted(events, key=lambda e: e.sort_key)
+        return causal_sort([self._row_to_event(row) for row in rows])
 
     def round_ids(self) -> list[str]:
         rows = self._conn.execute(

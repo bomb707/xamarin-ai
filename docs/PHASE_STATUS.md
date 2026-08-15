@@ -103,6 +103,72 @@ PYTHONPATH=src python scripts/run_shadow_demo.py [n_rounds]
 ```
 Tests: `PYTHONPATH=src pytest -q` (or `pip install -e .[dev]` first)
 
+## Phase 12C - Real Market Recorder and Event-Level Shadow Foundation
+
+**This is where the project changes character**: it stops designing around
+synthetic behavior and starts measuring the actual market. Tranche 2.2 was
+the final synthetic correctness closure; no further synthetic strategy
+optimization is performed, and no real orders are placed.
+
+| Area | Status | Notes |
+|---|---|---|
+| Market discovery + metadata (item 2) | Done, **live-verified** | [realtime/discovery.py](../src/xamarinbot/realtime/discovery.py). Dynamic per-round discovery of the `btc-up-or-down-5m` series; nothing hardcoded but the series slug pattern. Persists event/market id, condition_id, slug, question, rules, resolution source, start/end, UP/DOWN token ids, tick size, min order size, fee configuration, taker delay, and both raw payloads. |
+| CLOB market WebSocket adapter (item 3) | Done, **live-verified** | [realtime/clob_ws.py](../src/xamarinbot/realtime/clob_ws.py) + [feeds/polymarket_clob.py](../src/xamarinbot/feeds/polymarket_clob.py). Real in-memory book from the WS; REST only for bootstrap/resync/integrity. Fixed the `price_change` routing bug that silently discarded every book delta. |
+| RTDS reference feeds (item 4) | Done, **live-verified** | [realtime/rtds.py](../src/xamarinbot/realtime/rtds.py). One shared connection for Chainlink BTC/USD, Binance BTCUSDT, and Chainlink 30s/60s TWAP. No credentials. Chainlink observation time, RTDS publisher time, local wall and local monotonic receive times all preserved separately. |
+| Raw recorder layer (item 6) | Done | [realtime/raw_events.py](../src/xamarinbot/realtime/raw_events.py), [raw_store.py](../src/xamarinbot/realtime/raw_store.py), [recorder.py](../src/xamarinbot/realtime/recorder.py). Immutable append-only log, integer-nanosecond timestamps, verbatim wire payloads, bounded async queue + batched WAL writer. A dropped event disqualifies the interval for training. |
+| Pre-round history (item 7) | Done | `PRE_ROUND` lifecycle state, default 420s lead. Pre-round momentum/TWAP history comes from real observations, never approximated from `p0`. |
+| Round lifecycle (item 8) | Done | [realtime/lifecycle.py](../src/xamarinbot/realtime/lifecycle.py). DISCOVERED -> PRE_ROUND -> ACTIVE -> ENDED -> RESOLVED -> FINALIZED. |
+| Independent label reconstruction (items 5, 8) | Done | [realtime/label.py](../src/xamarinbot/realtime/label.py). Reconstructs under BOTH the market's declared settlement basis and the plain-Chainlink-reference basis, and compares each to Polymarket's own resolution. **See "Settlement rule discrepancy" below.** |
+| ShadowRunner tau/sigma (item 9) | Done | `tau=fv.tau, sigma=fv.realized_vol` passed explicitly; dynamic maker mode can no longer silently run with `tau=None, sigma=0` while real values exist. |
+| Real freshness (item 10) | Done | [realtime/freshness.py](../src/xamarinbot/realtime/freshness.py). Replaces the hardcoded `is_fresh=True`. Computed from source timestamps. Stale/missing input -> no new ALPHA, resting orders reviewed against an explicitly stale view, explicit reason recorded. |
+| Maker-fill counterfactuals (item 11) | Done | [realtime/counterfactual.py](../src/xamarinbot/realtime/counterfactual.py). Records the evidence needed to LATER estimate `rho` and `q_fill` from real data. **No fill probability is fitted in this phase.** |
+| Replacement provenance (item 12) | Done | `ReplacementPlan` carries its own `g_after_if_fill`/`fair_value`/`q`; the replacement `TrackedOrder` no longer inherits the canceled order's stale thesis. |
+| Own-order event ordering (item 13) | Done | [events/types.py](../src/xamarinbot/events/types.py)'s `causal_sort`. A FILL/CANCEL/ORDER_STATUS can never precede its own ORDER_SUBMIT, and no causal fact is fabricated between two external events sharing a timestamp. |
+| Authenticated trading (item 14) | **Deliberately not implemented** | No private key, no order, cancel or replacement is ever sent. Recorder + paper shadow only. |
+| Real integration capture (item 15) | Done | See [REAL_RECORDER_STATUS.md](REAL_RECORDER_STATUS.md) for the captured sample and its integrity verdict. |
+
+Docs: [REAL_RECORDER_ARCHITECTURE.md](REAL_RECORDER_ARCHITECTURE.md) (design
++ the full live-verification log), [REAL_DATA_SCHEMA.md](REAL_DATA_SCHEMA.md)
+(recorder schema), [REAL_RECORDER_STATUS.md](REAL_RECORDER_STATUS.md)
+(capture results).
+
+```
+# inspect the live market metadata for the next rounds (read-only, no capture)
+PYTHONPATH=src python scripts/run_market_discovery.py --rounds 2
+
+# capture N consecutive real rounds (NO ORDERS ARE PLACED)
+PYTHONPATH=src python scripts/run_real_recorder.py --rounds 3 --db captures/run1.db
+
+# fill in venue resolutions + label agreement afterwards (settlement lands
+# 3-8 min after a round closes, long after the recorder has finalized it)
+PYTHONPATH=src python scripts/resolve_capture_labels.py captures/run1.db
+```
+
+`run_real_recorder.py` exits non-zero when the capture is not training-grade
+(any dropped event, parse failure, or book-integrity mismatch), so a cron or
+CI invocation surfaces a bad capture instead of silently banking it.
+
+### Settlement rule discrepancy (unresolved by design, pending the approval gate)
+
+The Phase 12C brief states the BTC five-minute rule as
+`UP <=> ChainlinkBTC_end >= ChainlinkBTC_start` against the **plain
+Chainlink reference price**, with TWAP as a predictive feature only.
+
+Every live BTC 5-minute market inspected on 2026-08-15 declares otherwise:
+
+```
+"cryptoMarketConfigId": "btc-5m-twap-60",
+"cryptoMarketConfig": {"twapEnabled": true, "twapLookbackSeconds": 60},
+"resolutionSource": "https://data.chain.link/streams/btc-usd-twap-60s-streams"
+```
+
+with a rules description that resolves on the Chainlink **TWAP** over the
+window. The recorder does not choose between these readings. It
+reconstructs the label under both bases every round and reports both
+agreement rates, so which basis actually reproduces Polymarket's
+resolutions is an empirical result of the capture rather than an assumption.
+Binance is never used as a settlement basis under either reading.
+
 ## Not yet implemented (future work)
 
 | Phase | What it needs |
@@ -795,20 +861,23 @@ move within the window. The repricing logic itself is verified directly in
 differ between submission and revalidation. Sub-second synthetic tick
 granularity would be needed to see repricing in the demo's own output.
 
-## Live adapter confidence (Phase 1)
+## Live adapter confidence
 
-Endpoints/message shapes were pulled from docs.polymarket.com directly
-(2026-08-13) rather than guessed, but confidence varies by adapter -
-**verify against a live response before trusting any of these in
-production**:
+**Superseded for the market/reference adapters by Phase 12C
+(2026-08-15).** The table below was written when endpoints were taken from
+docs.polymarket.com (2026-08-13) without a live call. Phase 12C verified
+them against the live services and found several doc-vs-reality
+discrepancies - see `docs/REAL_RECORDER_ARCHITECTURE.md` SS1 for the full
+verification log.
 
 | Adapter | Confidence | Caveat |
 |---|---|---|
-| `feeds/polymarket_clob.py` - book snapshot (REST) + market channel (WSS) | High | Endpoint, subscribe message, and event shapes (`book`/`price_change`/`tick_size_change`) confirmed from current docs. |
-| `feeds/polymarket_clob.py` - market metadata (`get_market_config`) | Medium | Gamma API endpoint/fields confirmed, but `UP`/`DOWN` token-to-outcome mapping is **not implemented** (raises `NotImplementedError`) - the fetched docs excerpt didn't confirm the outcomes field name/order, and guessing token order wrong in a trading system is worse than failing loudly. |
-| `feeds/polymarket_user.py` - order/fill WSS stream | High (WSS) / Unconfirmed (REST) | Auth/subscribe/message shapes confirmed. `open_orders()`/`reconcile()`'s REST fallback path is unverified - only the WSS path was checked against current docs. |
-| `feeds/chainlink_twap.py` | Low | REST/WSS base URLs and report field names came from docs.polymarket.com, but Chainlink Data Streams' actual auth/subscription handshake was not in that excerpt (it normally requires HMAC-signed requests). `auth_headers` is a pluggable, caller-supplied dict, not a working implementation. |
-| `feeds/spot_composite.py` | High | Coinbase/Binance public spot-price REST endpoints are standard, stable, well-known APIs - lower integration risk than the Polymarket/Chainlink-specific pieces above. |
+| `realtime/clob_ws.py` + `feeds/polymarket_clob.py` - market channel + in-memory book | **Verified live (2026-08-15)** | Subscribe message, `custom_feature_enabled` gating, and `book`/`price_change`/`last_trade_price`/`best_bid_ask`/`new_market`/`tick_size_change` shapes all confirmed against the live socket. Fixed a routing bug that discarded 100% of book deltas (`price_change` has no top-level `asset_id`). |
+| `realtime/discovery.py` - market metadata | **Verified live (2026-08-15)** | Gamma + CLOB market-info; UP/DOWN from explicit `tokens[].outcome` labels cross-checked against Gamma `outcomes`. The old `NotImplementedError` mapping gap is closed. Found that Gamma `startDate` is the row-creation time, ~24h before the true round start. |
+| `realtime/rtds.py` - Chainlink reference / TWAP-30 / TWAP-60 / Binance | **Verified live (2026-08-15)** | One shared connection, no credentials. Found that the documented dotted topic aliases are rejected and that `filters` suppresses live delivery; subscribes unfiltered and filters client-side. |
+| `feeds/chainlink_twap.py` | Low - **superseded, do not use** | Chainlink Data Streams direct integration with an unverified HMAC handshake. Polymarket's own documentation recommends RTDS for production Chainlink TWAP, and `realtime/rtds.py` implements that with no credentials required. Kept only so the `TWAPFeed` interface has a direct-vendor reference implementation. |
+| `feeds/polymarket_user.py` - order/fill WSS stream | High (WSS) / Unconfirmed (REST) | **Not exercised in Phase 12C** - no authenticated trading occurs (item 14). Still unverified against a live authenticated session. |
+| `feeds/spot_composite.py` | High | Coinbase/Binance public spot-price REST endpoints. Superseded as the BTC leading signal by RTDS Binance, which arrives on the same socket as the reference feeds with a provider timestamp. |
 
 ## Before real historical data or live trading
 

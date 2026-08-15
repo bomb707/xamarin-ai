@@ -48,6 +48,14 @@ class TrackedOrder:
     ttl_s: float | None
     submit_ts: float
     last_action_ts: float
+    # Phase 12C item 12: the fill-probability-weighted MARGINAL risk
+    # contribution this order was accepted on (`rho * dG` for a maker),
+    # distinct from `g_after_if_fill_at_submit`, which is the ABSOLUTE
+    # if-filled level the hard safety check uses. Both are part of the
+    # thesis, and a REPLACE must record the replacement's own value for
+    # each rather than inheriting the canceled order's. Defaults to 0.0 so
+    # existing positional constructions are unaffected.
+    expected_delta_g_at_submit: float = 0.0
 
     @property
     def order_id(self) -> str:

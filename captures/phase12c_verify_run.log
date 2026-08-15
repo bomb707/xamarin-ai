@@ -1,0 +1,202 @@
+[recorder] session cap-1786777326-c34d359b
+[recorder] writing to captures/phase12c_verify.db
+[recorder] capturing 1 round(s); NO ORDERS WILL BE PLACED
+[btc-updown-5m-1786777800] metadata warning: gamma startDate (2026-08-14T07:18:44.857452Z) is the row-creation time, 85875s before the true round start; not used as the round start
+[service] 1786777800=DISCOVERED | events rx=1 persisted=1 queue=0 dropped=0 reconnects=0
+[service] 1786777800=DISCOVERED | events rx=148 persisted=148 queue=0 dropped=0 reconnects=0
+[btc-updown-5m-1786777800] DISCOVERED -> PRE_ROUND
+[service] 1786777800=PRE_ROUND | events rx=307 persisted=307 queue=0 dropped=0 reconnects=0
+[service] 1786777800=PRE_ROUND | events rx=480 persisted=480 queue=0 dropped=0 reconnects=0
+[service] 1786777800=PRE_ROUND | events rx=640 persisted=640 queue=0 dropped=0 reconnects=0
+[service] 1786777800=PRE_ROUND | events rx=690 persisted=690 queue=0 dropped=0 reconnects=0
+[service] 1786777800=PRE_ROUND | events rx=1038 persisted=1038 queue=0 dropped=0 reconnects=1
+[service] 1786777800=PRE_ROUND | events rx=1717 persisted=1717 queue=0 dropped=0 reconnects=1
+[service] 1786777800=PRE_ROUND | events rx=1924 persisted=1924 queue=0 dropped=0 reconnects=1
+[service] 1786777800=PRE_ROUND | events rx=2475 persisted=2475 queue=0 dropped=0 reconnects=1
+[service] 1786777800=PRE_ROUND | events rx=2776 persisted=2776 queue=0 dropped=0 reconnects=1
+[service] 1786777800=PRE_ROUND | events rx=3229 persisted=3229 queue=0 dropped=0 reconnects=1
+[service] 1786777800=PRE_ROUND | events rx=3813 persisted=3813 queue=0 dropped=0 reconnects=1
+[service] 1786777800=PRE_ROUND | events rx=4099 persisted=4099 queue=0 dropped=0 reconnects=1
+[service] 1786777800=PRE_ROUND | events rx=4781 persisted=4769 queue=0 dropped=0 reconnects=1
+[service] 1786777800=PRE_ROUND | events rx=5489 persisted=5443 queue=0 dropped=0 reconnects=1
+[btc-updown-5m-1786777800] PRE_ROUND -> ACTIVE
+[service] 1786777800=ACTIVE | events rx=12438 persisted=12377 queue=1 dropped=0 reconnects=1
+[service] 1786777800=ACTIVE | events rx=29926 persisted=29836 queue=0 dropped=0 reconnects=1
+[service] 1786777800=ACTIVE | events rx=54422 persisted=54317 queue=1 dropped=0 reconnects=1
+[service] 1786777800=ACTIVE | events rx=81699 persisted=81551 queue=0 dropped=0 reconnects=1
+[service] 1786777800=ACTIVE | events rx=107996 persisted=107832 queue=0 dropped=0 reconnects=1
+[service] 1786777800=ACTIVE | events rx=129097 persisted=128911 queue=0 dropped=0 reconnects=1
+[service] 1786777800=ACTIVE | events rx=146185 persisted=145979 queue=0 dropped=0 reconnects=1
+[service] 1786777800=ACTIVE | events rx=162552 persisted=162328 queue=0 dropped=0 reconnects=1
+[service] 1786777800=ACTIVE | events rx=174051 persisted=173823 queue=0 dropped=0 reconnects=1
+[service] 1786777800=ACTIVE | events rx=180833 persisted=180605 queue=0 dropped=0 reconnects=1
+[btc-updown-5m-1786777800] ACTIVE -> ENDED
+[service] 1786777800=ENDED | events rx=187428 persisted=187198 queue=0 dropped=0 reconnects=1
+[service] 1786777800=ENDED | events rx=188760 persisted=188527 queue=0 dropped=0 reconnects=1
+[service] 1786777800=ENDED | events rx=190025 persisted=189789 queue=0 dropped=0 reconnects=1
+[btc-updown-5m-1786777800] ENDED -> FINALIZED
+[resolve] 1 round(s) awaiting the venue's resolution
+[resolve] btc-updown-5m-1786777800 -> UP (gamma_outcome_prices); declared_agrees=True reference_agrees=True
+
+==============================================================================
+PHASE 12C - REAL CAPTURE SAMPLE REPORT
+Data integrity only. No profitability claim is made or implied.
+==============================================================================
+
+MARKET IDS / TIME WINDOWS
+------------------------------------------------------------------------------
+  btc-updown-5m-1786777800
+    condition_id     0xb1487da9c80dd63652ed787272b792ebc08c6a040f2742d27e4407d5dfe307e2
+    question         Bitcoin Up or Down - August 15, 3:10AM-3:15AM ET
+    window           1786777800 -> 1786778100  (300s)
+    settlement       chainlink_twap (twap_window=60)
+    resolution src   https://data.chain.link/streams/btc-usd-twap-60s-streams
+    tick / min size  0.01 / 5.0
+    fee rate         0.07 (type=crypto_fees_v2)
+    taker delay      0.0 ms
+    lifecycle        FINALIZED
+    ! warning        gamma startDate (2026-08-14T07:18:44.857452Z) is the row-creation time, 85875s before the true round start; not used as the round start
+    ! note           no venue resolution observed within 90s of round end; finalized without a reported outcome
+    ! note           no market_resolved event captured on the market channel
+
+TOKEN / OUTCOME MAPPING SUCCESS
+------------------------------------------------------------------------------
+  btc-updown-5m-1786777800: OK via clob_market_info+gamma_outcomes
+    UP   108778354035599428495716998272809117393977264312292023985762626121364830351964
+    DOWN 46682689473302979302191826243196512490864717204887815321776336457146623254956
+  mapped 1/1 rounds from EXPLICIT outcome labels (never token index order)
+
+EVENTS PER STREAM
+------------------------------------------------------------------------------
+  btc-updown-5m-1786777800  (total persisted 189846)
+    clob_market:best_bid_ask                         4404
+    clob_market:book                                 3142
+    clob_market:last_trade_price                     1487
+    clob_market:price_change                         177570
+    clob_market:tick_size_change                     4
+    clob_rest:book_snapshot_rest                     2
+    market_metadata:clob_market_info_resolution      2
+    market_metadata:market_metadata_discovered       1
+    market_metadata:market_metadata_final            1
+    market_metadata:market_metadata_poll             1
+    market_metadata:market_metadata_resolution       2
+    recorder_control:book_integrity_check            10
+    recorder_control:label_reconstruction            1
+    recorder_control:label_reconstruction_resolved   1
+    recorder_control:lifecycle_transition            4
+    recorder_control:reconnect                       1
+    recorder_control:stream_stalled                  1
+    rtds_binance:update                              833
+    rtds_chainlink:update                            793
+    rtds_twap_30:update                              793
+    rtds_twap_60:update                              793
+
+BOOK SNAPSHOTS / DELTAS / TRADES
+------------------------------------------------------------------------------
+  btc-updown-5m-1786777800: ws_snapshots=3142 rest_snapshots=2 deltas=177570 trades=1487 best_bid_ask=4404
+
+REFERENCE FEED UPDATES
+------------------------------------------------------------------------------
+  btc-updown-5m-1786777800
+    Chainlink reference updates     793  span=   862.0s  pre-round=426
+    TWAP-30 updates                 793  span=   862.0s  pre-round=426
+    TWAP-60 updates                 793  span=   862.0s  pre-round=426
+    Binance updates                 833  span=   863.0s  pre-round=442
+
+PRE-ROUND HISTORY COVERAGE (item 7)
+------------------------------------------------------------------------------
+  btc-updown-5m-1786777800: configured lead 420s
+    Chainlink reference updates     426 pre-round obs, earliest   474.0s before open  [OK]
+    TWAP-30 updates                 426 pre-round obs, earliest   474.0s before open  [OK]
+    TWAP-60 updates                 426 pre-round obs, earliest   474.0s before open  [OK]
+    Binance updates                 442 pre-round obs, earliest   473.0s before open  [OK]
+
+LATENCY DISTRIBUTIONS
+------------------------------------------------------------------------------
+  source->recv       n=190127   p50=12.7ms p95=35.9ms p99=1562.3ms max=2777.3ms
+  publisher->recv    n=3213     p50=277.2ms p95=432.1ms p99=483.0ms max=637.1ms
+  source->recv includes the oracle/venue's own publication delay;
+  publisher->recv isolates the hop this system could influence.
+
+RECORDER HEALTH
+------------------------------------------------------------------------------
+  events_received              190167
+  events_persisted             189922
+  queue_high_water             428
+  dropped_events               0
+  parse_failures               0
+  duplicate_events             245
+  reconnect_count              1
+  resnapshot_count             2
+  book_integrity_checks        10
+  book_integrity_mismatches    0
+  freshness_failures           0
+  suspect_intervals            0
+
+STREAM CONTINUITY
+------------------------------------------------------------------------------
+  ! STALL  rtds silent for 30s (threshold 30.0s) -> forced reconnect
+  A stalled socket that never raises is the worst failure mode for a
+  recorder: it produces a clean-looking capture with missing data. Each
+  stall above was detected by the watchdog and reconnected, and the
+  affected interval should be checked for a reference-data gap.
+
+BOOK-INTEGRITY CHECKS (in-memory vs REST resnapshot)
+------------------------------------------------------------------------------
+  btc-updown-5m-1786777800 1087783540355994... MATCH: top-of-book agrees
+  btc-updown-5m-1786777800 4668268947330297... MATCH: top-of-book agrees
+  btc-updown-5m-1786777800 1087783540355994... MATCH: top-of-book agrees
+  btc-updown-5m-1786777800 4668268947330297... MATCH: top-of-book agrees
+  btc-updown-5m-1786777800 1087783540355994... MATCH: top-of-book agrees
+  btc-updown-5m-1786777800 4668268947330297... MATCH: top-of-book agrees
+  btc-updown-5m-1786777800 1087783540355994... MATCH: top-of-book agrees
+  btc-updown-5m-1786777800 4668268947330297... MATCH: top-of-book agrees
+  btc-updown-5m-1786777800 1087783540355994... MATCH: top-of-book agrees
+  btc-updown-5m-1786777800 4668268947330297... MATCH: top-of-book agrees
+  A mismatch marks the interval suspect, triggers a resnapshot, and writes a
+  reconciliation event; it never silently continues.
+
+LABEL RECONSTRUCTION
+------------------------------------------------------------------------------
+  Reconstructed independently as  y_hat = UP if P_end >= P_start else DOWN,
+  under BOTH the basis the market metadata declares AND the plain
+  Chainlink-reference basis, then compared to Polymarket's own resolution.
+
+  btc-updown-5m-1786777800
+    reported by venue     UP (gamma_outcome_prices)
+    [declared ] topic=crypto_prices_twap_sixty
+        P_start=63010.5350 P_end=63061.8821 -> UP
+        boundary offsets: start=0.00s end=0.00s
+        P_end=63061.88210515432 >= P_start=63010.53498847699
+    [reference] topic=crypto_prices_chainlink
+        P_start=63010.4031 P_end=63066.2320 -> UP
+        boundary offsets: start=0.00s end=0.00s
+        P_end=63066.232023095836 >= P_start=63010.40313901463
+    declared agrees=True  reference agrees=True  bases agree with each other=True
+
+  AGREEMENT SUMMARY
+    rounds                               1
+    declared_basis_agreed                1
+    declared_basis_comparable            1
+    declared_basis_agreement_rate        1.000
+    reference_basis_agreed               1
+    reference_basis_comparable           1
+    reference_basis_agreement_rate       1.000
+    bases_agreed_with_each_other         1
+    bases_comparable                     1
+    bases_agreement_rate                 1.000
+    labels_reproducible                  True
+
+VERDICT
+------------------------------------------------------------------------------
+  training-grade interval: True
+  labels reproducible:     True
+
+  NOT ASSESSED IN THIS PHASE (deliberately): fill probability, q_fill,
+  strategy parameters, profitability. No model was fit and no parameter
+  was tuned from this capture.
+==============================================================================
+
+[recorder] wall-clock 16.1 min, 189922 raw events in captures/phase12c_verify.db
+[recorder] report written to captures/phase12c_verify_report.txt
+[recorder] metrics written to captures/phase12c_verify_metrics.json

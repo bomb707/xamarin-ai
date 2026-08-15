@@ -1,0 +1,265 @@
+==============================================================================
+PHASE 12C - REAL CAPTURE SAMPLE REPORT
+Data integrity only. No profitability claim is made or implied.
+==============================================================================
+
+MARKET IDS / TIME WINDOWS
+------------------------------------------------------------------------------
+  btc-updown-5m-1786773900
+    condition_id     0x0ce20be5269ef61a6799ea97a4a99431c1817f42de0c80534613316794dfe9ac
+    question         Bitcoin Up or Down - August 15, 2:05AM-2:10AM ET
+    window           1786773900 -> 1786774200  (300s)
+    settlement       chainlink_twap (twap_window=60)
+    resolution src   https://data.chain.link/streams/btc-usd-twap-60s-streams
+    tick / min size  0.01 / 5.0
+    fee rate         0.07 (type=crypto_fees_v2)
+    taker delay      0.0 ms
+    lifecycle        FINALIZED
+    ! warning        gamma startDate (2026-08-14T06:13:36.230313Z) is the row-creation time, 85884s before the true round start; not used as the round start
+    ! note           no venue resolution observed within 90s of round end; finalized without a reported outcome
+    ! note           no market_resolved event captured on the market channel
+  btc-updown-5m-1786774200
+    condition_id     0x8ab085cc1a8c19cb8ce36008f69a9cd6fd08c423d930aee32b46e3222e44b885
+    question         Bitcoin Up or Down - August 15, 2:10AM-2:15AM ET
+    window           1786774200 -> 1786774500  (300s)
+    settlement       chainlink_twap (twap_window=60)
+    resolution src   https://data.chain.link/streams/btc-usd-twap-60s-streams
+    tick / min size  0.01 / 5.0
+    fee rate         0.07 (type=crypto_fees_v2)
+    taker delay      0.0 ms
+    lifecycle        FINALIZED
+    ! warning        gamma startDate (2026-08-14T06:18:41.00728Z) is the row-creation time, 85879s before the true round start; not used as the round start
+    ! note           no venue resolution observed within 90s of round end; finalized without a reported outcome
+    ! note           no market_resolved event captured on the market channel
+  btc-updown-5m-1786774500
+    condition_id     0xf6d1db83bce9e79e17d27b45142c0f64556f768f7444489367f18d6f21048fd9
+    question         Bitcoin Up or Down - August 15, 2:15AM-2:20AM ET
+    window           1786774500 -> 1786774800  (300s)
+    settlement       chainlink_twap (twap_window=60)
+    resolution src   https://data.chain.link/streams/btc-usd-twap-60s-streams
+    tick / min size  0.01 / 5.0
+    fee rate         0.07 (type=crypto_fees_v2)
+    taker delay      0.0 ms
+    lifecycle        FINALIZED
+    ! warning        gamma startDate (2026-08-14T06:23:08.99584Z) is the row-creation time, 85911s before the true round start; not used as the round start
+    ! note           no venue resolution observed within 90s of round end; finalized without a reported outcome
+    ! note           no market_resolved event captured on the market channel
+
+TOKEN / OUTCOME MAPPING SUCCESS
+------------------------------------------------------------------------------
+  btc-updown-5m-1786773900: OK via clob_market_info+gamma_outcomes
+    UP   23554857378749348625442201839332642176667246755974766934516248799119273376205
+    DOWN 35644649070756659334213250420464670110878777003690299291470242928238582451860
+  btc-updown-5m-1786774200: OK via clob_market_info+gamma_outcomes
+    UP   28767321829610434877147548458508977649297316099419148249057541869300340646877
+    DOWN 59710643673296556852103867660754064372453965936269246750674295719430989836968
+  btc-updown-5m-1786774500: OK via clob_market_info+gamma_outcomes
+    UP   15495873162163232512506920707328928701501480278392287787219895763935026019310
+    DOWN 80276300391025831306905168436867500206472791921158713072806841084152093133768
+  mapped 3/3 rounds from EXPLICIT outcome labels (never token index order)
+
+EVENTS PER STREAM
+------------------------------------------------------------------------------
+  btc-updown-5m-1786773900  (total persisted 173796)
+    clob_market:best_bid_ask                         3282
+    clob_market:book                                 2246
+    clob_market:last_trade_price                     1097
+    clob_market:price_change                         167147
+    clob_market:tick_size_change                     2
+    clob_rest:book_snapshot_rest                     2
+    market_metadata:market_metadata_discovered       1
+    market_metadata:market_metadata_final            1
+    market_metadata:market_metadata_poll             3
+    recorder_control:book_integrity_check            10
+    recorder_control:label_reconstruction            1
+    recorder_control:lifecycle_transition            4
+  btc-updown-5m-1786774200  (total persisted 154149)
+    clob_market:best_bid_ask                         3242
+    clob_market:book                                 2330
+    clob_market:last_trade_price                     1121
+    clob_market:price_change                         147434
+    clob_market:tick_size_change                     2
+    clob_rest:book_snapshot_rest                     2
+    market_metadata:market_metadata_discovered       1
+    market_metadata:market_metadata_final            1
+    market_metadata:market_metadata_poll             3
+    recorder_control:book_integrity_check            8
+    recorder_control:label_reconstruction            1
+    recorder_control:lifecycle_transition            4
+  btc-updown-5m-1786774500  (total persisted 208123)
+    clob_market:best_bid_ask                         5044
+    clob_market:book                                 3254
+    clob_market:last_trade_price                     1582
+    clob_market:price_change                         198220
+    clob_market:tick_size_change                     2
+    clob_rest:book_snapshot_rest                     2
+    market_metadata:market_metadata_discovered       1
+    market_metadata:market_metadata_final            1
+    market_metadata:market_metadata_poll             2
+    recorder_control:book_integrity_check            10
+    recorder_control:label_reconstruction            1
+    recorder_control:lifecycle_transition            4
+
+BOOK SNAPSHOTS / DELTAS / TRADES
+------------------------------------------------------------------------------
+  btc-updown-5m-1786773900: ws_snapshots=2246 rest_snapshots=2 deltas=167147 trades=1097 best_bid_ask=3282
+  btc-updown-5m-1786774200: ws_snapshots=2330 rest_snapshots=2 deltas=147434 trades=1121 best_bid_ask=3242
+  btc-updown-5m-1786774500: ws_snapshots=3254 rest_snapshots=2 deltas=198220 trades=1582 best_bid_ask=5044
+
+REFERENCE FEED UPDATES
+------------------------------------------------------------------------------
+  btc-updown-5m-1786773900
+    Chainlink reference updates     457  span=   481.0s  pre-round=93
+    TWAP-30 updates                 458  span=   481.0s  pre-round=93
+    TWAP-60 updates                 455  span=   481.0s  pre-round=93
+    Binance updates                 483  span=   483.0s  pre-round=93
+  btc-updown-5m-1786774200
+    Chainlink reference updates     653  span=   688.0s  pre-round=370
+    TWAP-30 updates                 654  span=   688.0s  pre-round=371
+    TWAP-60 updates                 651  span=   688.0s  pre-round=369
+    Binance updates                 689  span=   689.0s  pre-round=392
+  btc-updown-5m-1786774500
+    Chainlink reference updates     653  span=   688.0s  pre-round=653
+    TWAP-30 updates                 654  span=   688.0s  pre-round=654
+    TWAP-60 updates                 651  span=   688.0s  pre-round=651
+    Binance updates                 689  span=   689.0s  pre-round=689
+
+PRE-ROUND HISTORY COVERAGE (item 7)
+------------------------------------------------------------------------------
+  btc-updown-5m-1786773900: configured lead 420s
+    Chainlink reference updates      93 pre-round obs, earliest    94.0s before open  [SHORT]
+    TWAP-30 updates                  93 pre-round obs, earliest    94.0s before open  [SHORT]
+    TWAP-60 updates                  93 pre-round obs, earliest    94.0s before open  [SHORT]
+    Binance updates                  93 pre-round obs, earliest    93.0s before open  [SHORT]
+  btc-updown-5m-1786774200: configured lead 420s
+    Chainlink reference updates     370 pre-round obs, earliest   394.0s before open  [OK]
+    TWAP-30 updates                 371 pre-round obs, earliest   394.0s before open  [OK]
+    TWAP-60 updates                 369 pre-round obs, earliest   394.0s before open  [OK]
+    Binance updates                 392 pre-round obs, earliest   393.0s before open  [OK]
+  btc-updown-5m-1786774500: configured lead 420s
+    Chainlink reference updates     653 pre-round obs, earliest   694.0s before open  [OK]
+    TWAP-30 updates                 654 pre-round obs, earliest   694.0s before open  [OK]
+    TWAP-60 updates                 651 pre-round obs, earliest   694.0s before open  [OK]
+    Binance updates                 689 pre-round obs, earliest   693.0s before open  [OK]
+
+LATENCY DISTRIBUTIONS
+------------------------------------------------------------------------------
+  source->recv       n=539451   p50=13.7ms p95=21.5ms p99=147.9ms max=2918.1ms
+  publisher->recv    n=2647     p50=298.7ms p95=439.6ms p99=477.0ms max=517.1ms
+  source->recv includes the oracle/venue's own publication delay;
+  publisher->recv isolates the hop this system could influence.
+
+RECORDER HEALTH
+------------------------------------------------------------------------------
+  events_received              539529
+  events_persisted             538761
+  queue_high_water             472
+  dropped_events               0
+  parse_failures               0
+  duplicate_events             768
+  reconnect_count              0
+  resnapshot_count             6
+  book_integrity_checks        30
+  book_integrity_mismatches    0
+  freshness_failures           0
+  suspect_intervals            0
+
+BOOK-INTEGRITY CHECKS (in-memory vs REST resnapshot)
+------------------------------------------------------------------------------
+  btc-updown-5m-1786773900 2355485737874934... MATCH: top-of-book agrees
+  btc-updown-5m-1786773900 3564464907075665... MATCH: top-of-book agrees
+  btc-updown-5m-1786773900 2355485737874934... MATCH: top-of-book agrees
+  btc-updown-5m-1786773900 3564464907075665... MATCH: top-of-book agrees
+  btc-updown-5m-1786773900 2355485737874934... MATCH: top-of-book agrees
+  btc-updown-5m-1786773900 3564464907075665... MATCH: top-of-book agrees
+  btc-updown-5m-1786773900 2355485737874934... MATCH: top-of-book agrees
+  btc-updown-5m-1786773900 3564464907075665... MATCH: top-of-book agrees
+  btc-updown-5m-1786773900 2355485737874934... MATCH: top-of-book agrees
+  btc-updown-5m-1786773900 3564464907075665... MATCH: top-of-book agrees
+  btc-updown-5m-1786774200 2876732182961043... MATCH: top-of-book agrees
+  btc-updown-5m-1786774200 5971064367329655... MATCH: top-of-book agrees
+  btc-updown-5m-1786774200 2876732182961043... MATCH: top-of-book agrees
+  btc-updown-5m-1786774200 5971064367329655... MATCH: top-of-book agrees
+  btc-updown-5m-1786774200 2876732182961043... MATCH: top-of-book agrees
+  btc-updown-5m-1786774200 5971064367329655... MATCH: top-of-book agrees
+  btc-updown-5m-1786774200 2876732182961043... MATCH: top-of-book agrees
+  btc-updown-5m-1786774200 5971064367329655... MATCH: top-of-book agrees
+  btc-updown-5m-1786774200 2876732182961043... MATCH: top-of-book agrees
+  btc-updown-5m-1786774200 5971064367329655... MATCH: top-of-book agrees
+  btc-updown-5m-1786774500 1549587316216323... MATCH: top-of-book agrees
+  btc-updown-5m-1786774500 8027630039102583... MATCH: top-of-book agrees
+  btc-updown-5m-1786774500 1549587316216323... MATCH: top-of-book agrees
+  btc-updown-5m-1786774500 8027630039102583... MATCH: top-of-book agrees
+  btc-updown-5m-1786774500 1549587316216323... MATCH: top-of-book agrees
+  btc-updown-5m-1786774500 8027630039102583... MATCH: top-of-book agrees
+  btc-updown-5m-1786774500 1549587316216323... MATCH: top-of-book agrees
+  btc-updown-5m-1786774500 8027630039102583... MATCH: top-of-book agrees
+  btc-updown-5m-1786774500 1549587316216323... MATCH: top-of-book agrees
+  btc-updown-5m-1786774500 8027630039102583... MATCH: top-of-book agrees
+  A mismatch marks the interval suspect, triggers a resnapshot, and writes a
+  reconciliation event; it never silently continues.
+
+LABEL RECONSTRUCTION
+------------------------------------------------------------------------------
+  Reconstructed independently as  y_hat = UP if P_end >= P_start else DOWN,
+  under BOTH the basis the market metadata declares AND the plain
+  Chainlink-reference basis, then compared to Polymarket's own resolution.
+
+  btc-updown-5m-1786773900
+    reported by venue     NONE (n/a)
+    [declared ] topic=crypto_prices_twap_sixty
+        P_start=63022.3702 P_end=63025.2618 -> UP
+        boundary offsets: start=0.00s end=0.00s
+        P_end=63025.261780120396 >= P_start=63022.370216335665
+    [reference] topic=crypto_prices_chainlink
+        P_start=63022.1793 P_end=63025.0424 -> UP
+        boundary offsets: start=0.00s end=0.00s
+        P_end=63025.04243936285 >= P_start=63022.179278861164
+    declared agrees=None  reference agrees=None  bases agree with each other=True
+  btc-updown-5m-1786774200
+    reported by venue     NONE (n/a)
+    [declared ] topic=crypto_prices_twap_sixty
+        P_start=63025.2618 P_end=n/a -> UNRECONSTRUCTED
+        boundary offsets: start=0.00s end=n/as
+        cannot reconstruct: missing boundary observation for end (none at or after)
+    [reference] topic=crypto_prices_chainlink
+        P_start=63025.0424 P_end=n/a -> UNRECONSTRUCTED
+        boundary offsets: start=0.00s end=n/as
+        cannot reconstruct: missing boundary observation for end (none at or after)
+    declared agrees=None  reference agrees=None  bases agree with each other=None
+  btc-updown-5m-1786774500
+    reported by venue     NONE (n/a)
+    [declared ] topic=crypto_prices_twap_sixty
+        P_start=n/a P_end=n/a -> UNRECONSTRUCTED
+        boundary offsets: start=6.00s end=n/as
+        cannot reconstruct: missing boundary observation for start (nearest offset 6.0s), end (none at or after)
+    [reference] topic=crypto_prices_chainlink
+        P_start=n/a P_end=n/a -> UNRECONSTRUCTED
+        boundary offsets: start=6.00s end=n/as
+        cannot reconstruct: missing boundary observation for start (nearest offset 6.0s), end (none at or after)
+    declared agrees=None  reference agrees=None  bases agree with each other=None
+
+  AGREEMENT SUMMARY
+    rounds                               3
+    declared_basis_agreed                0
+    declared_basis_comparable            0
+    declared_basis_agreement_rate        n/a
+    reference_basis_agreed               0
+    reference_basis_comparable           0
+    reference_basis_agreement_rate       n/a
+    bases_agreed_with_each_other         1
+    bases_comparable                     1
+    bases_agreement_rate                 1.000
+    labels_reproducible                  False
+
+VERDICT
+------------------------------------------------------------------------------
+  training-grade interval: True
+  labels reproducible:     False
+  Per item 8, the q model must NOT be trained while labels cannot be
+  reproduced reliably.
+
+  NOT ASSESSED IN THIS PHASE (deliberately): fill probability, q_fill,
+  strategy parameters, profitability. No model was fit and no parameter
+  was tuned from this capture.
+==============================================================================

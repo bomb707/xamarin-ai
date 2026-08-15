@@ -1,0 +1,478 @@
+[recorder] session cap-1786775190-1b2ddf5d
+[recorder] writing to captures/phase12c_final.db
+[recorder] capturing 3 round(s); NO ORDERS WILL BE PLACED
+[btc-updown-5m-1786775700] metadata warning: gamma startDate (2026-08-14T06:43:51.671649Z) is the row-creation time, 85868s before the true round start; not used as the round start
+[btc-updown-5m-1786776000] metadata warning: gamma startDate (2026-08-14T06:48:02.345676Z) is the row-creation time, 85918s before the true round start; not used as the round start
+[btc-updown-5m-1786776300] metadata warning: gamma startDate (2026-08-14T06:53:40.182233Z) is the row-creation time, 85880s before the true round start; not used as the round start
+[service] 1786775700=DISCOVERED, 1786776000=DISCOVERED, 1786776300=DISCOVERED | events rx=3 persisted=3 queue=0 dropped=0 reconnects=0
+[service] 1786775700=DISCOVERED, 1786776000=DISCOVERED, 1786776300=DISCOVERED | events rx=781 persisted=777 queue=0 dropped=0 reconnects=0
+[service] 1786775700=DISCOVERED, 1786776000=DISCOVERED, 1786776300=DISCOVERED | events rx=1543 persisted=1539 queue=0 dropped=0 reconnects=0
+[btc-updown-5m-1786775700] DISCOVERED -> PRE_ROUND
+[service] 1786775700=PRE_ROUND, 1786776000=DISCOVERED, 1786776300=DISCOVERED | events rx=2309 persisted=2305 queue=0 dropped=0 reconnects=0
+[service] 1786775700=PRE_ROUND, 1786776000=DISCOVERED, 1786776300=DISCOVERED | events rx=3128 persisted=3124 queue=0 dropped=0 reconnects=0
+[service] 1786775700=PRE_ROUND, 1786776000=DISCOVERED, 1786776300=DISCOVERED | events rx=3934 persisted=3930 queue=0 dropped=0 reconnects=0
+[service] 1786775700=PRE_ROUND, 1786776000=DISCOVERED, 1786776300=DISCOVERED | events rx=4776 persisted=4772 queue=0 dropped=0 reconnects=0
+[service] 1786775700=PRE_ROUND, 1786776000=DISCOVERED, 1786776300=DISCOVERED | events rx=5670 persisted=5666 queue=0 dropped=0 reconnects=0
+[service] 1786775700=PRE_ROUND, 1786776000=DISCOVERED, 1786776300=DISCOVERED | events rx=7188 persisted=7184 queue=0 dropped=0 reconnects=0
+[service] 1786775700=PRE_ROUND, 1786776000=DISCOVERED, 1786776300=DISCOVERED | events rx=8086 persisted=8080 queue=0 dropped=0 reconnects=0
+[service] 1786775700=PRE_ROUND, 1786776000=DISCOVERED, 1786776300=DISCOVERED | events rx=9235 persisted=9229 queue=0 dropped=0 reconnects=0
+[service] 1786775700=PRE_ROUND, 1786776000=DISCOVERED, 1786776300=DISCOVERED | events rx=10166 persisted=10160 queue=0 dropped=0 reconnects=0
+[service] 1786775700=PRE_ROUND, 1786776000=DISCOVERED, 1786776300=DISCOVERED | events rx=11122 persisted=11116 queue=0 dropped=0 reconnects=0
+[btc-updown-5m-1786776000] DISCOVERED -> PRE_ROUND
+[service] 1786775700=PRE_ROUND, 1786776000=PRE_ROUND, 1786776300=DISCOVERED | events rx=11859 persisted=11853 queue=0 dropped=0 reconnects=1
+[service] 1786775700=PRE_ROUND, 1786776000=PRE_ROUND, 1786776300=DISCOVERED | events rx=12175 persisted=12167 queue=0 dropped=0 reconnects=1
+[service] 1786775700=PRE_ROUND, 1786776000=PRE_ROUND, 1786776300=DISCOVERED | events rx=12882 persisted=12866 queue=0 dropped=0 reconnects=1
+[service] 1786775700=PRE_ROUND, 1786776000=PRE_ROUND, 1786776300=DISCOVERED | events rx=13960 persisted=13922 queue=0 dropped=0 reconnects=1
+[btc-updown-5m-1786775700] PRE_ROUND -> ACTIVE
+[service] 1786775700=ACTIVE, 1786776000=PRE_ROUND, 1786776300=DISCOVERED | events rx=17040 persisted=16974 queue=0 dropped=0 reconnects=1
+[service] 1786775700=ACTIVE, 1786776000=PRE_ROUND, 1786776300=DISCOVERED | events rx=34401 persisted=34297 queue=25 dropped=0 reconnects=1
+[service] 1786775700=ACTIVE, 1786776000=PRE_ROUND, 1786776300=DISCOVERED | events rx=49882 persisted=49792 queue=0 dropped=0 reconnects=1
+[service] 1786775700=ACTIVE, 1786776000=PRE_ROUND, 1786776300=DISCOVERED | events rx=65705 persisted=65614 queue=1 dropped=0 reconnects=1
+[service] 1786775700=ACTIVE, 1786776000=PRE_ROUND, 1786776300=DISCOVERED | events rx=87592 persisted=87486 queue=0 dropped=0 reconnects=1
+[service] 1786775700=ACTIVE, 1786776000=PRE_ROUND, 1786776300=DISCOVERED | events rx=103117 persisted=102992 queue=3 dropped=0 reconnects=1
+[btc-updown-5m-1786776300] DISCOVERED -> PRE_ROUND
+[service] 1786775700=ACTIVE, 1786776000=PRE_ROUND, 1786776300=PRE_ROUND | events rx=122992 persisted=122850 queue=0 dropped=0 reconnects=1
+[service] 1786775700=ACTIVE, 1786776000=PRE_ROUND, 1786776300=PRE_ROUND | events rx=140005 persisted=139845 queue=0 dropped=0 reconnects=1
+[service] 1786775700=ACTIVE, 1786776000=PRE_ROUND, 1786776300=PRE_ROUND | events rx=157456 persisted=157228 queue=0 dropped=0 reconnects=1
+[service] 1786775700=ACTIVE, 1786776000=PRE_ROUND, 1786776300=PRE_ROUND | events rx=168862 persisted=168590 queue=0 dropped=0 reconnects=1
+[btc-updown-5m-1786775700] ACTIVE -> ENDED
+[btc-updown-5m-1786776000] PRE_ROUND -> ACTIVE
+[service] 1786775700=ENDED, 1786776000=ACTIVE, 1786776300=PRE_ROUND | events rx=178670 persisted=178364 queue=0 dropped=0 reconnects=1
+[service] 1786775700=ENDED, 1786776000=ACTIVE, 1786776300=PRE_ROUND | events rx=201893 persisted=201567 queue=0 dropped=0 reconnects=1
+[service] 1786775700=ENDED, 1786776000=ACTIVE, 1786776300=PRE_ROUND | events rx=222994 persisted=222662 queue=0 dropped=0 reconnects=1
+[btc-updown-5m-1786775700] ENDED -> FINALIZED
+[service] 1786775700=FINALIZED, 1786776000=ACTIVE, 1786776300=PRE_ROUND | events rx=247290 persisted=246932 queue=0 dropped=0 reconnects=1
+[service] 1786775700=FINALIZED, 1786776000=ACTIVE, 1786776300=PRE_ROUND | events rx=272585 persisted=272175 queue=0 dropped=0 reconnects=1
+[service] 1786775700=FINALIZED, 1786776000=ACTIVE, 1786776300=PRE_ROUND | events rx=287636 persisted=287176 queue=0 dropped=0 reconnects=1
+[service] 1786775700=FINALIZED, 1786776000=ACTIVE, 1786776300=PRE_ROUND | events rx=301706 persisted=301228 queue=0 dropped=0 reconnects=1
+[service] 1786775700=FINALIZED, 1786776000=ACTIVE, 1786776300=PRE_ROUND | events rx=312429 persisted=311949 queue=0 dropped=0 reconnects=1
+[service] 1786775700=FINALIZED, 1786776000=ACTIVE, 1786776300=PRE_ROUND | events rx=322098 persisted=321592 queue=0 dropped=0 reconnects=1
+[service] 1786775700=FINALIZED, 1786776000=ACTIVE, 1786776300=PRE_ROUND | events rx=329564 persisted=329042 queue=0 dropped=0 reconnects=1
+[btc-updown-5m-1786776000] ACTIVE -> ENDED
+[btc-updown-5m-1786776300] PRE_ROUND -> ACTIVE
+[service] 1786775700=FINALIZED, 1786776000=ENDED, 1786776300=ACTIVE | events rx=338701 persisted=338165 queue=0 dropped=0 reconnects=1
+[service] 1786775700=FINALIZED, 1786776000=ENDED, 1786776300=ACTIVE | events rx=355871 persisted=355294 queue=0 dropped=0 reconnects=1
+[service] 1786775700=FINALIZED, 1786776000=ENDED, 1786776300=ACTIVE | events rx=372134 persisted=371537 queue=0 dropped=0 reconnects=1
+[btc-updown-5m-1786776000] ENDED -> FINALIZED
+[service] 1786775700=FINALIZED, 1786776000=FINALIZED, 1786776300=ACTIVE | events rx=389003 persisted=388395 queue=0 dropped=0 reconnects=1
+[service] 1786775700=FINALIZED, 1786776000=FINALIZED, 1786776300=ACTIVE | events rx=403783 persisted=403163 queue=0 dropped=0 reconnects=1
+[service] 1786775700=FINALIZED, 1786776000=FINALIZED, 1786776300=ACTIVE | events rx=427180 persisted=426532 queue=0 dropped=0 reconnects=1
+[service] 1786775700=FINALIZED, 1786776000=FINALIZED, 1786776300=ACTIVE | events rx=451323 persisted=450663 queue=0 dropped=0 reconnects=1
+[service] 1786775700=FINALIZED, 1786776000=FINALIZED, 1786776300=ACTIVE | events rx=474913 persisted=474217 queue=0 dropped=0 reconnects=1
+[service] 1786775700=FINALIZED, 1786776000=FINALIZED, 1786776300=ACTIVE | events rx=491607 persisted=490879 queue=0 dropped=0 reconnects=1
+[service] 1786775700=FINALIZED, 1786776000=FINALIZED, 1786776300=ACTIVE | events rx=503122 persisted=502388 queue=0 dropped=0 reconnects=1
+[btc-updown-5m-1786776300] ACTIVE -> ENDED
+[service] 1786775700=FINALIZED, 1786776000=FINALIZED, 1786776300=ENDED | events rx=507727 persisted=506989 queue=0 dropped=0 reconnects=1
+[service] 1786775700=FINALIZED, 1786776000=FINALIZED, 1786776300=ENDED | events rx=508183 persisted=507440 queue=0 dropped=0 reconnects=1
+[service] 1786775700=FINALIZED, 1786776000=FINALIZED, 1786776300=ENDED | events rx=508620 persisted=507874 queue=0 dropped=0 reconnects=1
+[btc-updown-5m-1786776300] ENDED -> FINALIZED
+[resolve] 3 round(s) awaiting the venue's resolution
+[resolve] btc-updown-5m-1786775700 -> DOWN (gamma_outcome_prices); declared_agrees=True reference_agrees=True
+[parse-failure] ConnectionClosedOK: received 1000 (OK) all subscribed assets resolved; then sent 1000 (OK) all subscribed assets resolved
+[resolve] btc-updown-5m-1786776000 -> UP (gamma_outcome_prices); declared_agrees=True reference_agrees=True
+[parse-failure] HTTPStatusError: Client error '404 Not Found' for url 'https://clob.polymarket.com/book?token_id=84233084765932774490735162902743523745375692597285786695501431666475608284162'
+For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/404
+[parse-failure] HTTPStatusError: Client error '404 Not Found' for url 'https://clob.polymarket.com/book?token_id=61339490021908660171776535725321670404538015020841612911606350361688856750661'
+For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/404
+[parse-failure] HTTPStatusError: Client error '404 Not Found' for url 'https://clob.polymarket.com/book?token_id=113869265578994891145605960424089564740438495491613719423668042894537252674001'
+For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/404
+[parse-failure] HTTPStatusError: Client error '404 Not Found' for url 'https://clob.polymarket.com/book?token_id=12646384564402571395736339335893855841049855788372169280906566362366963132037'
+For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/404
+[parse-failure] HTTPStatusError: Client error '404 Not Found' for url 'https://clob.polymarket.com/book?token_id=69652019254599956422592754455906349416805197307271551596135740229296986412641'
+For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/404
+[parse-failure] HTTPStatusError: Client error '404 Not Found' for url 'https://clob.polymarket.com/book?token_id=41215452683459245929529295652327026406748072542631681488500181305857071428459'
+For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/404
+[parse-failure] HTTPStatusError: Client error '404 Not Found' for url 'https://clob.polymarket.com/book?token_id=84233084765932774490735162902743523745375692597285786695501431666475608284162'
+For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/404
+[parse-failure] HTTPStatusError: Client error '404 Not Found' for url 'https://clob.polymarket.com/book?token_id=61339490021908660171776535725321670404538015020841612911606350361688856750661'
+For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/404
+[parse-failure] HTTPStatusError: Client error '404 Not Found' for url 'https://clob.polymarket.com/book?token_id=113869265578994891145605960424089564740438495491613719423668042894537252674001'
+For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/404
+[parse-failure] HTTPStatusError: Client error '404 Not Found' for url 'https://clob.polymarket.com/book?token_id=12646384564402571395736339335893855841049855788372169280906566362366963132037'
+For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/404
+[parse-failure] HTTPStatusError: Client error '404 Not Found' for url 'https://clob.polymarket.com/book?token_id=69652019254599956422592754455906349416805197307271551596135740229296986412641'
+For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/404
+[parse-failure] HTTPStatusError: Client error '404 Not Found' for url 'https://clob.polymarket.com/book?token_id=41215452683459245929529295652327026406748072542631681488500181305857071428459'
+For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/404
+[parse-failure] HTTPStatusError: Client error '404 Not Found' for url 'https://clob.polymarket.com/book?token_id=84233084765932774490735162902743523745375692597285786695501431666475608284162'
+For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/404
+[parse-failure] HTTPStatusError: Client error '404 Not Found' for url 'https://clob.polymarket.com/book?token_id=61339490021908660171776535725321670404538015020841612911606350361688856750661'
+For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/404
+[parse-failure] HTTPStatusError: Client error '404 Not Found' for url 'https://clob.polymarket.com/book?token_id=113869265578994891145605960424089564740438495491613719423668042894537252674001'
+For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/404
+[parse-failure] HTTPStatusError: Client error '404 Not Found' for url 'https://clob.polymarket.com/book?token_id=12646384564402571395736339335893855841049855788372169280906566362366963132037'
+For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/404
+[parse-failure] HTTPStatusError: Client error '404 Not Found' for url 'https://clob.polymarket.com/book?token_id=69652019254599956422592754455906349416805197307271551596135740229296986412641'
+For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/404
+[parse-failure] HTTPStatusError: Client error '404 Not Found' for url 'https://clob.polymarket.com/book?token_id=41215452683459245929529295652327026406748072542631681488500181305857071428459'
+For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/404
+[parse-failure] HTTPStatusError: Client error '404 Not Found' for url 'https://clob.polymarket.com/book?token_id=84233084765932774490735162902743523745375692597285786695501431666475608284162'
+For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/404
+[parse-failure] HTTPStatusError: Client error '404 Not Found' for url 'https://clob.polymarket.com/book?token_id=61339490021908660171776535725321670404538015020841612911606350361688856750661'
+For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/404
+[parse-failure] HTTPStatusError: Client error '404 Not Found' for url 'https://clob.polymarket.com/book?token_id=113869265578994891145605960424089564740438495491613719423668042894537252674001'
+For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/404
+[parse-failure] HTTPStatusError: Client error '404 Not Found' for url 'https://clob.polymarket.com/book?token_id=12646384564402571395736339335893855841049855788372169280906566362366963132037'
+For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/404
+[parse-failure] HTTPStatusError: Client error '404 Not Found' for url 'https://clob.polymarket.com/book?token_id=69652019254599956422592754455906349416805197307271551596135740229296986412641'
+For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/404
+[parse-failure] HTTPStatusError: Client error '404 Not Found' for url 'https://clob.polymarket.com/book?token_id=41215452683459245929529295652327026406748072542631681488500181305857071428459'
+For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/404
+[parse-failure] HTTPStatusError: Client error '404 Not Found' for url 'https://clob.polymarket.com/book?token_id=84233084765932774490735162902743523745375692597285786695501431666475608284162'
+For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/404
+[parse-failure] HTTPStatusError: Client error '404 Not Found' for url 'https://clob.polymarket.com/book?token_id=61339490021908660171776535725321670404538015020841612911606350361688856750661'
+For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/404
+[parse-failure] HTTPStatusError: Client error '404 Not Found' for url 'https://clob.polymarket.com/book?token_id=113869265578994891145605960424089564740438495491613719423668042894537252674001'
+For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/404
+[parse-failure] HTTPStatusError: Client error '404 Not Found' for url 'https://clob.polymarket.com/book?token_id=12646384564402571395736339335893855841049855788372169280906566362366963132037'
+For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/404
+[parse-failure] HTTPStatusError: Client error '404 Not Found' for url 'https://clob.polymarket.com/book?token_id=69652019254599956422592754455906349416805197307271551596135740229296986412641'
+For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/404
+[parse-failure] HTTPStatusError: Client error '404 Not Found' for url 'https://clob.polymarket.com/book?token_id=41215452683459245929529295652327026406748072542631681488500181305857071428459'
+For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/404
+[parse-failure] HTTPStatusError: Client error '404 Not Found' for url 'https://clob.polymarket.com/book?token_id=84233084765932774490735162902743523745375692597285786695501431666475608284162'
+For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/404
+[parse-failure] HTTPStatusError: Client error '404 Not Found' for url 'https://clob.polymarket.com/book?token_id=61339490021908660171776535725321670404538015020841612911606350361688856750661'
+For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/404
+[parse-failure] HTTPStatusError: Client error '404 Not Found' for url 'https://clob.polymarket.com/book?token_id=113869265578994891145605960424089564740438495491613719423668042894537252674001'
+For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/404
+[parse-failure] HTTPStatusError: Client error '404 Not Found' for url 'https://clob.polymarket.com/book?token_id=12646384564402571395736339335893855841049855788372169280906566362366963132037'
+For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/404
+[parse-failure] HTTPStatusError: Client error '404 Not Found' for url 'https://clob.polymarket.com/book?token_id=69652019254599956422592754455906349416805197307271551596135740229296986412641'
+For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/404
+[parse-failure] HTTPStatusError: Client error '404 Not Found' for url 'https://clob.polymarket.com/book?token_id=41215452683459245929529295652327026406748072542631681488500181305857071428459'
+For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/404
+[parse-failure] HTTPStatusError: Client error '404 Not Found' for url 'https://clob.polymarket.com/book?token_id=84233084765932774490735162902743523745375692597285786695501431666475608284162'
+For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/404
+[parse-failure] HTTPStatusError: Client error '404 Not Found' for url 'https://clob.polymarket.com/book?token_id=61339490021908660171776535725321670404538015020841612911606350361688856750661'
+For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/404
+[parse-failure] HTTPStatusError: Client error '404 Not Found' for url 'https://clob.polymarket.com/book?token_id=113869265578994891145605960424089564740438495491613719423668042894537252674001'
+For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/404
+[parse-failure] HTTPStatusError: Client error '404 Not Found' for url 'https://clob.polymarket.com/book?token_id=12646384564402571395736339335893855841049855788372169280906566362366963132037'
+For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/404
+[parse-failure] HTTPStatusError: Client error '404 Not Found' for url 'https://clob.polymarket.com/book?token_id=69652019254599956422592754455906349416805197307271551596135740229296986412641'
+For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/404
+[parse-failure] HTTPStatusError: Client error '404 Not Found' for url 'https://clob.polymarket.com/book?token_id=41215452683459245929529295652327026406748072542631681488500181305857071428459'
+For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/404
+[parse-failure] HTTPStatusError: Client error '404 Not Found' for url 'https://clob.polymarket.com/book?token_id=84233084765932774490735162902743523745375692597285786695501431666475608284162'
+For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/404
+[parse-failure] HTTPStatusError: Client error '404 Not Found' for url 'https://clob.polymarket.com/book?token_id=61339490021908660171776535725321670404538015020841612911606350361688856750661'
+For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/404
+[parse-failure] HTTPStatusError: Client error '404 Not Found' for url 'https://clob.polymarket.com/book?token_id=113869265578994891145605960424089564740438495491613719423668042894537252674001'
+For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/404
+[parse-failure] HTTPStatusError: Client error '404 Not Found' for url 'https://clob.polymarket.com/book?token_id=12646384564402571395736339335893855841049855788372169280906566362366963132037'
+For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/404
+[parse-failure] HTTPStatusError: Client error '404 Not Found' for url 'https://clob.polymarket.com/book?token_id=69652019254599956422592754455906349416805197307271551596135740229296986412641'
+For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/404
+[parse-failure] HTTPStatusError: Client error '404 Not Found' for url 'https://clob.polymarket.com/book?token_id=41215452683459245929529295652327026406748072542631681488500181305857071428459'
+For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/404
+[resolve] btc-updown-5m-1786776300 -> UP (gamma_outcome_prices); declared_agrees=True reference_agrees=True
+
+==============================================================================
+PHASE 12C - REAL CAPTURE SAMPLE REPORT
+Data integrity only. No profitability claim is made or implied.
+==============================================================================
+
+MARKET IDS / TIME WINDOWS
+------------------------------------------------------------------------------
+  btc-updown-5m-1786775700
+    condition_id     0xbb5a4ec8765e8324516cd85e26bd5fe255369f4e112af74fde51ef35129f5471
+    question         Bitcoin Up or Down - August 15, 2:35AM-2:40AM ET
+    window           1786775700 -> 1786776000  (300s)
+    settlement       chainlink_twap (twap_window=60)
+    resolution src   https://data.chain.link/streams/btc-usd-twap-60s-streams
+    tick / min size  0.01 / 5.0
+    fee rate         0.07 (type=crypto_fees_v2)
+    taker delay      0.0 ms
+    lifecycle        FINALIZED
+    ! warning        gamma startDate (2026-08-14T06:43:51.671649Z) is the row-creation time, 85868s before the true round start; not used as the round start
+    ! note           no venue resolution observed within 90s of round end; finalized without a reported outcome
+    ! note           no market_resolved event captured on the market channel
+  btc-updown-5m-1786776000
+    condition_id     0x1baaac8c50eead8d2449b0ad737d3ac58389d0e56f305411d026c9115182dac5
+    question         Bitcoin Up or Down - August 15, 2:40AM-2:45AM ET
+    window           1786776000 -> 1786776300  (300s)
+    settlement       chainlink_twap (twap_window=60)
+    resolution src   https://data.chain.link/streams/btc-usd-twap-60s-streams
+    tick / min size  0.01 / 5.0
+    fee rate         0.07 (type=crypto_fees_v2)
+    taker delay      0.0 ms
+    lifecycle        FINALIZED
+    ! warning        gamma startDate (2026-08-14T06:48:02.345676Z) is the row-creation time, 85918s before the true round start; not used as the round start
+    ! note           no venue resolution observed within 90s of round end; finalized without a reported outcome
+    ! note           no market_resolved event captured on the market channel
+  btc-updown-5m-1786776300
+    condition_id     0x9836b3d10e2548b8b4efbb22d13cb95dec7a69f7065579bcea4db0c70e3d1cd8
+    question         Bitcoin Up or Down - August 15, 2:45AM-2:50AM ET
+    window           1786776300 -> 1786776600  (300s)
+    settlement       chainlink_twap (twap_window=60)
+    resolution src   https://data.chain.link/streams/btc-usd-twap-60s-streams
+    tick / min size  0.01 / 5.0
+    fee rate         0.07 (type=crypto_fees_v2)
+    taker delay      0.0 ms
+    lifecycle        FINALIZED
+    ! warning        gamma startDate (2026-08-14T06:53:40.182233Z) is the row-creation time, 85880s before the true round start; not used as the round start
+    ! note           no venue resolution observed within 90s of round end; finalized without a reported outcome
+    ! note           no market_resolved event captured on the market channel
+
+TOKEN / OUTCOME MAPPING SUCCESS
+------------------------------------------------------------------------------
+  btc-updown-5m-1786775700: OK via clob_market_info+gamma_outcomes
+    UP   84233084765932774490735162902743523745375692597285786695501431666475608284162
+    DOWN 61339490021908660171776535725321670404538015020841612911606350361688856750661
+  btc-updown-5m-1786776000: OK via clob_market_info+gamma_outcomes
+    UP   113869265578994891145605960424089564740438495491613719423668042894537252674001
+    DOWN 12646384564402571395736339335893855841049855788372169280906566362366963132037
+  btc-updown-5m-1786776300: OK via clob_market_info+gamma_outcomes
+    UP   69652019254599956422592754455906349416805197307271551596135740229296986412641
+    DOWN 41215452683459245929529295652327026406748072542631681488500181305857071428459
+  mapped 3/3 rounds from EXPLICIT outcome labels (never token index order)
+
+EVENTS PER STREAM
+------------------------------------------------------------------------------
+  btc-updown-5m-1786775700  (total persisted 164075)
+    clob_market:best_bid_ask                         3644
+    clob_market:book                                 2862
+    clob_market:last_trade_price                     1375
+    clob_market:price_change                         153174
+    clob_market:tick_size_change                     2
+    clob_rest:book_snapshot_rest                     2
+    market_metadata:market_metadata_discovered       1
+    market_metadata:market_metadata_final            1
+    market_metadata:market_metadata_poll             3
+    market_metadata:market_metadata_resolution       1
+    recorder_control:book_integrity_check            10
+    recorder_control:label_reconstruction            1
+    recorder_control:label_reconstruction_resolved   1
+    recorder_control:lifecycle_transition            4
+    recorder_control:reconnect                       1
+    recorder_control:stream_stalled                  1
+    rtds_binance:update                              778
+    rtds_chainlink:update                            738
+    rtds_twap_30:update                              738
+    rtds_twap_60:update                              738
+  btc-updown-5m-1786776000  (total persisted 162853)
+    clob_market:best_bid_ask                         3228
+    clob_market:book                                 2586
+    clob_market:last_trade_price                     1233
+    clob_market:price_change                         154622
+    clob_market:tick_size_change                     2
+    clob_rest:book_snapshot_rest                     2
+    market_metadata:clob_market_info_resolution      1
+    market_metadata:market_metadata_discovered       1
+    market_metadata:market_metadata_final            1
+    market_metadata:market_metadata_poll             3
+    market_metadata:market_metadata_resolution       2
+    recorder_control:book_integrity_check            10
+    recorder_control:label_reconstruction            1
+    recorder_control:label_reconstruction_resolved   1
+    recorder_control:lifecycle_transition            4
+    rtds_binance:update                              300
+    rtds_chainlink:update                            285
+    rtds_twap_30:update                              286
+    rtds_twap_60:update                              285
+  btc-updown-5m-1786776300  (total persisted 181101)
+    clob_market:best_bid_ask                         3220
+    clob_market:book                                 2502
+    clob_market:last_trade_price                     1214
+    clob_market:price_change                         172632
+    clob_market:tick_size_change                     2
+    clob_rest:book_snapshot_rest                     2
+    market_metadata:clob_market_info_resolution      2
+    market_metadata:market_metadata_discovered       1
+    market_metadata:market_metadata_final            1
+    market_metadata:market_metadata_poll             1
+    market_metadata:market_metadata_resolution       2
+    recorder_control:book_integrity_check            10
+    recorder_control:label_reconstruction            1
+    recorder_control:label_reconstruction_resolved   1
+    recorder_control:lifecycle_transition            4
+    rtds_binance:update                              390
+    rtds_chainlink:update                            373
+    rtds_twap_30:update                              371
+    rtds_twap_60:update                              372
+
+BOOK SNAPSHOTS / DELTAS / TRADES
+------------------------------------------------------------------------------
+  btc-updown-5m-1786775700: ws_snapshots=2862 rest_snapshots=2 deltas=153174 trades=1375 best_bid_ask=3644
+  btc-updown-5m-1786776000: ws_snapshots=2586 rest_snapshots=2 deltas=154622 trades=1233 best_bid_ask=3228
+  btc-updown-5m-1786776300: ws_snapshots=2502 rest_snapshots=2 deltas=172632 trades=1214 best_bid_ask=3220
+
+REFERENCE FEED UPDATES
+------------------------------------------------------------------------------
+  btc-updown-5m-1786775700
+    Chainlink reference updates     827  span=   898.0s  pre-round=465
+    TWAP-30 updates                 827  span=   898.0s  pre-round=465
+    TWAP-60 updates                 827  span=   898.0s  pre-round=465
+    Binance updates                 869  span=   899.0s  pre-round=478
+  btc-updown-5m-1786776000
+    Chainlink reference updates    1110  span=  1199.0s  pre-round=739
+    TWAP-30 updates                1111  span=  1199.0s  pre-round=739
+    TWAP-60 updates                1110  span=  1199.0s  pre-round=739
+    Binance updates                1168  span=  1198.0s  pre-round=778
+  btc-updown-5m-1786776300
+    Chainlink reference updates    1396  span=  1498.0s  pre-round=1024
+    TWAP-30 updates                1395  span=  1498.0s  pre-round=1025
+    TWAP-60 updates                1395  span=  1497.0s  pre-round=1024
+    Binance updates                1468  span=  1498.0s  pre-round=1078
+
+PRE-ROUND HISTORY COVERAGE (item 7)
+------------------------------------------------------------------------------
+  btc-updown-5m-1786775700: configured lead 420s
+    Chainlink reference updates     465 pre-round obs, earliest   510.0s before open  [OK]
+    TWAP-30 updates                 465 pre-round obs, earliest   510.0s before open  [OK]
+    TWAP-60 updates                 465 pre-round obs, earliest   510.0s before open  [OK]
+    Binance updates                 478 pre-round obs, earliest   509.0s before open  [OK]
+  btc-updown-5m-1786776000: configured lead 420s
+    Chainlink reference updates     739 pre-round obs, earliest   810.0s before open  [OK]
+    TWAP-30 updates                 739 pre-round obs, earliest   810.0s before open  [OK]
+    TWAP-60 updates                 739 pre-round obs, earliest   810.0s before open  [OK]
+    Binance updates                 778 pre-round obs, earliest   809.0s before open  [OK]
+  btc-updown-5m-1786776300: configured lead 420s
+    Chainlink reference updates    1024 pre-round obs, earliest  1110.0s before open  [OK]
+    TWAP-30 updates                1025 pre-round obs, earliest  1110.0s before open  [OK]
+    TWAP-60 updates                1024 pre-round obs, earliest  1110.0s before open  [OK]
+    Binance updates                1078 pre-round obs, earliest  1109.0s before open  [OK]
+
+LATENCY DISTRIBUTIONS
+------------------------------------------------------------------------------
+  source->recv       n=510222   p50=13.5ms p95=27.1ms p99=1549.0ms max=11485.9ms
+  publisher->recv    n=6978     p50=279.7ms p95=434.9ms p99=472.8ms max=573.6ms
+  source->recv includes the oracle/venue's own publication delay;
+  publisher->recv isolates the hop this system could influence.
+
+RECORDER HEALTH
+------------------------------------------------------------------------------
+  events_received              510353
+  events_persisted             509578
+  queue_high_water             270
+  dropped_events               0
+  parse_failures               49
+  duplicate_events             775
+  reconnect_count              9
+  resnapshot_count             6
+  book_integrity_checks        30
+  book_integrity_mismatches    0
+  freshness_failures           0
+  suspect_intervals            0
+
+STREAM CONTINUITY
+------------------------------------------------------------------------------
+  ! STALL  clob_market silent for 30s (threshold 30.0s) -> forced reconnect
+  ! STALL  clob_market silent for 30s (threshold 30.0s) -> forced reconnect
+  ! STALL  clob_market silent for 30s (threshold 30.0s) -> forced reconnect
+  ! STALL  clob_market silent for 30s (threshold 30.0s) -> forced reconnect
+  ! STALL  clob_market silent for 30s (threshold 30.0s) -> forced reconnect
+  ! STALL  clob_market silent for 30s (threshold 30.0s) -> forced reconnect
+  ! STALL  clob_market silent for 30s (threshold 30.0s) -> forced reconnect
+  ! STALL  rtds silent for 30s (threshold 30.0s) -> forced reconnect
+  A stalled socket that never raises is the worst failure mode for a
+  recorder: it produces a clean-looking capture with missing data. Each
+  stall above was detected by the watchdog and reconnected, and the
+  affected interval should be checked for a reference-data gap.
+
+BOOK-INTEGRITY CHECKS (in-memory vs REST resnapshot)
+------------------------------------------------------------------------------
+  btc-updown-5m-1786775700 8423308476593277... MATCH: top-of-book agrees
+  btc-updown-5m-1786775700 6133949002190866... MATCH: top-of-book agrees
+  btc-updown-5m-1786775700 8423308476593277... MATCH: top-of-book agrees
+  btc-updown-5m-1786775700 6133949002190866... MATCH: top-of-book agrees
+  btc-updown-5m-1786775700 8423308476593277... MATCH: top-of-book agrees
+  btc-updown-5m-1786775700 6133949002190866... MATCH: top-of-book agrees
+  btc-updown-5m-1786775700 8423308476593277... MATCH: top-of-book agrees
+  btc-updown-5m-1786775700 6133949002190866... MATCH: top-of-book agrees
+  btc-updown-5m-1786775700 8423308476593277... MATCH: top-of-book agrees
+  btc-updown-5m-1786775700 6133949002190866... MATCH: top-of-book agrees
+  btc-updown-5m-1786776000 1138692655789948... MATCH: top-of-book agrees
+  btc-updown-5m-1786776000 1264638456440257... MATCH: top-of-book agrees
+  btc-updown-5m-1786776000 1138692655789948... MATCH: top-of-book agrees
+  btc-updown-5m-1786776000 1264638456440257... MATCH: top-of-book agrees
+  btc-updown-5m-1786776000 1138692655789948... MATCH: top-of-book agrees
+  btc-updown-5m-1786776000 1264638456440257... MATCH: top-of-book agrees
+  btc-updown-5m-1786776000 1138692655789948... MATCH: top-of-book agrees
+  btc-updown-5m-1786776000 1264638456440257... MATCH: top-of-book agrees
+  btc-updown-5m-1786776000 1138692655789948... MATCH: top-of-book agrees
+  btc-updown-5m-1786776000 1264638456440257... MATCH: top-of-book agrees
+  btc-updown-5m-1786776300 6965201925459995... MATCH: top-of-book agrees
+  btc-updown-5m-1786776300 4121545268345924... MATCH: top-of-book agrees
+  btc-updown-5m-1786776300 6965201925459995... MATCH: top-of-book agrees
+  btc-updown-5m-1786776300 4121545268345924... MATCH: top-of-book agrees
+  btc-updown-5m-1786776300 6965201925459995... MATCH: top-of-book agrees
+  btc-updown-5m-1786776300 4121545268345924... MATCH: top-of-book agrees
+  btc-updown-5m-1786776300 6965201925459995... MATCH: top-of-book agrees
+  btc-updown-5m-1786776300 4121545268345924... MATCH: top-of-book agrees
+  btc-updown-5m-1786776300 6965201925459995... MATCH: top-of-book agrees
+  btc-updown-5m-1786776300 4121545268345924... MATCH: top-of-book agrees
+  A mismatch marks the interval suspect, triggers a resnapshot, and writes a
+  reconciliation event; it never silently continues.
+
+LABEL RECONSTRUCTION
+------------------------------------------------------------------------------
+  Reconstructed independently as  y_hat = UP if P_end >= P_start else DOWN,
+  under BOTH the basis the market metadata declares AND the plain
+  Chainlink-reference basis, then compared to Polymarket's own resolution.
+
+  btc-updown-5m-1786775700
+    reported by venue     DOWN (gamma_outcome_prices)
+    [declared ] topic=crypto_prices_twap_sixty
+        P_start=62996.7931 P_end=62992.2005 -> DOWN
+        boundary offsets: start=0.00s end=0.00s
+        P_end=62992.20053083932 < P_start=62996.79305391605
+    [reference] topic=crypto_prices_chainlink
+        P_start=62997.1719 P_end=62993.0634 -> DOWN
+        boundary offsets: start=0.00s end=0.00s
+        P_end=62993.06344339726 < P_start=62997.1719373013
+    declared agrees=True  reference agrees=True  bases agree with each other=True
+  btc-updown-5m-1786776000
+    reported by venue     UP (gamma_outcome_prices)
+    [declared ] topic=crypto_prices_twap_sixty
+        P_start=62992.2005 P_end=63006.3835 -> UP
+        boundary offsets: start=0.00s end=0.00s
+        P_end=63006.383535806905 >= P_start=62992.20053083932
+    [reference] topic=crypto_prices_chainlink
+        P_start=62993.0634 P_end=63006.0466 -> UP
+        boundary offsets: start=0.00s end=0.00s
+        P_end=63006.046624065704 >= P_start=62993.06344339726
+    declared agrees=True  reference agrees=True  bases agree with each other=True
+  btc-updown-5m-1786776300
+    reported by venue     UP (gamma_outcome_prices)
+    [declared ] topic=crypto_prices_twap_sixty
+        P_start=63006.3835 P_end=63011.5814 -> UP
+        boundary offsets: start=0.00s end=0.00s
+        P_end=63011.58144333682 >= P_start=63006.383535806905
+    [reference] topic=crypto_prices_chainlink
+        P_start=63006.0466 P_end=63015.2976 -> UP
+        boundary offsets: start=0.00s end=0.00s
+        P_end=63015.297585843386 >= P_start=63006.046624065704
+    declared agrees=True  reference agrees=True  bases agree with each other=True
+
+  AGREEMENT SUMMARY
+    rounds                               3
+    declared_basis_agreed                3
+    declared_basis_comparable            3
+    declared_basis_agreement_rate        1.000
+    reference_basis_agreed               3
+    reference_basis_comparable           3
+    reference_basis_agreement_rate       1.000
+    bases_agreed_with_each_other         3
+    bases_comparable                     3
+    bases_agreement_rate                 1.000
+    labels_reproducible                  True
+
+VERDICT
+------------------------------------------------------------------------------
+  training-grade interval: False
+  disqualified by: parse_failures=49
+  Per item 6, a dropped-event/parse-failure/integrity-mismatch count above
+  zero makes this interval unsuitable for high-fidelity model training
+  unless explicitly repaired.
+  labels reproducible:     True
+
+  NOT ASSESSED IN THIS PHASE (deliberately): fill probability, q_fill,
+  strategy parameters, profitability. No model was fit and no parameter
+  was tuned from this capture.
+==============================================================================
+
+[recorder] wall-clock 30.8 min, 509578 raw events in captures/phase12c_final.db
+[recorder] report written to captures/phase12c_final_report.txt
+[recorder] metrics written to captures/phase12c_final_metrics.json

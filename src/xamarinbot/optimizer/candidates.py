@@ -796,6 +796,19 @@ class ReplacementPlan:
     delta_ev: float
     expected_delta_g: float
     exposure: ActiveOrderExposure
+    # Phase 12C item 12: the replacement's OWN if-filled G, carried so the
+    # replacement `TrackedOrder` records its own thesis rather than
+    # inheriting the canceled order's. `expected_delta_g` above is the
+    # fill-probability-weighted MARGINAL risk contribution used for
+    # selection scoring; this is the absolute level the supervisor's own
+    # risk-breach predicate is written against, and the two are not
+    # interchangeable.
+    g_after_if_fill: float = 0.0
+    # The fair value (SS9: q for UP, 1-q for DOWN) at the moment the
+    # replacement was priced - NOT the canceled order's stale fair value.
+    fair_value: float = 0.0
+    # The q this replacement was evaluated against.
+    q: float = 0.0
 
 
 def evaluate_replacement_plan(
@@ -838,6 +851,13 @@ def evaluate_replacement_plan(
     return ReplacementPlan(
         side=side, price=best.price, qty=best.qty, ttl_s=horizon_s,
         delta_ev=best.delta_ev, expected_delta_g=best.expected_delta_g, exposure=exposure,
+        # Phase 12C item 12: a replacement is a NEW order with a NEW
+        # thesis - carry its own if-filled G, its own fair value and the
+        # q it was priced against, so the caller never has to fall back on
+        # the canceled order's stale snapshot.
+        g_after_if_fill=best.g_after,
+        fair_value=(q if side is Side.UP else 1.0 - q),
+        q=q,
     )
 
 
