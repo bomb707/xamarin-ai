@@ -11,7 +11,7 @@ from xamarinbot.events.types import EventType
 from xamarinbot.features.config import FeatureConfig
 from xamarinbot.features.engine import compute
 from xamarinbot.features.types import FeatureVector, InvalidFeatureState, InvalidReason, TimeRegime, time_regime_for
-from xamarinbot.synthetic.rounds import populate_synthetic_round
+from devtools.synthetic.rounds import populate_synthetic_round
 
 CFG = FeatureConfig()
 

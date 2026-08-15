@@ -11,7 +11,12 @@ dev = ["pytest>=8.0", "hypothesis>=6.100"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]
+# "." puts the repo root on the path so tests can import `devtools.synthetic`
+# (Phase 12C.1 item 4). `devtools` is deliberately NOT under `src/` and is
+# NOT part of the installed package - see [tool.setuptools.packages.find],
+# which only ships `src/`. tests/test_import_boundaries.py enforces that
+# nothing under src/xamarinbot/ imports it.
+pythonpath = ["src", "."]
 
 [build-system]
 requires = ["setuptools>=68"]

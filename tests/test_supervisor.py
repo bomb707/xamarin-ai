@@ -20,6 +20,15 @@ from xamarinbot.supervisor.config import SupervisorConfig
 from xamarinbot.supervisor.predicates import book_displacement, edge_failure, feed_stale, hold_eligible, regime_flip, risk_breach, time_compression, value_cancel, value_hold, value_replace
 from xamarinbot.supervisor.supervisor import OrderSupervisor
 from xamarinbot.supervisor.types import CancelReason, SupervisorActionType, TrackedOrder
+from xamarinbot.market.constraints import MarketConstraints
+
+# Phase 12C.1 item 12: executable market parameters are a runtime object read
+# from the market, not static config. `for_testing` is explicitly stamped
+# SYNTHETIC_TEST and defaults min_order_shares to 1.0, reproducing the old
+# `OneStepConfig.taker_min_size` default so this file's sizing arithmetic is
+# unchanged - but it can no longer be inherited by a live path.
+CONSTRAINTS = MarketConstraints.for_testing()
+
 
 STATE_A = RegimeState(GapRegime.UPPER_MIDDLE, Direction.UP, Direction.UP)
 STATE_B = RegimeState(GapRegime.LOWER_MIDDLE, Direction.DOWN, Direction.DOWN)

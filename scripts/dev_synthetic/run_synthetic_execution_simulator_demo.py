@@ -11,16 +11,20 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+sys.path.insert(0, str(_REPO_ROOT / "src"))
+# `devtools` (the synthetic data fabricator) lives at the repo root,
+# deliberately outside the shipped package - see Phase 12C.1 item 4.
+sys.path.insert(0, str(_REPO_ROOT))
 
 from xamarinbot.events.replay import ReplayClock
 from xamarinbot.events.store import EventStore
 from xamarinbot.execution.config import ExecutionConfig
 from xamarinbot.execution.simulator import ExecutionSimulator
-from xamarinbot.feeds.mock import MockBookFeed, MockFeedCursor
+from xamarinbot.replay.feeds import ReplayBookFeed, ReplayCursor
 from xamarinbot.portfolio.state import FeeConfig, Side
 from xamarinbot.reports.execution_report import build_execution_report, format_execution_report
-from xamarinbot.synthetic.rounds import generate_synthetic_dataset
+from devtools.synthetic.rounds import generate_synthetic_dataset
 
 HEARTBEAT_S = 10.0
 ORDER_SIZE = 750.0  # > one book level (500 shares), forces depth walking
@@ -42,8 +46,8 @@ def main() -> None:
     for i, result in enumerate(results):
         round_events = store.all_events(result.round_id)
         clock = ReplayClock(store, result.round_id)
-        cursor = MockFeedCursor(store, result.round_id, preloaded=round_events)
-        book_feed = MockBookFeed(cursor)
+        cursor = ReplayCursor(store, result.round_id, preloaded=round_events)
+        book_feed = ReplayBookFeed(cursor)
         sim = ExecutionSimulator(result.round_id, fee_config, exec_cfg)
 
         decision_points = clock.decision_points(heartbeat=HEARTBEAT_S)

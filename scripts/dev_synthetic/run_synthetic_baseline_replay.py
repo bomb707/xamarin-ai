@@ -15,7 +15,11 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+sys.path.insert(0, str(_REPO_ROOT / "src"))
+# `devtools` (the synthetic data fabricator) lives at the repo root,
+# deliberately outside the shipped package - see Phase 12C.1 item 4.
+sys.path.insert(0, str(_REPO_ROOT))
 
 from xamarinbot.baseline.config import BaselineConfig
 from xamarinbot.baseline.inputs import elapsed_t
@@ -25,12 +29,12 @@ from xamarinbot.events.replay import ReplayClock
 from xamarinbot.events.store import EventStore
 from xamarinbot.events.types import EventType
 from xamarinbot.feeds.freshness import FeedFreshnessMonitor
-from xamarinbot.feeds.mock import (
-    MockFeedCursor,
-    MockMarketConfigProvider,
-    MockSpotFeed,
-    MockTWAPFeed,
-    MockBookFeed,
+from xamarinbot.replay.feeds import (
+    ReplayCursor,
+    ReplayMarketConfigProvider,
+    ReplaySpotFeed,
+    ReplayTWAPFeed,
+    ReplayBookFeed,
 )
 from xamarinbot.journal.schema import (
     AuditRecord,
@@ -43,7 +47,7 @@ from xamarinbot.journal.schema import (
 from xamarinbot.journal.writer import JournalWriter
 from xamarinbot.portfolio.state import Fill, FeeConfig, LiquidityRole, PortfolioState, apply_fill
 from xamarinbot.reports.baseline_report import build_baseline_report, format_report
-from xamarinbot.synthetic.rounds import generate_synthetic_dataset
+from devtools.synthetic.rounds import generate_synthetic_dataset
 
 
 def _midpoint(book_snapshot):
@@ -73,20 +77,20 @@ class _TypeIndex:
 def run_round(store: EventStore, round_id: str, outcome_side, cfg: BaselineConfig, journal: JournalWriter) -> None:
     clock = ReplayClock(store, round_id)
     round_events = store.all_events(round_id)
-    cursor = MockFeedCursor(store, round_id, preloaded=round_events)
-    twap_feed = MockTWAPFeed(cursor)
-    spot_feed = MockSpotFeed(cursor)
-    book_feed = MockBookFeed(cursor)
-    config_provider = MockMarketConfigProvider(cursor)
+    cursor = ReplayCursor(store, round_id, preloaded=round_events)
+    twap_feed = ReplayTWAPFeed(cursor)
+    spot_feed = ReplaySpotFeed(cursor)
+    book_feed = ReplayBookFeed(cursor)
+    config_provider = ReplayMarketConfigProvider(cursor)
     freshness = FeedFreshnessMonitor(default_max_staleness_s=cfg.freshness_s)
 
     # Separate cursor/feed for the "clob_lookback_s ago" reads, advanced in
     # lock-step (monotonically) with the main cursor each iteration, so
-    # MockBookFeed's incremental cache benefits here too instead of
+    # ReplayBookFeed's incremental cache benefits here too instead of
     # rebuilding a fresh cursor (and re-scanning the whole round) at every
     # decision point.
-    prev_cursor = MockFeedCursor(store, round_id, preloaded=round_events)
-    prev_book_feed = MockBookFeed(prev_cursor)
+    prev_cursor = ReplayCursor(store, round_id, preloaded=round_events)
+    prev_book_feed = ReplayBookFeed(prev_cursor)
     spot_index = _TypeIndex(round_events, EventType.SPOT)
 
     portfolio = PortfolioState()

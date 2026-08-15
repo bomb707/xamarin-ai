@@ -1,11 +1,26 @@
-"""Mock/replay feed adapters satisfying every Phase-1 interface, driven by
-an EventStore. These are the adapters used by replay and tests; real
-adapters (polymarket_clob.py etc.) satisfy the same interfaces so the
-controller code never has to know whether it's live or replaying.
+"""Replay feed adapters satisfying every Phase-1 interface, driven by an
+`EventStore`.
 
-Each adapter shares a MockFeedCursor: "now" advances as the replay clock
-advances, and get_latest()/get_snapshot() only ever return data with
-event_time <= now - the same causality guarantee as the live system, just
+These adapters FABRICATE NOTHING. There is no random number generator and no
+price model in this module: each one reads events that something else
+already wrote into the store and reconstructs a feed-interface view of them.
+What that store contains - a real projected capture (`REAL_REPLAY`) or a
+generated one (`SYNTHETIC_TEST`) - is recorded on `EventStore.provenance`,
+not implied by the class names here.
+
+This module was `feeds/mock.py` until Phase 12C.1 item 3. The rename matters:
+these classes are what replay **real captured market data** into the shadow
+runner, and calling them `Mock*` made the synthetic-vs-real boundary
+impossible to see at a glance. The genuine fabricator now lives outside the
+production namespace entirely, in `devtools/synthetic/`.
+
+The real live adapters (`realtime/feed_adapter.py`) satisfy the same
+interfaces, so controller code never has to know whether it is live or
+replaying.
+
+Each adapter shares a `ReplayCursor`: "now" advances as the replay clock
+advances, and `get_latest()`/`get_snapshot()` only ever return data with
+`event_time <= now` - the same causality guarantee as the live system, just
 driven by a stored log instead of a socket.
 """
 from __future__ import annotations
@@ -30,16 +45,39 @@ from xamarinbot.feeds.base import (
 )
 from xamarinbot.portfolio.state import Side
 
+#: Fields `MarketConfig` actually declares. A MARKET_CONFIG payload may carry
+#: more than that - the real projection attaches a `_provenance` block
+#: recording the raw event it came from (Phase 12C.1 item 8) - and
+#: `MarketConfig(**payload)` would raise on any extra key. Reconstruction
+#: therefore selects the declared fields rather than splatting the payload.
+_MARKET_CONFIG_FIELDS = tuple(MarketConfig.__dataclass_fields__)
+
+
+def market_config_from_payload(payload: dict) -> MarketConfig:
+    """Rebuild a `MarketConfig` from a MARKET_CONFIG event payload.
+
+    Raises `KeyError` naming the missing field rather than silently
+    defaulting one - a market parameter that was never recorded must not be
+    invented at replay time.
+    """
+    missing = [f for f in _MARKET_CONFIG_FIELDS if f not in payload]
+    if missing:
+        raise KeyError(
+            f"MARKET_CONFIG payload is missing required market parameters {missing}; "
+            "refusing to default them"
+        )
+    return MarketConfig(**{f: payload[f] for f in _MARKET_CONFIG_FIELDS})
+
 
 @dataclass
-class MockFeedCursor:
-    """Shared replay cursor: all mock feeds for a round read through this.
+class ReplayCursor:
+    """Shared replay cursor: all replay feeds for a round read through this.
 
     Loads the round's events from the store once at construction time (the
     round is already fully written by the time replay starts - append-only
     events aren't added mid-replay here) and filters/groups them in memory,
     rather than re-querying SQLite and re-sorting on every single
-    events_up_to() call, which is what every mock feed does at every
+    events_up_to() call, which is what every replay feed does at every
     decision point.
 
     `time_attr` selects which Event timestamp gates causal visibility:
@@ -82,13 +120,13 @@ class MockFeedCursor:
 
     def all_of_type(self, event_type: EventType) -> list[Event]:
         """Every event of this type in the round, regardless of `now` -
-        for adapters (MockBookFeed) that want to build a static merged/
+        for adapters (ReplayBookFeed) that want to build a static merged/
         sorted view once and then apply a moving prefix incrementally."""
         return self._by_type.get(event_type, [])
 
 
-class MockMarketConfigProvider(MarketConfigProvider):
-    def __init__(self, cursor: MockFeedCursor):
+class ReplayMarketConfigProvider(MarketConfigProvider):
+    def __init__(self, cursor: ReplayCursor):
         self._cursor = cursor
         self._tick_subscribers: list[Callable[[float], None]] = []
 
@@ -96,8 +134,7 @@ class MockMarketConfigProvider(MarketConfigProvider):
         events = self._cursor.events_up_to(EventType.MARKET_CONFIG)
         if not events:
             raise LookupError(f"no MARKET_CONFIG event visible yet for {market_id}")
-        latest = events[-1].payload
-        return MarketConfig(**latest)
+        return market_config_from_payload(events[-1].payload)
 
     def subscribe_tick_size_changes(self, market_id: str, callback: Callable[[float], None]) -> None:
         self._tick_subscribers.append(callback)
@@ -110,8 +147,8 @@ class MockMarketConfigProvider(MarketConfigProvider):
             prev_tick = tick
 
 
-class MockTWAPFeed(TWAPFeed):
-    def __init__(self, cursor: MockFeedCursor):
+class ReplayTWAPFeed(TWAPFeed):
+    def __init__(self, cursor: ReplayCursor):
         self._cursor = cursor
 
     def get_latest(self, round_id: str) -> TWAPObservation | None:
@@ -141,8 +178,8 @@ class MockTWAPFeed(TWAPFeed):
         pass  # replay has no connection to lose
 
 
-class MockSpotFeed(SpotFeed):
-    def __init__(self, cursor: MockFeedCursor):
+class ReplaySpotFeed(SpotFeed):
+    def __init__(self, cursor: ReplayCursor):
         self._cursor = cursor
 
     def get_latest(self, round_id: str) -> SpotObservation | None:
@@ -154,7 +191,7 @@ class MockSpotFeed(SpotFeed):
             value=e.payload["value"],
             source_ts=e.source_ts if e.source_ts is not None else e.recv_ts,
             recv_ts=e.recv_ts,
-            provider=e.payload.get("provider", "mock"),
+            provider=e.payload.get("provider", "replay"),
         )
 
     def subscribe(self, round_id: str, callback: Callable[[SpotObservation], None]) -> None:
@@ -164,7 +201,7 @@ class MockSpotFeed(SpotFeed):
                     value=e.payload["value"],
                     source_ts=e.source_ts if e.source_ts is not None else e.recv_ts,
                     recv_ts=e.recv_ts,
-                    provider=e.payload.get("provider", "mock"),
+                    provider=e.payload.get("provider", "replay"),
                 )
             )
 
@@ -192,11 +229,11 @@ class _BookSideCache:
     snapshot: BookSnapshot | None = None
 
 
-class MockBookFeed(BookFeed):
+class ReplayBookFeed(BookFeed):
     """Reconstructs book state from BOOK_SNAPSHOT (full replace) and
     BOOK_DELTA (level upsert/remove) events, per side, up to the cursor."""
 
-    def __init__(self, cursor: MockFeedCursor):
+    def __init__(self, cursor: ReplayCursor):
         self._cursor = cursor
         self._side_cache: dict[Side, _BookSideCache] = {}
 
@@ -277,8 +314,8 @@ class MockBookFeed(BookFeed):
         pass
 
 
-class MockUserOrderFeed(UserOrderFeed):
-    def __init__(self, cursor: MockFeedCursor):
+class ReplayUserOrderFeed(UserOrderFeed):
+    def __init__(self, cursor: ReplayCursor):
         self._cursor = cursor
 
     def _latest_by_order(self) -> dict[str, UserOrderEvent]:

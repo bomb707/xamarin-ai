@@ -13,20 +13,28 @@ recorded rounds before trusting Phase 0's baseline performance report.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
 
 from xamarinbot.events.replay import seeded_random
 from xamarinbot.events.store import EventStore
 from xamarinbot.events.types import EventType
 from xamarinbot.portfolio.state import Side
+from xamarinbot.provenance import DataProvenance
+from xamarinbot.rounds import RoundLabel
+
+#: Everything this module produces carries this provenance. Phase 12C.1
+#: item 2: an economic-evaluation path refuses it unless the caller passes
+#: `allow_synthetic=True` explicitly.
+PROVENANCE = DataProvenance.SYNTHETIC_TEST
 
 
-@dataclass(frozen=True)
-class SyntheticRoundResult:
-    round_id: str
-    p0: float
-    final_twap: float
-    outcome: Side
+def new_synthetic_store(db_path: str = ":memory:") -> EventStore:
+    """An `EventStore` correctly labelled as holding fabricated data.
+
+    Prefer this over `EventStore(...)` in demos and tests that then call
+    `generate_synthetic_dataset`, so the label is attached at construction
+    rather than depending on the default.
+    """
+    return EventStore(db_path, provenance=PROVENANCE)
 
 
 def _depth_levels(touch_price: float, is_ask: bool, tick_size: float, book_liquidity: float,
@@ -63,7 +71,7 @@ def populate_synthetic_round(
     resnapshot_interval_s: float = 5.0,
     depth_offsets_ticks: tuple[int, ...] = (0, 2, 4),
     depth_size_multipliers: tuple[float, ...] = (1.0, 1.5, 2.0),
-) -> SyntheticRoundResult:
+) -> RoundLabel:
     """Appends one synthetic round's worth of events to `store` and returns
     its ground-truth settlement outcome. Deterministic for a given
     `round_id` (uses seeded_random, not the process RNG)."""
@@ -206,12 +214,15 @@ def populate_synthetic_round(
         payload={"outcome": outcome.value, "final_twap": final_twap, "p0": p0},
     )
 
-    return SyntheticRoundResult(round_id=round_id, p0=p0, final_twap=final_twap, outcome=outcome)
+    return RoundLabel(
+        round_id=round_id, p0=p0, final_reference=final_twap, outcome=outcome,
+        provenance=PROVENANCE,
+    )
 
 
 def generate_synthetic_dataset(
     store: EventStore, n_rounds: int, round_length_s: float = 300.0, id_offset: int = 0
-) -> list[SyntheticRoundResult]:
+) -> list[RoundLabel]:
     """`id_offset` shifts the absolute round index used for `round_id`,
     `start_ts`, and the bias pattern - every one of `round_id`,
     `bias_bp_per_tick`, and `start_ts` is a pure function of that index

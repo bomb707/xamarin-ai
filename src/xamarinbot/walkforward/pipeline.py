@@ -34,7 +34,7 @@ from xamarinbot.model.features import FeatureSet
 from xamarinbot.mpc.scenario import TransitionModel, build_transition_model
 from xamarinbot.portfolio.state import FeeConfig, Side
 from xamarinbot.regime.classifier import RegimeClassifier
-from xamarinbot.synthetic.rounds import SyntheticRoundResult
+from xamarinbot.rounds import RoundLabel
 from xamarinbot.walkforward.ablations import AblationSpec, RoundResult, run_ablation_round
 from xamarinbot.walkforward.windows import WalkForwardWindow
 
@@ -157,13 +157,13 @@ class WindowArtifacts:
     transition_model: TransitionModel
 
 
-def _rounds_for_ids(all_rounds: list[SyntheticRoundResult], round_ids: tuple[str, ...]) -> list[SyntheticRoundResult]:
+def _rounds_for_ids(all_rounds: list[RoundLabel], round_ids: tuple[str, ...]) -> list[RoundLabel]:
     wanted = set(round_ids)
     return [r for r in all_rounds if r.round_id in wanted]
 
 
 def _train_transition_model(
-    store: EventStore, train_rounds: list[SyntheticRoundResult], feature_cfg: FeatureConfig
+    store: EventStore, train_rounds: list[RoundLabel], feature_cfg: FeatureConfig
 ) -> TransitionModel:
     all_transitions = []
     for result in train_rounds:
@@ -180,7 +180,7 @@ def _train_transition_model(
 
 def fit_window_artifacts(
     window: WalkForwardWindow,
-    all_rounds: list[SyntheticRoundResult],
+    all_rounds: list[RoundLabel],
     store: EventStore,
     feature_cfg: FeatureConfig,
     feature_sets: list[FeatureSet],
@@ -241,7 +241,7 @@ class WindowRoundResult:
 
 def run_walk_forward_ablations(
     store: EventStore,
-    all_rounds: list[SyntheticRoundResult],
+    all_rounds: list[RoundLabel],
     windows: list[WalkForwardWindow],
     feature_cfg: FeatureConfig,
     fee_config: FeeConfig,

@@ -31,7 +31,8 @@ from xamarinbot.execution.simulator import ExecutionSimulator, TakerOrderQueue
 from xamarinbot.features.config import FeatureConfig
 from xamarinbot.features.engine import compute
 from xamarinbot.features.types import FeatureVector
-from xamarinbot.feeds.mock import MockBookFeed, MockFeedCursor, MockSpotFeed, MockTWAPFeed
+from xamarinbot.market.constraints import MarketConstraints
+from xamarinbot.replay.feeds import ReplayBookFeed, ReplayCursor, ReplaySpotFeed, ReplayTWAPFeed, market_config_from_payload
 from xamarinbot.model.features import COMBINED_LEAD_LAG, LEAD_LAG_ONLY, SPOT_ONLY, TWAP_ONLY, FeatureSet, design_vector
 from xamarinbot.model.calibrated import CalibratedModel
 from xamarinbot.model.logistic import LogisticModel
@@ -158,18 +159,18 @@ def _run_baseline_round(
     head-to-head."""
     events = store.all_events(round_id)
     clock = ReplayClock(store, round_id)
-    cursor = MockFeedCursor(store, round_id, preloaded=events)
-    twap_feed, spot_feed, book_feed = MockTWAPFeed(cursor), MockSpotFeed(cursor), MockBookFeed(cursor)
-    prev_clob_cursor = MockFeedCursor(store, round_id, preloaded=events)
-    prev_book_feed = MockBookFeed(prev_clob_cursor)
-    prev_spot_cursor = MockFeedCursor(store, round_id, preloaded=events)
-    prev_spot_feed = MockSpotFeed(prev_spot_cursor)
+    cursor = ReplayCursor(store, round_id, preloaded=events)
+    twap_feed, spot_feed, book_feed = ReplayTWAPFeed(cursor), ReplaySpotFeed(cursor), ReplayBookFeed(cursor)
+    prev_clob_cursor = ReplayCursor(store, round_id, preloaded=events)
+    prev_book_feed = ReplayBookFeed(prev_clob_cursor)
+    prev_spot_cursor = ReplayCursor(store, round_id, preloaded=events)
+    prev_spot_feed = ReplaySpotFeed(prev_spot_cursor)
     # Dedicated cursor/book_feed for fetching the actual causal book at a
     # delayed taker order's matched_ts, only at resolve time (Phase 12B
     # Tranche 1.2 item 2) - kept separate from the decision-time cursor
     # above since it advances to a different timestamp.
-    revalidation_cursor = MockFeedCursor(store, round_id, preloaded=events)
-    revalidation_book_feed = MockBookFeed(revalidation_cursor)
+    revalidation_cursor = ReplayCursor(store, round_id, preloaded=events)
+    revalidation_book_feed = ReplayBookFeed(revalidation_cursor)
     portfolio = PortfolioState()
     sim = ExecutionSimulator(round_id, fee_config, exec_cfg)
     queue = TakerOrderQueue(sim)
@@ -243,16 +244,16 @@ def _run_controller_round(
 ) -> tuple[PortfolioState, int, int]:
     events = store.all_events(round_id)
     clock = ReplayClock(store, round_id)
-    cursor = MockFeedCursor(store, round_id, preloaded=events)
-    book_feed = MockBookFeed(cursor)
+    cursor = ReplayCursor(store, round_id, preloaded=events)
+    book_feed = ReplayBookFeed(cursor)
     # Dedicated cursor/book_feed for fetching the actual causal book at a
     # delayed taker order's matched_ts, only at resolve time (Phase 12B
     # Tranche 1.2 item 2) - kept separate from the main decision-time
     # cursor above since it advances to a different timestamp, mirroring
     # the prev_cursor pattern already used for baseline lookback in this
     # same module.
-    revalidation_cursor = MockFeedCursor(store, round_id, preloaded=events)
-    revalidation_book_feed = MockBookFeed(revalidation_cursor)
+    revalidation_cursor = ReplayCursor(store, round_id, preloaded=events)
+    revalidation_book_feed = ReplayBookFeed(revalidation_cursor)
     regime_clf = RegimeClassifier(round_id=round_id)
     one_step = OneStepController(spec.one_step_cfg, exec_cfg, fee_config)
     mpc = MPCController(spec.mpc_cfg, transition_model or TransitionModel(probabilities={}), one_step) if spec.controller == "mpc" else None
@@ -264,8 +265,13 @@ def _run_controller_round(
     n_attempts = 0
     order_seq = 0
 
-    market_config = next(e.payload for e in events if e.event_type is EventType.MARKET_CONFIG)
-    tick_size = market_config["tick_size"]
+    constraints = MarketConstraints.from_market_config(
+        market_config_from_payload(
+            next(e.payload for e in events if e.event_type is EventType.MARKET_CONFIG)
+        ),
+        provenance=store.provenance,
+        source=f"replayed MARKET_CONFIG ({store.provenance.value})",
+    )
 
     def _book_at(pending) -> tuple:
         revalidation_cursor.advance_to(pending.matched_ts)
@@ -290,7 +296,16 @@ def _run_controller_round(
         book_up = book_feed.get_snapshot(round_id, Side.UP)
         book_down = book_feed.get_snapshot(round_id, Side.DOWN)
         vec = design_vector(fv, spec.feature_set) if model is not None else None
-        q = model.predict_proba(vec) if (model is not None and vec is not None) else 0.5
+        # Phase 12C.1 item 10: the q=0.5 fallback is a SYNTHETIC-only
+        # convenience. This harness runs the 8 mandatory ablations over a
+        # generated dataset; on a real store it must not invent a
+        # probability, so it declines the decision point instead.
+        if model is None or vec is None:
+            if store.provenance.is_real:
+                continue
+            q = 0.5
+        else:
+            q = model.predict_proba(vec)
 
         if supervisor is not None:
             for order_id in list(supervisor.open_order_ids()):
@@ -321,6 +336,7 @@ def _run_controller_round(
                     f"review-{order_id}", tracked.order_state.side, tracked.purpose, tracked.order_state.limit_price,
                     tracked.order_state.remaining_shares, distance_to_touch_ticks=0.0, queue_ahead_shares=0.0,
                     horizon_s=horizon, portfolio=portfolio, q=q, exec_cfg=exec_cfg, cfg=spec.one_step_cfg,
+                    constraints=constraints,
                 )
                 # Phase 12B Tranche 2.1 item 9: a real ReplacementPlan,
                 # re-evaluated against the current book/portfolio, so
@@ -328,7 +344,7 @@ def _run_controller_round(
                 # `current_optimal_ev` staying permanently None.
                 replacement = evaluate_replacement_plan(
                     tracked.order_state.side, tracked.order_state.remaining_shares, book.best_bid.price, book.best_ask.price,
-                    tick_size, spec.one_step_cfg.maker_price_offsets_ticks, horizon, portfolio, q, exec_cfg, fee_config, spec.one_step_cfg,
+                    constraints, spec.one_step_cfg.maker_price_offsets_ticks, horizon, portfolio, q, exec_cfg, fee_config, spec.one_step_cfg,
                 )
                 current_optimal_ev = replacement.delta_ev if replacement is not None else None
                 decision = supervisor.review_order(tracked, decision_ts, snapshot.state, current.delta_ev, current.g_after, fv.tau, True, current_optimal_ev)
@@ -380,10 +396,10 @@ def _run_controller_round(
             # active exposure exists (see MPCController.decide's own
             # docstring for why the deeper rollout doesn't get its own
             # exposure-transition model).
-            mpc_decision = mpc.decide(round_id, decision_ts, portfolio, q, snapshot.state, book_up, book_down, tick_size, True, risk_view=risk_view)
+            mpc_decision = mpc.decide(round_id, decision_ts, portfolio, q, snapshot.state, book_up, book_down, constraints, True, risk_view=risk_view)
             chosen = mpc_decision.chosen
         else:
-            one_step_decision = one_step.decide(round_id, decision_ts, portfolio, q, permitted, book_up, book_down, tick_size, True, risk_view=risk_view)
+            one_step_decision = one_step.decide(round_id, decision_ts, portfolio, q, permitted, book_up, book_down, constraints, True, risk_view=risk_view)
             chosen = one_step_decision.chosen
 
         if chosen.mode is OrderMode.FAK and chosen.qty > 0 and not queue.has_pending:

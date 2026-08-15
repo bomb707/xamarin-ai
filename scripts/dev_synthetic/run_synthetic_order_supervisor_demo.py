@@ -11,7 +11,11 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+sys.path.insert(0, str(_REPO_ROOT / "src"))
+# `devtools` (the synthetic data fabricator) lives at the repo root,
+# deliberately outside the shipped package - see Phase 12C.1 item 4.
+sys.path.insert(0, str(_REPO_ROOT))
 
 from xamarinbot.events.replay import ReplayClock
 from xamarinbot.events.store import EventStore
@@ -21,20 +25,23 @@ from xamarinbot.execution.session import TradingSession
 from xamarinbot.features.config import FeatureConfig
 from xamarinbot.features.engine import compute
 from xamarinbot.features.types import FeatureVector
-from xamarinbot.feeds.mock import MockBookFeed, MockFeedCursor
+from xamarinbot.replay.feeds import ReplayBookFeed, ReplayCursor
 from xamarinbot.journal.schema import SupervisorDecisionRecord
 from xamarinbot.journal.writer import JournalWriter
 from xamarinbot.model.calibrated import fit_calibrated_model
 from xamarinbot.model.dataset import build_examples_multi
 from xamarinbot.model.features import COMBINED_LEAD_LAG, design_vector
 from xamarinbot.model.walkforward import round_ordered_split
+from xamarinbot.market.constraints import MarketConstraints
+from xamarinbot.provenance import DataProvenance
+from xamarinbot.replay.feeds import market_config_from_payload
 from xamarinbot.optimizer.config import OneStepConfig
 from xamarinbot.optimizer.controller import OneStepController
 from xamarinbot.portfolio.state import FeeConfig, PortfolioState, Side
 from xamarinbot.regime.classifier import RegimeClassifier
 from xamarinbot.reports.supervisor_report import build_supervisor_report, format_supervisor_report
 from xamarinbot.supervisor.config import SupervisorConfig
-from xamarinbot.synthetic.rounds import generate_synthetic_dataset
+from devtools.synthetic.rounds import generate_synthetic_dataset
 
 HEARTBEAT_S = 10.0
 N_TRAIN_ROUNDS = 15
@@ -54,23 +61,27 @@ def train_q_model(feature_cfg: FeatureConfig):
 def run_round(store, round_id, p0, feature_cfg, model, controller_cfg, supervisor_cfg, exec_cfg, fee_config, journal) -> tuple[PortfolioState, dict]:
     events = store.all_events(round_id)
     clock = ReplayClock(store, round_id)
-    cursor = MockFeedCursor(store, round_id, preloaded=events)
-    book_feed = MockBookFeed(cursor)
+    cursor = ReplayCursor(store, round_id, preloaded=events)
+    book_feed = ReplayBookFeed(cursor)
     # Dedicated cursor/book_feed for fetching the actual causal book at a
     # delayed taker order's matched_ts, only at resolve time (Phase 12B
     # Tranche 1.2 items 1/2).
-    revalidation_cursor = MockFeedCursor(store, round_id, preloaded=events)
-    revalidation_book_feed = MockBookFeed(revalidation_cursor)
+    revalidation_cursor = ReplayCursor(store, round_id, preloaded=events)
+    revalidation_book_feed = ReplayBookFeed(revalidation_cursor)
     regime_clf = RegimeClassifier(round_id=round_id)
     controller = OneStepController(controller_cfg, exec_cfg, fee_config)
     # Phase 12B Tranche 2.2 item 3: the same shared execution/session
     # engine ShadowRunner now uses - RiskView-gated dispatch, open makers
     # tracked via OrderSupervisor, delayed taker resolution, cancel/
     # replace, all owned by TradingSession rather than duplicated here.
-    session = TradingSession(round_id, fee_config, exec_cfg, controller_cfg, supervisor_cfg=supervisor_cfg)
 
     market_config = next(e.payload for e in events if e.event_type is EventType.MARKET_CONFIG)
-    tick_size = market_config["tick_size"]
+    constraints = MarketConstraints.from_market_config(
+        market_config_from_payload(market_config),
+        provenance=DataProvenance.SYNTHETIC_TEST,
+        source="synthetic demo MARKET_CONFIG",
+    )
+    session = TradingSession(round_id, fee_config, exec_cfg, controller_cfg, constraints, supervisor_cfg=supervisor_cfg)
 
     def _book_at(pending) -> tuple:
         revalidation_cursor.advance_to(pending.matched_ts)
@@ -103,12 +114,12 @@ def run_round(store, round_id, p0, feature_cfg, model, controller_cfg, superviso
 
         # 1) review every open order against current conditions (cancel/
         # replace/expire), journaling each real supervisor decision.
-        session.review_open_orders(decision_ts, snapshot.state, q, book_up, book_down, fv.tau, True, tick_size, on_decision=_journal_decision)
+        session.review_open_orders(decision_ts, snapshot.state, q, book_up, book_down, fv.tau, True, on_decision=_journal_decision)
 
         # 2) place a new order if the one-step controller wants one -
         # gated by the same aggregate RiskView as every other dispatch.
         risk_view = session.risk_view()
-        decision = controller.decide(round_id, decision_ts, session.portfolio, q, snapshot.permitted_actions, book_up, book_down, tick_size, is_fresh=True, risk_view=risk_view)
+        decision = controller.decide(round_id, decision_ts, session.portfolio, q, snapshot.permitted_actions, book_up, book_down, constraints, is_fresh=True, risk_view=risk_view)
         session.dispatch(decision.chosen, decision_ts, snapshot.state, q, book_up, book_down)
 
     stats = {"placed": session.n_maker_placed, "expired_filled": session.n_maker_expired_filled, "expired_unfilled": session.n_maker_expired_unfilled}

@@ -31,6 +31,15 @@ from xamarinbot.portfolio.exposure import RiskView
 from xamarinbot.portfolio.math import OrderPurpose, delta_g_directional, directional_projected_g
 from xamarinbot.portfolio.state import FeeConfig, LiquidityRole, PortfolioState, Side
 from xamarinbot.regime.types import SeedAction
+from xamarinbot.market.constraints import MarketConstraints
+
+# Phase 12C.1 item 12: executable market parameters are a runtime object read
+# from the market, not static config. `for_testing` is explicitly stamped
+# SYNTHETIC_TEST and defaults min_order_shares to 1.0, reproducing the old
+# `OneStepConfig.taker_min_size` default so this file's sizing arithmetic is
+# unchanged - but it can no longer be inherited by a live path.
+CONSTRAINTS = MarketConstraints.for_testing()
+
 
 FEE = FeeConfig()
 ASKS = (BookLevel(0.50, 100.0), BookLevel(0.52, 150.0), BookLevel(0.54, 200.0))
@@ -53,7 +62,7 @@ def test_taker_sizing_produces_exact_partial_quantity_at_risk_budget_boundary():
     cfg = OneStepConfig(g_min=-risk_budget)  # G_current=0 (empty portfolio) - g_min => max_directional_spend = risk_budget
     portfolio = PortfolioState()
 
-    sizing = taker_sizing_boundaries(asks, q_effective=0.9, fee_config=fee_config, cfg=cfg, portfolio=portfolio, side=Side.UP)
+    sizing = taker_sizing_boundaries(asks, q_effective=0.9, fee_config=fee_config, cfg=cfg, portfolio=portfolio, side=Side.UP, constraints=CONSTRAINTS)
 
     assert sizing.p_max == 0.50
     assert any(math.isclose(q, 7.4, rel_tol=1e-6) for q in sizing.quantities), sizing.quantities
@@ -69,7 +78,7 @@ def test_taker_sizing_stops_at_last_level_with_positive_marginal_edge():
     cfg = OneStepConfig(g_min=-1_000_000.0)  # risk budget deliberately not the binding constraint here
     portfolio = PortfolioState()
 
-    sizing = taker_sizing_boundaries(asks, q_effective=0.9, fee_config=fee_config, cfg=cfg, portfolio=portfolio, side=Side.UP)
+    sizing = taker_sizing_boundaries(asks, q_effective=0.9, fee_config=fee_config, cfg=cfg, portfolio=portfolio, side=Side.UP, constraints=CONSTRAINTS)
 
     assert sizing.p_max == 0.50  # the 0.95 level is never walked
     assert max(sizing.quantities) <= 100.0 + 1e-6  # never offers quantity from the rejected level
@@ -81,7 +90,7 @@ def test_taker_sizing_returns_nothing_when_no_level_clears_marginal_edge():
     cfg = OneStepConfig(g_min=-1_000_000.0)
     portfolio = PortfolioState()
 
-    sizing = taker_sizing_boundaries(asks, q_effective=0.1, fee_config=fee_config, cfg=cfg, portfolio=portfolio, side=Side.UP)
+    sizing = taker_sizing_boundaries(asks, q_effective=0.1, fee_config=fee_config, cfg=cfg, portfolio=portfolio, side=Side.UP, constraints=CONSTRAINTS)
 
     assert sizing.p_max is None
     assert sizing.quantities == ()
@@ -93,11 +102,11 @@ def test_taker_sizing_respects_position_and_spend_caps():
     cfg = OneStepConfig(g_min=-1_000_000.0, position_limit=3.0)
     portfolio = PortfolioState()
 
-    sizing = taker_sizing_boundaries(asks, q_effective=0.9, fee_config=fee_config, cfg=cfg, portfolio=portfolio, side=Side.UP)
+    sizing = taker_sizing_boundaries(asks, q_effective=0.9, fee_config=fee_config, cfg=cfg, portfolio=portfolio, side=Side.UP, constraints=CONSTRAINTS)
     assert max(sizing.quantities) <= 3.0 + 1e-6
 
     cfg_spend = OneStepConfig(g_min=-1_000_000.0, spend_cap=5.0)
-    sizing_spend = taker_sizing_boundaries(asks, q_effective=0.9, fee_config=fee_config, cfg=cfg_spend, portfolio=portfolio, side=Side.UP)
+    sizing_spend = taker_sizing_boundaries(asks, q_effective=0.9, fee_config=fee_config, cfg=cfg_spend, portfolio=portfolio, side=Side.UP, constraints=CONSTRAINTS)
     c_1 = 0.50 + fee_config.taker_fee(1.0, 0.50)
     assert max(sizing_spend.quantities) <= (5.0 / c_1) + 1e-6
 
@@ -126,7 +135,7 @@ def test_taker_sizing_uses_exact_side_aware_g_when_buying_the_underrepresented_s
     old_wrong_cap = 50.0 / 0.5175  # ~96.6 - what the flat max_directional_spend budget would have allowed
     exact_boundary = 150.0 / 0.5175  # ~289.86 - the true G_U(x)>=g_min crossing point
 
-    sizing = taker_sizing_boundaries(asks, q_effective=0.9, fee_config=fee_config, cfg=cfg, portfolio=portfolio, side=Side.UP)
+    sizing = taker_sizing_boundaries(asks, q_effective=0.9, fee_config=fee_config, cfg=cfg, portfolio=portfolio, side=Side.UP, constraints=CONSTRAINTS)
 
     assert any(q >= 100.0 for q in sizing.quantities), sizing.quantities  # the prompt's explicit claim: 100 shares must be feasible
     assert any(q > old_wrong_cap for q in sizing.quantities), sizing.quantities  # strictly more than the old (wrong) flat-budget cap
@@ -191,7 +200,7 @@ def test_taker_sizing_boundaries_max_execution_price_by_qty_never_exceeds_p_max(
     cfg = OneStepConfig(g_min=-50.0, min_marginal_edge=0.0)
     portfolio = PortfolioState()
 
-    sizing = taker_sizing_boundaries(asks, q_effective=0.9, fee_config=FEE, cfg=cfg, portfolio=portfolio, side=Side.UP, tick_size=0.01)
+    sizing = taker_sizing_boundaries(asks, q_effective=0.9, fee_config=FEE, cfg=cfg, portfolio=portfolio, side=Side.UP, constraints=CONSTRAINTS)
     assert sizing.p_max is not None
     for qty, price in sizing.max_execution_price_by_qty.items():
         assert price <= sizing.p_max + 1e-9
@@ -203,7 +212,7 @@ def test_taker_sizing_boundaries_uses_tick_size_default_when_not_supplied():
     asks = (BookLevel(0.50, 500.0),)
     cfg = OneStepConfig(g_min=-1_000_000.0)
     portfolio = PortfolioState()
-    sizing = taker_sizing_boundaries(asks, q_effective=0.9, fee_config=FEE, cfg=cfg, portfolio=portfolio, side=Side.UP)
+    sizing = taker_sizing_boundaries(asks, q_effective=0.9, fee_config=FEE, cfg=cfg, portfolio=portfolio, side=Side.UP, constraints=CONSTRAINTS)
     assert sizing.quantities  # runs without error, produces candidates as before
 
 
@@ -218,7 +227,7 @@ def test_taker_sizing_boundaries_are_wired_into_controller_candidate_generation(
     book_down = BookSnapshot(Side.DOWN, bids=(), asks=(), ts=0.0, recv_ts=0.0)
     permitted = frozenset({SeedAction.TAKER_UP, SeedAction.WAIT})
 
-    decision = controller.decide("r0", 10.0, portfolio, q=0.9, permitted_actions=permitted, book_up=book_up, book_down=book_down, tick_size=0.01, is_fresh=True)
+    decision = controller.decide("r0", 10.0, portfolio, q=0.9, permitted_actions=permitted, book_up=book_up, book_down=book_down, constraints=CONSTRAINTS, is_fresh=True)
 
     taker_candidates = [c for c in decision.candidates if c.mode is OrderMode.FAK]
     assert taker_candidates  # the good-edge level produced at least one candidate
@@ -251,8 +260,7 @@ def test_p_min_stays_inactive_by_default_after_favored_side_fix():
     portfolio = PortfolioState()
     candidate = evaluate_taker_candidate(
         "taker_up_1", Side.UP, OrderPurpose.ALPHA, 50.0, limit_price=1.0, asks=ASKS,
-        portfolio=portfolio, q=0.5, fee_config=FEE, cfg=cfg,
-    )
+        portfolio=portfolio, q=0.5, fee_config=FEE, cfg=cfg, constraints=CONSTRAINTS)
     assert "p_min" not in candidate.violated_constraints
 
 # --------------------------------------------------------------------------
@@ -287,7 +295,7 @@ def test_maker_price_grid_empty_when_bid_already_at_ask():
 def test_taker_up_ev_matches_ss13_delta_ev_formula():
     portfolio = PortfolioState()
     cfg = OneStepConfig(g_min=-1_000_000.0)
-    candidate = evaluate_taker_candidate("t1", Side.UP, OrderPurpose.ALPHA, 100.0, 0.99, ASKS, portfolio, q=0.6, fee_config=FEE, cfg=cfg)
+    candidate = evaluate_taker_candidate("t1", Side.UP, OrderPurpose.ALPHA, 100.0, 0.99, ASKS, portfolio, q=0.6, fee_config=FEE, cfg=cfg, constraints=CONSTRAINTS)
     # DeltaEV_U(x) = q*x - K_U(x); K_U(x) = cost + fee
     expected_cost = 100.0 * 0.50
     expected_fee = FEE.taker_fee(100.0, 0.50)
@@ -298,7 +306,7 @@ def test_taker_up_ev_matches_ss13_delta_ev_formula():
 def test_taker_down_ev_matches_ss13_delta_ev_formula():
     portfolio = PortfolioState()
     cfg = OneStepConfig(g_min=-1_000_000.0)
-    candidate = evaluate_taker_candidate("t1", Side.DOWN, OrderPurpose.ALPHA, 100.0, 0.99, ASKS, portfolio, q=0.6, fee_config=FEE, cfg=cfg)
+    candidate = evaluate_taker_candidate("t1", Side.DOWN, OrderPurpose.ALPHA, 100.0, 0.99, ASKS, portfolio, q=0.6, fee_config=FEE, cfg=cfg, constraints=CONSTRAINTS)
     # DeltaEV_D(x) = (1-q)*x - K_D(x)
     expected_cost = 100.0 * 0.50
     expected_fee = FEE.taker_fee(100.0, 0.50)
@@ -309,7 +317,7 @@ def test_taker_down_ev_matches_ss13_delta_ev_formula():
 def test_taker_candidate_rejected_when_g_min_breached():
     portfolio = PortfolioState()
     cfg = OneStepConfig(g_min=0.0)  # any spend at all breaches this from a zero start
-    candidate = evaluate_taker_candidate("t1", Side.UP, OrderPurpose.ALPHA, 100.0, 0.99, ASKS, portfolio, q=0.6, fee_config=FEE, cfg=cfg)
+    candidate = evaluate_taker_candidate("t1", Side.UP, OrderPurpose.ALPHA, 100.0, 0.99, ASKS, portfolio, q=0.6, fee_config=FEE, cfg=cfg, constraints=CONSTRAINTS)
     assert not candidate.is_valid
     assert "g_min" in candidate.violated_constraints
 
@@ -317,7 +325,7 @@ def test_taker_candidate_rejected_when_g_min_breached():
 def test_taker_candidate_rejected_below_edge_min():
     portfolio = PortfolioState()
     cfg = OneStepConfig(g_min=-1_000_000.0, edge_min=1_000_000.0)  # impossibly high bar
-    candidate = evaluate_taker_candidate("t1", Side.UP, OrderPurpose.ALPHA, 100.0, 0.99, ASKS, portfolio, q=0.6, fee_config=FEE, cfg=cfg)
+    candidate = evaluate_taker_candidate("t1", Side.UP, OrderPurpose.ALPHA, 100.0, 0.99, ASKS, portfolio, q=0.6, fee_config=FEE, cfg=cfg, constraints=CONSTRAINTS)
     assert "edge_min" in candidate.violated_constraints
 
 
@@ -325,7 +333,7 @@ def test_taker_candidate_partial_fak_reflected_in_expected_fill():
     portfolio = PortfolioState()
     cfg = OneStepConfig(g_min=-1_000_000.0)
     total_depth = sum(l.size for l in ASKS)
-    candidate = evaluate_taker_candidate("t1", Side.UP, OrderPurpose.ALPHA, total_depth + 1000.0, 0.99, ASKS, portfolio, q=0.6, fee_config=FEE, cfg=cfg)
+    candidate = evaluate_taker_candidate("t1", Side.UP, OrderPurpose.ALPHA, total_depth + 1000.0, 0.99, ASKS, portfolio, q=0.6, fee_config=FEE, cfg=cfg, constraints=CONSTRAINTS)
     assert math.isclose(candidate.expected_fill, total_depth)
 
 
@@ -340,8 +348,7 @@ def test_maker_candidate_ev_is_probability_weighted():
     exec_cfg = ExecutionConfig()
     candidate = evaluate_maker_candidate(
         "m1", Side.UP, OrderPurpose.ALPHA, price=0.45, qty=20.0, distance_to_touch_ticks=0.0,
-        queue_ahead_shares=0.0, horizon_s=10.0, portfolio=portfolio, q=0.6, exec_cfg=exec_cfg, cfg=cfg,
-    )
+        queue_ahead_shares=0.0, horizon_s=10.0, portfolio=portfolio, q=0.6, exec_cfg=exec_cfg, cfg=cfg, constraints=CONSTRAINTS)
     assert 0.0 < candidate.expected_fill < 20.0  # rho in (0,1) at the touch with a real horizon
     assert candidate.mode is OrderMode.POST_ONLY
 
@@ -357,8 +364,7 @@ def test_maker_candidate_constraint_uses_if_filled_portfolio():
     exec_cfg = ExecutionConfig()
     candidate = evaluate_maker_candidate(
         "m1", Side.UP, OrderPurpose.ALPHA, price=0.45, qty=1000.0, distance_to_touch_ticks=0.0,
-        queue_ahead_shares=0.0, horizon_s=10.0, portfolio=portfolio, q=0.6, exec_cfg=exec_cfg, cfg=cfg,
-    )
+        queue_ahead_shares=0.0, horizon_s=10.0, portfolio=portfolio, q=0.6, exec_cfg=exec_cfg, cfg=cfg, constraints=CONSTRAINTS)
     assert "g_min" in candidate.violated_constraints
 
 
@@ -393,7 +399,7 @@ def test_controller_candidate_table_includes_every_permitted_family():
     cfg = OneStepConfig(g_min=-1_000_000.0)
     controller = OneStepController(cfg, ExecutionConfig(), FEE)
     permitted = frozenset({SeedAction.TAKER_UP, SeedAction.MAKER_UP, SeedAction.WAIT})
-    decision = controller.decide("r0", 10.0, PortfolioState(), q=0.6, permitted_actions=permitted, book_up=_up_book(), book_down=_down_book(), tick_size=0.01, is_fresh=True)
+    decision = controller.decide("r0", 10.0, PortfolioState(), q=0.6, permitted_actions=permitted, book_up=_up_book(), book_down=_down_book(), constraints=CONSTRAINTS, is_fresh=True)
 
     modes = {c.mode for c in decision.candidates}
     assert OrderMode.WAIT in modes
@@ -405,7 +411,7 @@ def test_controller_candidate_table_includes_every_permitted_family():
 def test_controller_generates_no_extra_candidates_for_wait_only_regime():
     cfg = OneStepConfig(g_min=-1_000_000.0)
     controller = OneStepController(cfg, ExecutionConfig(), FEE)
-    decision = controller.decide("r0", 10.0, PortfolioState(), q=0.6, permitted_actions=frozenset({SeedAction.WAIT}), book_up=_up_book(), book_down=_down_book(), tick_size=0.01, is_fresh=True)
+    decision = controller.decide("r0", 10.0, PortfolioState(), q=0.6, permitted_actions=frozenset({SeedAction.WAIT}), book_up=_up_book(), book_down=_down_book(), constraints=CONSTRAINTS, is_fresh=True)
     assert len(decision.candidates) == 1
     assert decision.chosen.mode is OrderMode.WAIT
 
@@ -414,7 +420,7 @@ def test_controller_falls_back_to_wait_when_all_directional_candidates_invalid()
     cfg = OneStepConfig(g_min=1_000_000.0)  # impossible to satisfy
     controller = OneStepController(cfg, ExecutionConfig(), FEE)
     permitted = frozenset({SeedAction.TAKER_UP, SeedAction.MAKER_UP})
-    decision = controller.decide("r0", 10.0, PortfolioState(), q=0.6, permitted_actions=permitted, book_up=_up_book(), book_down=_down_book(), tick_size=0.01, is_fresh=True)
+    decision = controller.decide("r0", 10.0, PortfolioState(), q=0.6, permitted_actions=permitted, book_up=_up_book(), book_down=_down_book(), constraints=CONSTRAINTS, is_fresh=True)
     assert decision.chosen.mode is OrderMode.WAIT
     assert all(not c.is_valid for c in decision.candidates if c.mode is not OrderMode.WAIT)
 
@@ -423,7 +429,7 @@ def test_controller_selects_highest_ev_valid_candidate():
     cfg = OneStepConfig(g_min=-1_000_000.0)
     controller = OneStepController(cfg, ExecutionConfig(), FEE)
     permitted = frozenset({SeedAction.TAKER_UP, SeedAction.MAKER_UP, SeedAction.WAIT})
-    decision = controller.decide("r0", 10.0, PortfolioState(), q=0.9, permitted_actions=permitted, book_up=_up_book(), book_down=_down_book(), tick_size=0.01, is_fresh=True)
+    decision = controller.decide("r0", 10.0, PortfolioState(), q=0.9, permitted_actions=permitted, book_up=_up_book(), book_down=_down_book(), constraints=CONSTRAINTS, is_fresh=True)
     valid = [c for c in decision.candidates if c.is_valid]
     assert decision.chosen.delta_ev == max(c.delta_ev for c in valid)
 
@@ -432,7 +438,7 @@ def test_controller_stale_data_forces_wait_only():
     cfg = OneStepConfig(g_min=-1_000_000.0)
     controller = OneStepController(cfg, ExecutionConfig(), FEE)
     permitted = frozenset({SeedAction.TAKER_UP})
-    decision = controller.decide("r0", 10.0, PortfolioState(), q=0.9, permitted_actions=permitted, book_up=_up_book(), book_down=_down_book(), tick_size=0.01, is_fresh=False)
+    decision = controller.decide("r0", 10.0, PortfolioState(), q=0.9, permitted_actions=permitted, book_up=_up_book(), book_down=_down_book(), constraints=CONSTRAINTS, is_fresh=False)
     assert decision.chosen.mode is OrderMode.WAIT
     assert decision.skip_reason == "stale_data"
     assert len(decision.candidates) == 1
@@ -465,7 +471,7 @@ def test_optimizer_never_violates_g_min_across_random_states(u, d, c, q, g_min, 
     book_down = BookSnapshot(Side.DOWN, bids=(BookLevel(max(0.01, 1.0 - ask), 300.0),), asks=(BookLevel(down_ask, 300.0),), ts=0.0, recv_ts=0.0)
 
     permitted = frozenset({SeedAction.TAKER_UP, SeedAction.TAKER_DOWN, SeedAction.MAKER_UP, SeedAction.MAKER_DOWN, SeedAction.WAIT})
-    decision = controller.decide("r0", 10.0, portfolio, q, permitted, book_up, book_down, tick_size=0.01, is_fresh=True)
+    decision = controller.decide("r0", 10.0, portfolio, q, permitted, book_up, book_down, constraints=CONSTRAINTS, is_fresh=True)
 
     # If the starting portfolio is already below g_min (a randomly-drawn
     # portfolio can start there - e.g. g_min > 0 is infeasible from any
@@ -509,7 +515,7 @@ def test_buffer_build_generates_candidate_with_positive_delta_g_even_when_delta_
     low_q = 0.1  # strongly favors DOWN - buying UP is a bad bet standalone
     asks_up = (BookLevel(0.50, 500.0),)
 
-    candidates = generate_buffer_build_candidates("buffer_build", portfolio, asks_up, (), low_q, FEE, cfg)
+    candidates = generate_buffer_build_candidates("buffer_build", portfolio, asks_up, (), low_q, FEE, cfg, constraints=CONSTRAINTS)
 
     assert candidates, "expected at least one BUFFER_BUILD candidate"
     first = candidates[0]
@@ -529,14 +535,14 @@ def test_buffer_build_generates_nothing_when_already_the_overrepresented_side():
     # side selection buys the UNDERrepresented side (D here) - give it an
     # empty down book so there's nothing to walk, proving no candidate
     # materializes rather than incorrectly falling back to buying UP.
-    candidates = generate_buffer_build_candidates("buffer_build", portfolio, (), (), 0.9, FEE, cfg)
+    candidates = generate_buffer_build_candidates("buffer_build", portfolio, (), (), 0.9, FEE, cfg, constraints=CONSTRAINTS)
     assert candidates == []
 
 
 def test_buffer_build_is_exempt_from_edge_min():
     portfolio = PortfolioState(U=0.0, D=100.0, C=0.0)
     cfg = OneStepConfig(g_min=-1_000_000.0, edge_min=1_000_000.0)  # impossibly high bar
-    candidates = generate_buffer_build_candidates("buffer_build", portfolio, (BookLevel(0.50, 500.0),), (), 0.1, FEE, cfg)
+    candidates = generate_buffer_build_candidates("buffer_build", portfolio, (BookLevel(0.50, 500.0),), (), 0.1, FEE, cfg, constraints=CONSTRAINTS)
     assert candidates
     assert "edge_min" not in candidates[0].violated_constraints
 
@@ -549,7 +555,7 @@ def test_alpha_candidate_can_have_positive_ev_and_negative_g_independently():
     not exempt a candidate from the hard g_min gate."""
     portfolio = PortfolioState()
     cfg = OneStepConfig(g_min=0.0)  # any spend at all breaches this from a flat start
-    candidate = evaluate_taker_candidate("t1", Side.UP, OrderPurpose.ALPHA, 100.0, 0.99, ASKS, portfolio, q=0.9, fee_config=FEE, cfg=cfg)
+    candidate = evaluate_taker_candidate("t1", Side.UP, OrderPurpose.ALPHA, 100.0, 0.99, ASKS, portfolio, q=0.9, fee_config=FEE, cfg=cfg, constraints=CONSTRAINTS)
     assert candidate.delta_ev > 0.0  # clearly positive expected value
     assert candidate.g_after < 0.0  # and clearly below the g_min=0.0 floor
     assert not candidate.is_valid
@@ -564,9 +570,9 @@ def test_alpha_candidate_can_have_positive_ev_and_negative_g_independently():
 
 def test_buffer_build_generates_multiple_distinct_quantity_choices():
     portfolio = PortfolioState(U=0.0, D=200.0, C=0.0)
-    cfg = OneStepConfig(g_min=-1_000_000.0, taker_min_size=1.0, taker_qty_step=10.0, taker_qty_grid_points=5)
+    cfg = OneStepConfig(g_min=-1_000_000.0, taker_qty_step=10.0, taker_qty_grid_points=5)
     asks_up = (BookLevel(0.40, 500.0),)
-    candidates = generate_buffer_build_candidates("buffer_build", portfolio, asks_up, (), q=0.5, fee_config=FEE, cfg=cfg)
+    candidates = generate_buffer_build_candidates("buffer_build", portfolio, asks_up, (), q=0.5, fee_config=FEE, cfg=cfg, constraints=CONSTRAINTS)
     quantities = {round(c.qty, 3) for c in candidates}
     assert len(quantities) > 1, "expected multiple distinct BUFFER_BUILD quantity choices, not a single peak candidate"
     assert all(c.expected_delta_g > 0 for c in candidates), "every generated candidate must individually clear ΔG>0"
@@ -579,7 +585,7 @@ def test_buffer_build_candidate_quantities_are_all_individually_delta_g_positive
     portfolio = PortfolioState(U=10.0, D=150.0, C=0.0)
     cfg = OneStepConfig(g_min=-1_000_000.0, taker_qty_step=5.0)
     asks_up = (BookLevel(0.40, 100.0), BookLevel(0.55, 100.0))
-    candidates = generate_buffer_build_candidates("buffer_build", portfolio, asks_up, (), q=0.5, fee_config=FEE, cfg=cfg)
+    candidates = generate_buffer_build_candidates("buffer_build", portfolio, asks_up, (), q=0.5, fee_config=FEE, cfg=cfg, constraints=CONSTRAINTS)
     assert candidates
     for c in candidates:
         k_x = c.expected_fill * c.price  # taker: filled at its own avg price, fee already inside delta_ev's own accounting
@@ -593,18 +599,22 @@ def test_buffer_build_candidate_quantities_are_all_individually_delta_g_positive
 
 def test_buffer_build_generates_a_valid_candidate_when_max_feasible_equals_exact_exchange_minimum():
     """Phase 12B Tranche 2.2 item 4 regression: when the parity gap (x0)
-    itself equals exactly cfg.taker_min_size, the resulting max_feasible
+    itself equals exactly the market minimum, the resulting max_feasible
     quantity is exactly the exchange minimum - applying the 0.999 float-
     safety margin uniformly to every candidate (the prior bug) turned
-    `raw_qty=taker_min_size=1.0` into `qty=0.999`, which then failed its
-    own >= taker_min_size check, silently discarding a genuinely
-    delta_g>0-feasible candidate at exactly the exchange minimum."""
-    portfolio = PortfolioState(U=0.0, D=1.0, C=0.0)  # x0 = D - U = 1.0 = taker_min_size exactly
-    cfg = OneStepConfig(g_min=-1_000_000.0, taker_min_size=1.0)
+    `raw_qty=min_order_shares=1.0` into `qty=0.999`, which then failed its
+    own >= minimum check, silently discarding a genuinely
+    delta_g>0-feasible candidate at exactly the exchange minimum.
+
+    Phase 12C.1 item 11 moved that minimum from `OneStepConfig.taker_min_size`
+    to `MarketConstraints.min_order_shares`; the arithmetic is unchanged
+    because `for_testing()` keeps the same 1.0 value."""
+    portfolio = PortfolioState(U=0.0, D=1.0, C=0.0)  # x0 = D - U = 1.0 = the minimum exactly
+    cfg = OneStepConfig(g_min=-1_000_000.0)
     asks_up = (BookLevel(0.10, 500.0),)
-    candidates = generate_buffer_build_candidates("buffer_build", portfolio, asks_up, (), q=0.5, fee_config=FEE, cfg=cfg)
+    candidates = generate_buffer_build_candidates("buffer_build", portfolio, asks_up, (), q=0.5, fee_config=FEE, cfg=cfg, constraints=CONSTRAINTS)
     assert candidates, "a valid candidate must still exist at the exact exchange minimum when its ΔG is positive"
-    assert any(c.qty >= cfg.taker_min_size - 1e-6 for c in candidates), "the exact-minimum candidate must not be margined below the exchange minimum"
+    assert any(c.qty >= CONSTRAINTS.min_order_shares - 1e-6 for c in candidates), "the exact-minimum candidate must not be margined below the exchange minimum"
 
 
 # --------------------------------------------------------------------------
@@ -652,7 +662,7 @@ def test_hedge_candidate_price_ceiling_is_derived_not_a_hardcoded_1_0():
     the binding constraint, something a hardcoded 1.0 could never do."""
     portfolio = PortfolioState(U=190.0, D=0.0, C=100.0)  # Pi_U=90, Pi_D=-100 - a real hedge is needed
     cfg = OneStepConfig(g_min=-10.0, spend_cap=150.0)
-    hedge = generate_hedge_candidate("hedge", portfolio, (), (BookLevel(0.40, 500.0),), q=0.5, fee_config=FEE, cfg=cfg)
+    hedge = generate_hedge_candidate("hedge", portfolio, (), (BookLevel(0.40, 500.0),), q=0.5, fee_config=FEE, cfg=cfg, constraints=CONSTRAINTS)
     assert hedge is not None
     assert hedge.max_execution_price is not None
     assert hedge.max_execution_price < 1.0, "spend_cap must visibly bind the derived ceiling, proving it isn't a hardcoded 1.0"
@@ -666,7 +676,7 @@ def test_hedge_candidate_price_ceiling_is_derived_not_a_hardcoded_1_0():
 def test_breach_recovery_alpha_is_prohibited_when_already_below_g_min():
     portfolio = PortfolioState(U=0.0, D=0.0, C=200.0)  # G = -200, deep in breach
     cfg = OneStepConfig(g_min=-50.0)
-    candidate = evaluate_taker_candidate("t1", Side.UP, OrderPurpose.ALPHA, 1.0, 0.50, ASKS, portfolio, q=0.9, fee_config=FEE, cfg=cfg)
+    candidate = evaluate_taker_candidate("t1", Side.UP, OrderPurpose.ALPHA, 1.0, 0.50, ASKS, portfolio, q=0.9, fee_config=FEE, cfg=cfg, constraints=CONSTRAINTS)
     assert not candidate.is_valid
     assert "breach_recovery_alpha_prohibited" in candidate.violated_constraints
 
@@ -679,7 +689,7 @@ def test_breach_recovery_allows_partial_hedge_that_improves_g_without_fully_rest
     cfg = OneStepConfig(g_min=-50.0)  # full restoration to -50 is not reachable by a small buy
     # a small UP buy improves G (from -200 towards less-negative) without
     # reaching -50 - must NOT be rejected for missing g_min while in breach.
-    candidate = evaluate_taker_candidate("t1", Side.UP, OrderPurpose.BUFFER_BUILD, 5.0, 0.50, ASKS, portfolio, q=0.5, fee_config=FEE, cfg=cfg)
+    candidate = evaluate_taker_candidate("t1", Side.UP, OrderPurpose.BUFFER_BUILD, 5.0, 0.50, ASKS, portfolio, q=0.5, fee_config=FEE, cfg=cfg, constraints=CONSTRAINTS)
     assert candidate.g_after > portfolio.G, "sanity: this candidate does improve G"
     assert candidate.g_after < cfg.g_min, "sanity: it still doesn't reach g_min in one fill"
     assert "g_min" not in candidate.violated_constraints
@@ -691,7 +701,7 @@ def test_breach_recovery_rejects_a_repair_candidate_that_makes_g_worse():
     cfg = OneStepConfig(g_min=-50.0)
     # DOWN buy while UP=D=0 doesn't move min(U,D) at all (still 0) but adds
     # cost - G strictly worsens.
-    candidate = evaluate_taker_candidate("t1", Side.DOWN, OrderPurpose.HEDGE, 5.0, 0.50, ASKS, portfolio, q=0.5, fee_config=FEE, cfg=cfg)
+    candidate = evaluate_taker_candidate("t1", Side.DOWN, OrderPurpose.HEDGE, 5.0, 0.50, ASKS, portfolio, q=0.5, fee_config=FEE, cfg=cfg, constraints=CONSTRAINTS)
     assert candidate.g_after <= portfolio.G
     assert "breach_recovery_no_improvement" in candidate.violated_constraints
 
@@ -702,7 +712,7 @@ def test_breach_recovery_hard_rule_unaffected_when_not_already_in_breach():
     into the normal case."""
     portfolio = PortfolioState()  # G = 0, safely above g_min
     cfg = OneStepConfig(g_min=-10.0)
-    candidate = evaluate_taker_candidate("t1", Side.UP, OrderPurpose.ALPHA, 1000.0, 0.99, ASKS, portfolio, q=0.9, fee_config=FEE, cfg=cfg)
+    candidate = evaluate_taker_candidate("t1", Side.UP, OrderPurpose.ALPHA, 1000.0, 0.99, ASKS, portfolio, q=0.9, fee_config=FEE, cfg=cfg, constraints=CONSTRAINTS)
     assert candidate.g_after < cfg.g_min  # a large enough buy still breaches it
     assert "g_min" in candidate.violated_constraints
     assert "breach_recovery_no_improvement" not in candidate.violated_constraints  # not the breach-recovery path at all
@@ -725,7 +735,7 @@ def test_breach_recovery_candidate_survives_a_real_risk_view_and_beats_wait_when
 
     decision = controller.decide(
         "r0", 10.0, portfolio, q=0.5, permitted_actions=frozenset({SeedAction.WAIT}),
-        book_up=book_up, book_down=book_down, tick_size=0.01, is_fresh=True, risk_view=risk_view,
+        book_up=book_up, book_down=book_down, constraints=CONSTRAINTS, is_fresh=True, risk_view=risk_view,
     )
 
     buffer_candidates = [c for c in decision.candidates if c.purpose is OrderPurpose.BUFFER_BUILD]
@@ -749,8 +759,7 @@ def test_maker_expected_delta_g_is_rho_weighted_not_the_full_if_filled_delta():
     c = evaluate_maker_candidate(
         "m1", Side.UP, OrderPurpose.ALPHA, price=0.40, qty=50.0,
         distance_to_touch_ticks=2.0, queue_ahead_shares=10.0, horizon_s=10.0,
-        portfolio=portfolio, q=0.6, exec_cfg=ExecutionConfig(), cfg=cfg,
-    )
+        portfolio=portfolio, q=0.6, exec_cfg=ExecutionConfig(), cfg=cfg, constraints=CONSTRAINTS)
     full_if_filled_delta_g = c.g_after - portfolio.G
     assert full_if_filled_delta_g > 0.0  # sanity: filling raises G here (buying the flat/underrepresented side)
     assert c.expected_delta_g < full_if_filled_delta_g, "expected_delta_g must be rho-weighted, strictly less than the full if-filled delta"
@@ -762,7 +771,7 @@ def test_taker_expected_delta_g_equals_the_full_deterministic_delta():
     expected_delta_g must equal the full delta, unlike a maker's."""
     portfolio = PortfolioState(U=0.0, D=100.0, C=0.0)
     cfg = OneStepConfig(g_min=-1_000_000.0)
-    c = evaluate_taker_candidate("t1", Side.UP, OrderPurpose.ALPHA, 20.0, 0.50, ASKS, portfolio, q=0.6, fee_config=FEE, cfg=cfg)
+    c = evaluate_taker_candidate("t1", Side.UP, OrderPurpose.ALPHA, 20.0, 0.50, ASKS, portfolio, q=0.6, fee_config=FEE, cfg=cfg, constraints=CONSTRAINTS)
     assert math.isclose(c.expected_delta_g, c.g_after - portfolio.G)
 
 
@@ -786,19 +795,19 @@ class _RejectAboveQty:
 
 
 def test_decide_reranks_to_next_best_candidate_when_top_choice_is_aggregate_unsafe():
-    cfg = OneStepConfig(g_min=-1_000_000.0, taker_min_size=10.0, taker_qty_step=10.0, taker_qty_grid_points=5)
+    cfg = OneStepConfig(g_min=-1_000_000.0, taker_qty_step=10.0, taker_qty_grid_points=5)
     controller = OneStepController(cfg, ExecutionConfig(), FEE)
     portfolio = PortfolioState()
     book_up = _up_book()
 
-    baseline = controller.decide("r0", 10.0, portfolio, q=0.9, permitted_actions=frozenset({SeedAction.TAKER_UP, SeedAction.WAIT}), book_up=book_up, book_down=_down_book(), tick_size=0.01, is_fresh=True)
+    baseline = controller.decide("r0", 10.0, portfolio, q=0.9, permitted_actions=frozenset({SeedAction.TAKER_UP, SeedAction.WAIT}), book_up=book_up, book_down=_down_book(), constraints=CONSTRAINTS, is_fresh=True)
     taker_candidates = sorted((c for c in baseline.candidates if c.action_id.startswith("taker_up_")), key=lambda c: c.qty)
     assert len(taker_candidates) >= 2, "need at least two distinct taker quantities to prove reranking"
     assert baseline.chosen.qty == max(c.qty for c in taker_candidates), "sanity: without a risk_view, the largest/highest-EV candidate wins"
 
     second_best_qty = sorted({c.qty for c in taker_candidates})[-2]
     stub_risk_view = _RejectAboveQty(reject_above_qty=second_best_qty)
-    reranked = controller.decide("r0", 10.0, portfolio, q=0.9, permitted_actions=frozenset({SeedAction.TAKER_UP, SeedAction.WAIT}), book_up=book_up, book_down=_down_book(), tick_size=0.01, is_fresh=True, risk_view=stub_risk_view)
+    reranked = controller.decide("r0", 10.0, portfolio, q=0.9, permitted_actions=frozenset({SeedAction.TAKER_UP, SeedAction.WAIT}), book_up=book_up, book_down=_down_book(), constraints=CONSTRAINTS, is_fresh=True, risk_view=stub_risk_view)
 
     assert reranked.chosen.mode is not OrderMode.WAIT, "must not fall through to WAIT when a smaller legal candidate exists"
     assert reranked.chosen.qty <= second_best_qty
@@ -812,12 +821,12 @@ def test_buffer_build_controller_wiring_is_off_by_default_and_on_when_enabled():
 
     cfg_off = OneStepConfig(g_min=-1_000_000.0)  # enable_buffer_build defaults False
     controller_off = OneStepController(cfg_off, ExecutionConfig(), FEE)
-    decision_off = controller_off.decide("r0", 10.0, portfolio, q=0.1, permitted_actions=frozenset({SeedAction.WAIT}), book_up=book_up, book_down=book_down, tick_size=0.01, is_fresh=True)
+    decision_off = controller_off.decide("r0", 10.0, portfolio, q=0.1, permitted_actions=frozenset({SeedAction.WAIT}), book_up=book_up, book_down=book_down, constraints=CONSTRAINTS, is_fresh=True)
     assert all(c.purpose is not OrderPurpose.BUFFER_BUILD for c in decision_off.candidates)
 
     cfg_on = OneStepConfig(g_min=-1_000_000.0, enable_buffer_build=True)
     controller_on = OneStepController(cfg_on, ExecutionConfig(), FEE)
-    decision_on = controller_on.decide("r0", 10.0, portfolio, q=0.1, permitted_actions=frozenset({SeedAction.WAIT}), book_up=book_up, book_down=book_down, tick_size=0.01, is_fresh=True)
+    decision_on = controller_on.decide("r0", 10.0, portfolio, q=0.1, permitted_actions=frozenset({SeedAction.WAIT}), book_up=book_up, book_down=book_down, constraints=CONSTRAINTS, is_fresh=True)
     assert any(c.purpose is OrderPurpose.BUFFER_BUILD for c in decision_on.candidates), (
         "BUFFER_BUILD must be generated even under a WAIT-only regime - a portfolio-level decision, not directional"
     )
@@ -838,7 +847,7 @@ def test_hard_regime_gate_still_produces_no_candidate_for_a_disallowed_family():
     controller = OneStepController(cfg, ExecutionConfig(), FEE)
     decision = controller.decide(
         "r0", 10.0, PortfolioState(), q=0.9, permitted_actions=frozenset({SeedAction.WAIT}),
-        book_up=_up_book(), book_down=_down_book(), tick_size=0.01, is_fresh=True,
+        book_up=_up_book(), book_down=_down_book(), constraints=CONSTRAINTS, is_fresh=True,
     )
     assert all(c.mode is OrderMode.WAIT for c in decision.candidates)
 
@@ -852,7 +861,7 @@ def test_soft_regime_generates_disfavored_candidates_with_a_selection_penalty():
     controller = OneStepController(cfg, ExecutionConfig(), FEE)
     decision = controller.decide(
         "r0", 10.0, PortfolioState(), q=0.9, permitted_actions=frozenset({SeedAction.WAIT}),
-        book_up=_up_book(), book_down=_down_book(), tick_size=0.01, is_fresh=True,
+        book_up=_up_book(), book_down=_down_book(), constraints=CONSTRAINTS, is_fresh=True,
     )
     taker_up_candidates = [c for c in decision.candidates if c.action_id.startswith("taker_up_")]
     assert taker_up_candidates, "TAKER_UP must still be generated under soft_regime even though WAIT-only was permitted"
@@ -867,7 +876,7 @@ def test_soft_regime_can_still_select_a_strong_enough_disfavored_candidate():
     controller = OneStepController(cfg, ExecutionConfig(), FEE)
     decision = controller.decide(
         "r0", 10.0, PortfolioState(), q=0.9, permitted_actions=frozenset({SeedAction.WAIT}),
-        book_up=_up_book(), book_down=_down_book(), tick_size=0.01, is_fresh=True,
+        book_up=_up_book(), book_down=_down_book(), constraints=CONSTRAINTS, is_fresh=True,
     )
     assert decision.chosen.mode is not OrderMode.WAIT, "a strong-edge candidate must be able to beat WAIT despite a small regime penalty"
 
@@ -876,7 +885,7 @@ def test_permitted_family_never_gets_a_penalty_under_soft_regime():
     cfg = OneStepConfig(g_min=-1_000_000.0, soft_regime=True, regime_prior_penalty=5.0)
     controller = OneStepController(cfg, ExecutionConfig(), FEE)
     permitted = frozenset({SeedAction.TAKER_UP, SeedAction.WAIT})
-    decision = controller.decide("r0", 10.0, PortfolioState(), q=0.9, permitted_actions=permitted, book_up=_up_book(), book_down=_down_book(), tick_size=0.01, is_fresh=True)
+    decision = controller.decide("r0", 10.0, PortfolioState(), q=0.9, permitted_actions=permitted, book_up=_up_book(), book_down=_down_book(), constraints=CONSTRAINTS, is_fresh=True)
     taker_up_candidates = [c for c in decision.candidates if c.action_id.startswith("taker_up_")]
     assert taker_up_candidates
     assert all(c.selection_penalty == 0.0 for c in taker_up_candidates)
@@ -899,8 +908,8 @@ def test_dynamic_maker_candidates_shrinks_typical_quantity_and_ttl_as_volatility
     (which is dominated by the unrelated risk-boundary quantity)."""
     cfg = OneStepConfig(g_min=-1_000_000.0, maker_quantity=20.0, maker_horizon_s=10.0)
     portfolio = PortfolioState()
-    calm = dynamic_maker_candidates(q=0.6, side=Side.UP, tau=30.0, sigma=0.0, portfolio=portfolio, best_bid=0.48, best_ask=0.50, tick_size=0.01, fee_config=FEE, cfg=cfg)
-    stormy = dynamic_maker_candidates(q=0.6, side=Side.UP, tau=30.0, sigma=3.0, portfolio=portfolio, best_bid=0.48, best_ask=0.50, tick_size=0.01, fee_config=FEE, cfg=cfg)
+    calm = dynamic_maker_candidates(q=0.6, side=Side.UP, tau=30.0, sigma=0.0, portfolio=portfolio, best_bid=0.48, best_ask=0.50, constraints=CONSTRAINTS, fee_config=FEE, cfg=cfg)
+    stormy = dynamic_maker_candidates(q=0.6, side=Side.UP, tau=30.0, sigma=3.0, portfolio=portfolio, best_bid=0.48, best_ask=0.50, constraints=CONSTRAINTS, fee_config=FEE, cfg=cfg)
     assert calm and stormy
     assert any(math.isclose(c.qty, 20.0) for c in calm), "sigma=0 typical size must be the unamped maker_quantity"
     assert any(math.isclose(c.qty, 5.0) for c in stormy), "sigma=3 typical size must be maker_quantity/(1+sigma)=5.0"
@@ -910,8 +919,8 @@ def test_dynamic_maker_candidates_shrinks_typical_quantity_and_ttl_as_volatility
 def test_dynamic_maker_candidates_widens_price_offset_grid_with_volatility():
     cfg = OneStepConfig(g_min=-1_000_000.0)
     portfolio = PortfolioState()
-    calm = dynamic_maker_candidates(q=0.6, side=Side.UP, tau=30.0, sigma=0.0, portfolio=portfolio, best_bid=0.10, best_ask=0.90, tick_size=0.01, fee_config=FEE, cfg=cfg)
-    stormy = dynamic_maker_candidates(q=0.6, side=Side.UP, tau=30.0, sigma=3.0, portfolio=portfolio, best_bid=0.10, best_ask=0.90, tick_size=0.01, fee_config=FEE, cfg=cfg)
+    calm = dynamic_maker_candidates(q=0.6, side=Side.UP, tau=30.0, sigma=0.0, portfolio=portfolio, best_bid=0.10, best_ask=0.90, constraints=CONSTRAINTS, fee_config=FEE, cfg=cfg)
+    stormy = dynamic_maker_candidates(q=0.6, side=Side.UP, tau=30.0, sigma=3.0, portfolio=portfolio, best_bid=0.10, best_ask=0.90, constraints=CONSTRAINTS, fee_config=FEE, cfg=cfg)
     assert len({c.offset_ticks for c in stormy}) > len({c.offset_ticks for c in calm}), "higher sigma must widen (not narrow) the price-offset grid"
 
 
@@ -923,7 +932,7 @@ def test_dynamic_maker_candidates_quantity_respects_exact_price_aware_risk_budge
     actual if-filled G, not the implementation's own internals."""
     cfg = OneStepConfig(g_min=-5.0, maker_quantity=1_000.0)
     portfolio = PortfolioState(U=0.0, D=0.0, C=0.0)  # G=0
-    specs = dynamic_maker_candidates(q=0.6, side=Side.UP, tau=30.0, sigma=0.0, portfolio=portfolio, best_bid=0.48, best_ask=0.50, tick_size=0.01, fee_config=FEE, cfg=cfg)
+    specs = dynamic_maker_candidates(q=0.6, side=Side.UP, tau=30.0, sigma=0.0, portfolio=portfolio, best_bid=0.48, best_ask=0.50, constraints=CONSTRAINTS, fee_config=FEE, cfg=cfg)
     assert specs
     for spec in specs:
         fee = FEE.fee_for(LiquidityRole.MAKER, spec.qty, spec.price)
@@ -935,7 +944,7 @@ def test_dynamic_maker_candidates_quantity_respects_exact_price_aware_risk_budge
 def test_dynamic_maker_candidates_ttl_never_exceeds_tau():
     cfg = OneStepConfig(g_min=-1_000_000.0, maker_horizon_s=1_000.0)
     portfolio = PortfolioState()
-    specs = dynamic_maker_candidates(q=0.6, side=Side.UP, tau=2.0, sigma=0.0, portfolio=portfolio, best_bid=0.48, best_ask=0.50, tick_size=0.01, fee_config=FEE, cfg=cfg)
+    specs = dynamic_maker_candidates(q=0.6, side=Side.UP, tau=2.0, sigma=0.0, portfolio=portfolio, best_bid=0.48, best_ask=0.50, constraints=CONSTRAINTS, fee_config=FEE, cfg=cfg)
     assert specs
     assert all(c.ttl_s <= 2.0 for c in specs), "TTL must not outlive the round (tau) even when maker_horizon_s is large"
 
@@ -946,7 +955,7 @@ def test_dynamic_maker_candidates_generates_nothing_when_remaining_time_below_mi
     prior draft silently clamped TTL back up past `tau` instead."""
     cfg = OneStepConfig(g_min=-1_000_000.0, min_maker_ttl_s=5.0)
     portfolio = PortfolioState()
-    specs = dynamic_maker_candidates(q=0.6, side=Side.UP, tau=1.0, sigma=0.0, portfolio=portfolio, best_bid=0.48, best_ask=0.50, tick_size=0.01, fee_config=FEE, cfg=cfg)
+    specs = dynamic_maker_candidates(q=0.6, side=Side.UP, tau=1.0, sigma=0.0, portfolio=portfolio, best_bid=0.48, best_ask=0.50, constraints=CONSTRAINTS, fee_config=FEE, cfg=cfg)
     assert specs == []
 
 
@@ -959,10 +968,10 @@ def test_dynamic_maker_candidates_tau_none_unconstrained_but_tau_zero_suppresses
     cfg = OneStepConfig(g_min=-1_000_000.0, min_maker_ttl_s=0.0)
     portfolio = PortfolioState()
 
-    unconstrained = dynamic_maker_candidates(q=0.6, side=Side.UP, tau=None, sigma=0.0, portfolio=portfolio, best_bid=0.48, best_ask=0.50, tick_size=0.01, fee_config=FEE, cfg=cfg)
+    unconstrained = dynamic_maker_candidates(q=0.6, side=Side.UP, tau=None, sigma=0.0, portfolio=portfolio, best_bid=0.48, best_ask=0.50, constraints=CONSTRAINTS, fee_config=FEE, cfg=cfg)
     assert unconstrained, "tau=None (unknown) must not suppress maker candidate generation"
 
-    suppressed = dynamic_maker_candidates(q=0.6, side=Side.UP, tau=0.0, sigma=0.0, portfolio=portfolio, best_bid=0.48, best_ask=0.50, tick_size=0.01, fee_config=FEE, cfg=cfg)
+    suppressed = dynamic_maker_candidates(q=0.6, side=Side.UP, tau=0.0, sigma=0.0, portfolio=portfolio, best_bid=0.48, best_ask=0.50, constraints=CONSTRAINTS, fee_config=FEE, cfg=cfg)
     assert suppressed == [], "tau=0.0 (a real, supplied zero remaining time) must suppress maker generation entirely"
 
 
@@ -972,7 +981,7 @@ def test_dynamic_maker_candidates_ttl_le_tau_holds_even_when_the_floor_would_oth
     tau, the tau cap must be applied LAST so the guarantee always holds."""
     cfg = OneStepConfig(g_min=-1_000_000.0, maker_horizon_s=1.0, min_maker_ttl_s=0.0)
     portfolio = PortfolioState()
-    specs = dynamic_maker_candidates(q=0.6, side=Side.UP, tau=0.5, sigma=0.0, portfolio=portfolio, best_bid=0.48, best_ask=0.50, tick_size=0.01, fee_config=FEE, cfg=cfg)
+    specs = dynamic_maker_candidates(q=0.6, side=Side.UP, tau=0.5, sigma=0.0, portfolio=portfolio, best_bid=0.48, best_ask=0.50, constraints=CONSTRAINTS, fee_config=FEE, cfg=cfg)
     assert specs
     assert all(c.ttl_s <= 0.5 for c in specs), "TTL must never exceed tau, even when the 1.0 floor would otherwise push it above a smaller tau"
 
@@ -986,8 +995,8 @@ def test_dynamic_maker_controller_wiring_is_off_by_default_and_matches_fixed_con
     controller = OneStepController(cfg, ExecutionConfig(), FEE)
     permitted = frozenset({SeedAction.MAKER_UP, SeedAction.WAIT})
 
-    decision_no_vol_args = controller.decide("r0", 10.0, PortfolioState(), q=0.6, permitted_actions=permitted, book_up=_up_book(), book_down=_down_book(), tick_size=0.01, is_fresh=True)
-    decision_with_vol_args = controller.decide("r0", 10.0, PortfolioState(), q=0.6, permitted_actions=permitted, book_up=_up_book(), book_down=_down_book(), tick_size=0.01, is_fresh=True, tau=30.0, sigma=5.0)
+    decision_no_vol_args = controller.decide("r0", 10.0, PortfolioState(), q=0.6, permitted_actions=permitted, book_up=_up_book(), book_down=_down_book(), constraints=CONSTRAINTS, is_fresh=True)
+    decision_with_vol_args = controller.decide("r0", 10.0, PortfolioState(), q=0.6, permitted_actions=permitted, book_up=_up_book(), book_down=_down_book(), constraints=CONSTRAINTS, is_fresh=True, tau=30.0, sigma=5.0)
 
     maker_up_no_vol = [c for c in decision_no_vol_args.candidates if c.action_id.startswith("maker_up_")]
     maker_up_with_vol = [c for c in decision_with_vol_args.candidates if c.action_id.startswith("maker_up_")]
@@ -1003,8 +1012,8 @@ def test_dynamic_maker_controller_wiring_uses_dynamic_sizing_when_enabled():
     permitted = frozenset({SeedAction.MAKER_UP, SeedAction.WAIT})
     portfolio = PortfolioState()
 
-    expected_specs = dynamic_maker_candidates(q=0.6, side=Side.UP, tau=30.0, sigma=3.0, portfolio=portfolio, best_bid=_up_book().best_bid.price, best_ask=_up_book().best_ask.price, tick_size=0.01, fee_config=FEE, cfg=cfg)
-    decision = controller.decide("r0", 10.0, portfolio, q=0.6, permitted_actions=permitted, book_up=_up_book(), book_down=_down_book(), tick_size=0.01, is_fresh=True, tau=30.0, sigma=3.0)
+    expected_specs = dynamic_maker_candidates(q=0.6, side=Side.UP, tau=30.0, sigma=3.0, portfolio=portfolio, best_bid=_up_book().best_bid.price, best_ask=_up_book().best_ask.price, constraints=CONSTRAINTS, fee_config=FEE, cfg=cfg)
+    decision = controller.decide("r0", 10.0, portfolio, q=0.6, permitted_actions=permitted, book_up=_up_book(), book_down=_down_book(), constraints=CONSTRAINTS, is_fresh=True, tau=30.0, sigma=3.0)
 
     maker_up = [c for c in decision.candidates if c.action_id.startswith("maker_up_")]
     assert maker_up, "dynamic_maker=True must not suppress maker candidate generation"

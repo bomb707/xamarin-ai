@@ -6,14 +6,14 @@ real subsequent book evolution. Run a parallel paper executor with
 realistic delay/queue assumptions."
 
 Feeds here are the same pluggable Phase 1 interfaces used everywhere else
-(mock/replay today; real adapters once credentials are confirmed - see
+(replay today; real adapters via realtime/feed_adapter.py - see
 docs/PHASE_STATUS.md's "Live adapter confidence"), so this runner is
 already the code that would run against a live stream, not a separate
 implementation to be swapped in later.
 
 The one genuinely new piece versus every prior phase's replay loop: this
 runner gates causal visibility on `recv_ts` (`time_attr="recv_ts"` on
-`MockFeedCursor`), not `event_time`. Every earlier phase's replay/backtest
+`ReplayCursor`), not `event_time`. Every earlier phase's replay/backtest
 code treats an event as "known" once its *source* timestamp has passed
 (`event_time <= decision_ts`, preferring source_ts) - correct for
 reproducible backtesting, but mildly optimistic relative to when a live
@@ -39,7 +39,8 @@ from xamarinbot.execution.session import TradingSession
 from xamarinbot.features.config import FeatureConfig
 from xamarinbot.features.engine import compute
 from xamarinbot.features.types import FeatureVector
-from xamarinbot.feeds.mock import MockBookFeed, MockFeedCursor
+from xamarinbot.market.constraints import MarketConstraints
+from xamarinbot.replay.feeds import ReplayBookFeed, ReplayCursor, market_config_from_payload
 from xamarinbot.model.features import FeatureSet, design_vector
 from xamarinbot.model.calibrated import CalibratedModel
 from xamarinbot.model.logistic import LogisticModel
@@ -54,10 +55,11 @@ from xamarinbot.realtime.freshness import (
     FreshnessReport,
     evaluate_freshness,
 )
+from xamarinbot.provenance import DataProvenance
 from xamarinbot.regime.classifier import RegimeClassifier
 from xamarinbot.regime.matrix import ActionPermissionMatrix, classify_seed_action
 from xamarinbot.shadow.config import ShadowConfig
-from xamarinbot.shadow.types import ShadowDecisionRecord, ShadowRoundResult
+from xamarinbot.shadow.types import DecisionBlockReason, ShadowDecisionRecord, ShadowRoundResult
 
 #: Which `FeedKind` each legacy (normalized) event type reports freshness
 #: for. The Phase-2 event vocabulary predates the real recorder and has one
@@ -77,21 +79,23 @@ _LEGACY_FEED_FOR_EVENT: dict[EventType, FeedKind] = {
     EventType.SPOT: FeedKind.BINANCE,
 }
 
-#: Freshness budgets for a REPLAY of the Phase-2 event store.
+#: Freshness budgets for a replay of a SYNTHETIC store.
 #:
-#: These are derived from the publication cadence of the data being
-#: replayed, exactly as the live budgets in `realtime/freshness.py` are
-#: derived from the measured live rates - not tuned against outcomes. The
-#: synthetic generator (`synthetic/rounds.py`) declares
-#: `tick_interval_s=1.0` for its spot/TWAP series and
+#: Derived from the publication cadence of the data being replayed, exactly
+#: as the live budgets in `realtime/freshness.py` are derived from measured
+#: live rates - not tuned against outcomes. `devtools/synthetic/rounds.py`
+#: declares `tick_interval_s=1.0` for its spot/TWAP series and
 #: `resnapshot_interval_s=5.0` for full book snapshots, and the observed
 #: worst-case ages over a generated round match those exactly (book 5.0s,
 #: TWAP 1.0s, spot 1.0s). Each budget is that cadence plus one interval of
 #: margin, so a feed has to genuinely skip a publication to read as stale.
 #:
-#: A live recorder run uses the default `FreshnessPolicy` instead, whose
-#: much tighter book budget reflects a ~130 message/second stream.
-REPLAY_FRESHNESS_POLICY = FreshnessPolicy(
+#: Phase 12C.1 item 9 RENAMED this from `REPLAY_FRESHNESS_POLICY`. The old
+#: name implied it was the policy for replay in general; it is specifically
+#: the policy for replaying a fabricated feed whose cadence is a property of
+#: the generator, and applying it to real data would accept a book six
+#: seconds stale on a stream that publishes ~130 times a second.
+SYNTHETIC_REPLAY_FRESHNESS_POLICY = FreshnessPolicy(
     max_age_s={
         FeedKind.BOOK: 6.0,
         FeedKind.CHAINLINK_TWAP_60: 2.0,
@@ -99,6 +103,40 @@ REPLAY_FRESHNESS_POLICY = FreshnessPolicy(
     },
     required=frozenset({FeedKind.BOOK, FeedKind.CHAINLINK_TWAP_60, FeedKind.BINANCE}),
 )
+
+#: Freshness budgets for a replay of a REAL capture (item 9: "Real replay
+#: uses the real feed freshness policy derived from actual stream
+#: characteristics").
+#:
+#: Measured over the Phase 12C captures, not assumed:
+#:   book              ~130 messages/second across a round's two tokens, so
+#:                     2.0s of silence is already anomalous
+#:   TWAP-60/Binance   ~1 Hz, so 5.0s allows a few missed observations
+#:                     before the input is unusable
+#: These are the same numbers as `realtime/freshness.py`'s live defaults,
+#: because a replay of real data has the real data's cadence.
+REAL_REPLAY_FRESHNESS_POLICY = FreshnessPolicy(
+    max_age_s={
+        FeedKind.BOOK: 2.0,
+        FeedKind.CHAINLINK_TWAP_60: 5.0,
+        FeedKind.BINANCE: 5.0,
+    },
+    required=frozenset({FeedKind.BOOK, FeedKind.CHAINLINK_TWAP_60, FeedKind.BINANCE}),
+)
+
+
+def freshness_policy_for(provenance: DataProvenance) -> FreshnessPolicy:
+    """Pick the policy from the data's own provenance rather than a default.
+
+    Item 9: "Real replay must not use synthetic publication cadences or
+    synthetic freshness thresholds." A REAL_REPLAY store gets the real
+    budgets; only a SYNTHETIC_TEST store gets the generator-derived ones.
+    """
+    return (
+        REAL_REPLAY_FRESHNESS_POLICY
+        if provenance.is_real
+        else SYNTHETIC_REPLAY_FRESHNESS_POLICY
+    )
 
 
 def freshness_from_events(
@@ -153,6 +191,7 @@ def _record_for(
     freshness_reason: str | None = None,
     invalid_reason: str | None = None,
     suppressed_by_freshness: bool = False,
+    blocked_reason: DecisionBlockReason | None = None,
 ) -> ShadowDecisionRecord:
     return ShadowDecisionRecord(
         round_id=round_id, decision_ts=decision_ts, action_id=chosen.action_id, mode=chosen.mode.value,
@@ -161,6 +200,7 @@ def _record_for(
         decide_elapsed_ms=elapsed_ms, missed_deadline=missed, reconnected=reconnected,
         is_fresh=is_fresh, freshness_reason=freshness_reason,
         invalid_reason=invalid_reason, suppressed_by_freshness=suppressed_by_freshness,
+        blocked_reason=blocked_reason,
     )
 
 
@@ -194,15 +234,15 @@ class ShadowRunner:
         # Phase 12C item 10. Defaults to the replay-cadence policy because
         # this constructor's `store` is a Phase-2 event store; a live
         # service passes the tighter real policy explicitly.
-        self.freshness_policy = freshness_policy or REPLAY_FRESHNESS_POLICY
+        self.freshness_policy = freshness_policy or freshness_policy_for(store.provenance)
 
     def run(self) -> ShadowRoundResult:
         events = self.store.all_events(self.round_id)
         clock = ReplayClock(self.store, self.round_id)
         # time_attr="recv_ts": the true live-arrival gate, not Phase 2's
         # event_time gate - see module docstring.
-        live_cursor = MockFeedCursor(self.store, self.round_id, preloaded=events, time_attr="recv_ts")
-        book_feed = MockBookFeed(live_cursor)
+        live_cursor = ReplayCursor(self.store, self.round_id, preloaded=events, time_attr="recv_ts")
+        book_feed = ReplayBookFeed(live_cursor)
         # Dedicated cursor/book_feed for fetching the actual causal book at
         # a delayed taker order's matched_ts, only at resolve time (Phase
         # 12B Tranche 1.2 items 1/2, corrected in Tranche 2A item 5).
@@ -221,8 +261,8 @@ class ShadowRunner:
         # network/processing latency, which is backwards: a book update
         # that reached the real exchange before matched_ts determines the
         # fill even if it reaches this system's feed handler later.
-        revalidation_cursor = MockFeedCursor(self.store, self.round_id, preloaded=events)
-        revalidation_book_feed = MockBookFeed(revalidation_cursor)
+        revalidation_cursor = ReplayCursor(self.store, self.round_id, preloaded=events)
+        revalidation_book_feed = ReplayBookFeed(revalidation_cursor)
         regime_clf = RegimeClassifier(round_id=self.round_id)
         one_step = OneStepController(self.one_step_cfg, self.exec_cfg, self.fee_config)
         # Phase 12B Tranche 2.2 item 3: the same shared execution/session
@@ -232,17 +272,29 @@ class ShadowRunner:
         # OrderSupervisor on later decision points, taker fills only ever
         # applied at their own resolved matched_ts. ShadowRunner is no
         # longer a separately-maintained, simplified execution engine.
-        session = TradingSession(self.round_id, self.fee_config, self.exec_cfg, self.one_step_cfg)
+        # Phase 12C.1 item 12: the round's executable market parameters come
+        # from the MARKET_CONFIG event this store actually recorded - tick
+        # size, minimum order size in SHARES, fee rate and taker delay - not
+        # from a static strategy config. On a REAL_REPLAY store these are the
+        # values the venue reported for that market.
+        market_config = market_config_from_payload(
+            next(e.payload for e in events if e.event_type is EventType.MARKET_CONFIG)
+        )
+        constraints = MarketConstraints.from_market_config(
+            market_config,
+            provenance=self.store.provenance,
+            source=f"replayed MARKET_CONFIG ({self.store.provenance.value})",
+        )
+
+        session = TradingSession(self.round_id, self.fee_config, self.exec_cfg, self.one_step_cfg, constraints)
         records: list[ShadowDecisionRecord] = []
         n_reconnects = 0
         n_missed = 0
         n_freshness_failures = 0
         n_invalid = 0
         n_reviewed_stale = 0
+        n_model_unavailable = 0
         pending_reconnect_ack = False
-
-        market_config = next(e.payload for e in events if e.event_type is EventType.MARKET_CONFIG)
-        tick_size = market_config["tick_size"]
 
         def _book_at(pending) -> tuple:
             revalidation_cursor.advance_to(pending.matched_ts)
@@ -287,7 +339,7 @@ class ShadowRunner:
                 decision_ts, state, last_q,
                 book_feed.get_snapshot(self.round_id, Side.UP),
                 book_feed.get_snapshot(self.round_id, Side.DOWN),
-                last_tau, False, tick_size,
+                last_tau, False,
             )
             return len(open_ids)
 
@@ -320,6 +372,7 @@ class ShadowRunner:
                     0.0, False, False,
                     is_fresh=False, freshness_reason="feed disconnected (simulated outage)",
                     suppressed_by_freshness=True,
+                    blocked_reason=DecisionBlockReason.FEED_DISCONNECTED,
                 ))
                 pending_reconnect_ack = True
                 continue
@@ -353,6 +406,7 @@ class ShadowRunner:
                     freshness_reason=freshness_reason,
                     invalid_reason=fv.reason.value,
                     suppressed_by_freshness=True,
+                    blocked_reason=DecisionBlockReason.INVALID_FEATURES,
                 ))
                 pending_reconnect_ack = False
                 continue
@@ -361,7 +415,32 @@ class ShadowRunner:
             book_up = book_feed.get_snapshot(self.round_id, Side.UP)
             book_down = book_feed.get_snapshot(self.round_id, Side.DOWN)
             vec = design_vector(fv, self.feature_set) if (self.model is not None and self.feature_set is not None) else None
-            q = self.model.predict_proba(vec) if (self.model is not None and vec is not None) else 0.5
+            if self.model is None or vec is None:
+                # Phase 12C.1 item 10: modelUnavailable => NO_ALPHA.
+                #
+                # This branch used to be `else 0.5`, silently converting "we
+                # have no probability estimate" into "the true probability is
+                # exactly 50%" - a number the optimizer then sized real
+                # (paper) orders against. On REAL_LIVE/REAL_REPLAY the run
+                # now declines to have an opinion and records why. The
+                # fallback survives ONLY for SYNTHETIC_TEST data, where the
+                # point is to exercise the pipeline, never to produce a
+                # number anyone acts on.
+                if self.store.provenance.is_real:
+                    n_model_unavailable += 1
+                    n_reviewed_stale += _supervise_unsafe_orders(decision_ts)
+                    records.append(_record_for(
+                        self.round_id, decision_ts, wait_candidate("wait", session.portfolio),
+                        (time.perf_counter() - t0) * 1000.0, False, pending_reconnect_ack,
+                        is_fresh=is_fresh, freshness_reason=freshness_reason,
+                        suppressed_by_freshness=True,
+                        blocked_reason=DecisionBlockReason.MODEL_UNAVAILABLE,
+                    ))
+                    pending_reconnect_ack = False
+                    continue
+                q = 0.5
+            else:
+                q = self.model.predict_proba(vec)
             permitted = ActionPermissionMatrix.permitted_actions(classify_seed_action(snapshot.state))
             last_q, last_tau = q, fv.tau
 
@@ -372,7 +451,7 @@ class ShadowRunner:
             # this is what triggers SS16's FEED_STALE cancel.
             n_open_before_review = len(list(session.supervisor.open_order_ids()))
             session.review_open_orders(
-                decision_ts, snapshot.state, q, book_up, book_down, fv.tau, is_fresh, tick_size
+                decision_ts, snapshot.state, q, book_up, book_down, fv.tau, is_fresh
             )
 
             if not is_fresh:
@@ -391,6 +470,7 @@ class ShadowRunner:
                     (time.perf_counter() - t0) * 1000.0, False, pending_reconnect_ack,
                     is_fresh=False, freshness_reason=freshness_reason,
                     suppressed_by_freshness=True,
+                    blocked_reason=DecisionBlockReason.FEED_STALE,
                 ))
                 pending_reconnect_ack = False
                 continue
@@ -405,7 +485,7 @@ class ShadowRunner:
             # values were sitting on `fv`.
             decision = one_step.decide(
                 self.round_id, decision_ts, session.portfolio, q, permitted,
-                book_up, book_down, tick_size, is_fresh,
+                book_up, book_down, constraints, is_fresh,
                 tau=fv.tau, sigma=fv.realized_vol, risk_view=risk_view,
             )
             elapsed_ms = (time.perf_counter() - t0) * 1000.0
@@ -428,4 +508,6 @@ class ShadowRunner:
             n_freshness_failures=n_freshness_failures,
             n_invalid_feature_states=n_invalid,
             n_orders_reviewed_while_stale=n_reviewed_stale,
+            n_model_unavailable=n_model_unavailable,
+            provenance=self.store.provenance,
         )

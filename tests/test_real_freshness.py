@@ -12,7 +12,12 @@ from xamarinbot.realtime.freshness import (
     evaluate_feed,
     evaluate_freshness,
 )
-from xamarinbot.shadow.runner import REPLAY_FRESHNESS_POLICY, freshness_from_events
+from xamarinbot.shadow.runner import (
+    REAL_REPLAY_FRESHNESS_POLICY,
+    SYNTHETIC_REPLAY_FRESHNESS_POLICY,
+    freshness_from_events,
+    freshness_policy_for,
+)
 
 NOW = 1000.0
 
@@ -106,7 +111,7 @@ def test_age_is_measured_from_source_time_not_receive_time():
         (EventType.TWAP, 99.5, 10.0),
     ])
     events = store.all_events("r1")
-    r = freshness_from_events(events, 100.0, REPLAY_FRESHNESS_POLICY)
+    r = freshness_from_events(events, 100.0, SYNTHETIC_REPLAY_FRESHNESS_POLICY)
     assert r.feeds[FeedKind.CHAINLINK_TWAP_60].age_s == pytest.approx(90.0)
     assert r.is_fresh is False
     assert "chainlink_twap_60:STALE" in r.reason
@@ -118,7 +123,7 @@ def test_only_arrived_events_contribute():
     store = _store_with([(EventType.TWAP, 200.0, 99.9)])
     events = store.all_events("r1")
     r = freshness_from_events([e for e in events if e.recv_ts <= 100.0], 100.0,
-                              REPLAY_FRESHNESS_POLICY)
+                              SYNTHETIC_REPLAY_FRESHNESS_POLICY)
     assert r.feeds[FeedKind.CHAINLINK_TWAP_60].status is FeedStatus.MISSING
 
 
@@ -127,17 +132,41 @@ def test_replay_policy_does_not_require_a_feed_the_replay_cannot_supply():
     requiring one would make every replay decision permanently not-fresh -
     and mapping the synthetic SPOT series to it would have manufactured a
     settlement reference out of a leading-price series."""
-    assert FeedKind.CHAINLINK_REFERENCE not in REPLAY_FRESHNESS_POLICY.required
-    assert REPLAY_FRESHNESS_POLICY.required == {
+    assert FeedKind.CHAINLINK_REFERENCE not in SYNTHETIC_REPLAY_FRESHNESS_POLICY.required
+    assert SYNTHETIC_REPLAY_FRESHNESS_POLICY.required == {
         FeedKind.BOOK, FeedKind.CHAINLINK_TWAP_60, FeedKind.BINANCE,
     }
 
 
 def test_replay_budgets_match_the_generators_declared_cadence():
-    """Derived from `synthetic/rounds.py`'s own `tick_interval_s=1.0` and
+    """Derived from `devtools/synthetic/rounds.py`'s own `tick_interval_s=1.0` and
     `resnapshot_interval_s=5.0`, each plus one interval of margin - not
     tuned against results."""
-    p = REPLAY_FRESHNESS_POLICY
+    p = SYNTHETIC_REPLAY_FRESHNESS_POLICY
     assert p.limit_for(FeedKind.BOOK) == 6.0
     assert p.limit_for(FeedKind.CHAINLINK_TWAP_60) == 2.0
     assert p.limit_for(FeedKind.BINANCE) == 2.0
+
+
+# ------------------------------------- Phase 12C.1 item 9: real vs synthetic
+
+def test_real_replay_uses_real_stream_cadence_not_synthetic_cadence():
+    """Item 9: "Real replay must not use synthetic publication cadences or
+    synthetic freshness thresholds." The real book stream publishes ~130
+    messages/second, so a 6-second budget derived from the generator's
+    5-second resnapshot interval would accept a catastrophically stale book."""
+    real = REAL_REPLAY_FRESHNESS_POLICY
+    synth = SYNTHETIC_REPLAY_FRESHNESS_POLICY
+    assert real.limit_for(FeedKind.BOOK) == 2.0
+    assert real.limit_for(FeedKind.BOOK) < synth.limit_for(FeedKind.BOOK)
+    # the ~1 Hz reference feeds get a LOOSER budget than the synthetic 1s
+    # tick, because a real 1 Hz feed may legitimately skip an observation
+    assert real.limit_for(FeedKind.CHAINLINK_TWAP_60) > synth.limit_for(FeedKind.CHAINLINK_TWAP_60)
+
+
+def test_policy_is_selected_from_the_data_s_own_provenance():
+    from xamarinbot.provenance import DataProvenance
+
+    assert freshness_policy_for(DataProvenance.REAL_REPLAY) is REAL_REPLAY_FRESHNESS_POLICY
+    assert freshness_policy_for(DataProvenance.REAL_LIVE) is REAL_REPLAY_FRESHNESS_POLICY
+    assert freshness_policy_for(DataProvenance.SYNTHETIC_TEST) is SYNTHETIC_REPLAY_FRESHNESS_POLICY

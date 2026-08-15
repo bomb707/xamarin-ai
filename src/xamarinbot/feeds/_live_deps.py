@@ -1,6 +1,6 @@
 """Optional-dependency guard for the real (live) adapters.
 
-Core replay/mock code has zero network dependencies. Real adapters need
+Core replay code has zero network dependencies. Real adapters need
 `pip install xamarinbot[live]` (httpx + websockets); importing them without
 that extra fails loudly here rather than at some deeper, confusing point.
 """

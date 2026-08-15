@@ -21,6 +21,15 @@ from xamarinbot.portfolio.math import OrderPurpose
 from xamarinbot.portfolio.state import FeeConfig, PortfolioState, Side
 from xamarinbot.regime.matrix import ActionPermissionMatrix, classify_seed_action
 from xamarinbot.regime.types import Direction, GapRegime, RegimeState, RegimeTransition
+from xamarinbot.market.constraints import MarketConstraints
+
+# Phase 12C.1 item 12: executable market parameters are a runtime object read
+# from the market, not static config. `for_testing` is explicitly stamped
+# SYNTHETIC_TEST and defaults min_order_shares to 1.0, reproducing the old
+# `OneStepConfig.taker_min_size` default so this file's sizing arithmetic is
+# unchanged - but it can no longer be inherited by a live path.
+CONSTRAINTS = MarketConstraints.for_testing()
+
 
 FEE = FeeConfig()
 REGIME_A = RegimeState(GapRegime.UPPER_MIDDLE, Direction.UP, Direction.UP)
@@ -107,10 +116,10 @@ def test_degenerate_horizon_matches_one_step_exactly():
     mpc = MPCController(MPCConfig(horizon_steps=1), TransitionModel(probabilities={}), one_step)
     portfolio = PortfolioState()
 
-    mpc_decision = mpc.decide("r0", 10.0, portfolio, 0.65, REGIME_A, BOOK_UP, BOOK_DOWN, 0.01, True)
+    mpc_decision = mpc.decide("r0", 10.0, portfolio, 0.65, REGIME_A, BOOK_UP, BOOK_DOWN, CONSTRAINTS, True)
 
     permitted = ActionPermissionMatrix.permitted_actions(classify_seed_action(REGIME_A))
-    base_decision = one_step.decide("r0", 10.0, portfolio, 0.65, permitted, BOOK_UP, BOOK_DOWN, 0.01, True)
+    base_decision = one_step.decide("r0", 10.0, portfolio, 0.65, permitted, BOOK_UP, BOOK_DOWN, CONSTRAINTS, True)
 
     assert mpc_decision.chosen.action_id == base_decision.chosen.action_id
     assert math.isclose(mpc_decision.chosen.delta_ev, base_decision.chosen.delta_ev)
@@ -123,9 +132,9 @@ def test_degenerate_horizon_matches_across_several_states_and_portfolios():
 
     for portfolio in (PortfolioState(), PortfolioState(U=100.0, D=20.0, C=50.0)):
         for regime in (REGIME_A, REGIME_B, RegimeState(GapRegime.LOWER_MIDDLE, Direction.DOWN, Direction.DOWN)):
-            mpc_decision = mpc.decide("r0", 10.0, portfolio, 0.55, regime, BOOK_UP, BOOK_DOWN, 0.01, True)
+            mpc_decision = mpc.decide("r0", 10.0, portfolio, 0.55, regime, BOOK_UP, BOOK_DOWN, CONSTRAINTS, True)
             permitted = ActionPermissionMatrix.permitted_actions(classify_seed_action(regime))
-            base_decision = one_step.decide("r0", 10.0, portfolio, 0.55, permitted, BOOK_UP, BOOK_DOWN, 0.01, True)
+            base_decision = one_step.decide("r0", 10.0, portfolio, 0.55, permitted, BOOK_UP, BOOK_DOWN, CONSTRAINTS, True)
             assert mpc_decision.chosen.action_id == base_decision.chosen.action_id
 
 
@@ -141,10 +150,10 @@ def test_timeout_fallback_returns_plain_one_step_decision():
     mpc = MPCController(MPCConfig(horizon_steps=3, time_budget_ms=0.0), model, one_step)
     portfolio = PortfolioState()
 
-    mpc_decision = mpc.decide("r0", 10.0, portfolio, 0.65, REGIME_A, BOOK_UP, BOOK_DOWN, 0.01, True)
+    mpc_decision = mpc.decide("r0", 10.0, portfolio, 0.65, REGIME_A, BOOK_UP, BOOK_DOWN, CONSTRAINTS, True)
 
     permitted = ActionPermissionMatrix.permitted_actions(classify_seed_action(REGIME_A))
-    base_decision = one_step.decide("r0", 10.0, portfolio, 0.65, permitted, BOOK_UP, BOOK_DOWN, 0.01, True)
+    base_decision = one_step.decide("r0", 10.0, portfolio, 0.65, permitted, BOOK_UP, BOOK_DOWN, CONSTRAINTS, True)
 
     assert mpc_decision.used_fallback
     assert mpc_decision.chosen.action_id == base_decision.chosen.action_id
@@ -155,7 +164,7 @@ def test_generous_time_budget_does_not_fall_back():
     one_step = _one_step()
     model = build_transition_model([RegimeTransition("r0", REGIME_A, REGIME_A, None, 1.0, 1.0)])
     mpc = MPCController(MPCConfig(horizon_steps=2, time_budget_ms=5000.0), model, one_step)
-    decision = mpc.decide("r0", 10.0, PortfolioState(), 0.65, REGIME_A, BOOK_UP, BOOK_DOWN, 0.01, True)
+    decision = mpc.decide("r0", 10.0, PortfolioState(), 0.65, REGIME_A, BOOK_UP, BOOK_DOWN, CONSTRAINTS, True)
     assert not decision.used_fallback
     assert decision.sequence_values
 
@@ -200,7 +209,7 @@ def test_continuation_does_not_double_count_consumed_liquidity():
         RegimeTransition("r0", REGIME_A, REGIME_B, None, 2.0, 1.0),
     ])
     mpc = MPCController(MPCConfig(horizon_steps=2, transition_top_k=2, time_budget_ms=1000.0), model, one_step)
-    decision = mpc.decide("r0", 10.0, PortfolioState(), 0.7, REGIME_A, BOOK_UP, BOOK_DOWN, 0.01, True)
+    decision = mpc.decide("r0", 10.0, PortfolioState(), 0.7, REGIME_A, BOOK_UP, BOOK_DOWN, CONSTRAINTS, True)
 
     values = list(decision.sequence_values.values())
     assert max(values) - min(values) < 1e-6, f"sequence values should tie under zero churn cost: {decision.sequence_values}"
@@ -217,7 +226,7 @@ def test_nonzero_churn_penalty_favors_consolidating_into_fewer_actions():
         RegimeTransition("r0", REGIME_A, REGIME_B, None, 2.0, 1.0),
     ])
     mpc = MPCController(MPCConfig(horizon_steps=2, transition_top_k=2, time_budget_ms=1000.0), model, one_step)
-    decision = mpc.decide("r0", 10.0, PortfolioState(), 0.7, REGIME_A, BOOK_UP, BOOK_DOWN, 0.01, True)
+    decision = mpc.decide("r0", 10.0, PortfolioState(), 0.7, REGIME_A, BOOK_UP, BOOK_DOWN, CONSTRAINTS, True)
 
     # the single-action, full-depth candidate must strictly beat the
     # smaller, split-requiring candidate once each action costs something.
@@ -288,7 +297,7 @@ def test_mpc_immediate_decision_respects_risk_view():
     mpc = MPCController(MPCConfig(horizon_steps=1), TransitionModel(probabilities={}), one_step)
     portfolio = PortfolioState()
 
-    unconstrained = mpc.decide("r0", 10.0, portfolio, 0.9, REGIME_A, BOOK_UP, BOOK_DOWN, 0.01, True)
+    unconstrained = mpc.decide("r0", 10.0, portfolio, 0.9, REGIME_A, BOOK_UP, BOOK_DOWN, CONSTRAINTS, True)
     assert unconstrained.chosen.mode is not OrderMode.WAIT, "sanity: without a risk_view, MPC picks a real trade"
 
     # A RiskView that rejects every candidate must force MPC back to WAIT,
@@ -297,7 +306,7 @@ def test_mpc_immediate_decision_respects_risk_view():
         def admits(self, candidate, g_min, spend_cap, position_limit=None, is_recovery_candidate=False, exact_subset_cap=10):
             return False
 
-    constrained = mpc.decide("r0", 10.0, portfolio, 0.9, REGIME_A, BOOK_UP, BOOK_DOWN, 0.01, True, risk_view=_RejectEverything())
+    constrained = mpc.decide("r0", 10.0, portfolio, 0.9, REGIME_A, BOOK_UP, BOOK_DOWN, CONSTRAINTS, True, risk_view=_RejectEverything())
     assert constrained.chosen.mode is OrderMode.WAIT, "a RiskView rejecting everything must force MPC's immediate decision to WAIT too"
 
 
@@ -311,7 +320,7 @@ def test_mpc_sequence_value_uses_the_same_candidate_selection_score_as_one_step(
     mpc = MPCController(MPCConfig(horizon_steps=1), TransitionModel(probabilities={}), one_step)
     portfolio = PortfolioState()
 
-    decision = mpc.decide("r0", 10.0, portfolio, 0.65, REGIME_A, BOOK_UP, BOOK_DOWN, 0.01, True)
+    decision = mpc.decide("r0", 10.0, portfolio, 0.65, REGIME_A, BOOK_UP, BOOK_DOWN, CONSTRAINTS, True)
     assert decision.sequence_values
     for c in decision.candidates:
         if c.action_id in decision.sequence_values:
@@ -337,11 +346,11 @@ def test_mpc_falls_back_to_risk_aware_one_step_when_real_active_exposure_exists(
     risk_view = RiskView(portfolio, pending_taker_exposure=PendingExposure(orders=(pending_order,), potential_up_shares=50.0, max_committed_spend=25.0))
     assert risk_view.combined_exposure.orders  # sanity: real active exposure is present
 
-    decision = mpc.decide("r0", 10.0, portfolio, 0.65, REGIME_A, BOOK_UP, BOOK_DOWN, 0.01, True, risk_view=risk_view)
+    decision = mpc.decide("r0", 10.0, portfolio, 0.65, REGIME_A, BOOK_UP, BOOK_DOWN, CONSTRAINTS, True, risk_view=risk_view)
     assert decision.used_fallback, "MPC must fall back to the plain risk-aware one-step decision when real active exposure exists"
 
     permitted = ActionPermissionMatrix.permitted_actions(classify_seed_action(REGIME_A))
-    base_decision = one_step.decide("r0", 10.0, portfolio, 0.65, permitted, BOOK_UP, BOOK_DOWN, 0.01, True, risk_view=risk_view)
+    base_decision = one_step.decide("r0", 10.0, portfolio, 0.65, permitted, BOOK_UP, BOOK_DOWN, CONSTRAINTS, True, risk_view=risk_view)
     assert decision.chosen.action_id == base_decision.chosen.action_id
 
 
@@ -355,6 +364,6 @@ def test_mpc_does_not_fall_back_when_risk_view_has_no_active_exposure():
     portfolio = PortfolioState()
     risk_view = RiskView(portfolio)  # no pending taker / open maker exposure at all
 
-    decision = mpc.decide("r0", 10.0, portfolio, 0.65, REGIME_A, BOOK_UP, BOOK_DOWN, 0.01, True, risk_view=risk_view)
+    decision = mpc.decide("r0", 10.0, portfolio, 0.65, REGIME_A, BOOK_UP, BOOK_DOWN, CONSTRAINTS, True, risk_view=risk_view)
     assert not decision.used_fallback
     assert decision.sequence_values

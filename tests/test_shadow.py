@@ -12,7 +12,7 @@ from xamarinbot.events.store import EventStore
 from xamarinbot.events.types import EventType
 from xamarinbot.execution.config import ExecutionConfig
 from xamarinbot.features.config import FeatureConfig
-from xamarinbot.feeds.mock import MockFeedCursor, MockTWAPFeed
+from xamarinbot.replay.feeds import ReplayCursor, ReplayTWAPFeed
 from xamarinbot.model.calibrated import fit_calibrated_model
 from xamarinbot.model.dataset import build_examples_multi
 from xamarinbot.model.features import COMBINED_LEAD_LAG
@@ -22,7 +22,7 @@ from xamarinbot.portfolio.state import FeeConfig
 from xamarinbot.shadow.config import ShadowConfig
 from xamarinbot.shadow.parity import compare_live_vs_replay
 from xamarinbot.shadow.runner import FaultInjector, ShadowRunner
-from xamarinbot.synthetic.rounds import generate_synthetic_dataset
+from devtools.synthetic.rounds import generate_synthetic_dataset
 
 HEARTBEAT_S = 10.0
 
@@ -44,9 +44,9 @@ def _store_with_source_recv_gap() -> EventStore:
 
 def test_recv_ts_gated_cursor_does_not_leak_future_arriving_event():
     store = _store_with_source_recv_gap()
-    live_cursor = MockFeedCursor(store, "r1", time_attr="recv_ts")
+    live_cursor = ReplayCursor(store, "r1", time_attr="recv_ts")
     live_cursor.advance_to(3.0)
-    feed = MockTWAPFeed  # not used - SPOT via generic events_up_to instead
+    feed = ReplayTWAPFeed  # not used - SPOT via generic events_up_to instead
     visible = live_cursor.events_up_to(EventType.SPOT)
     assert len(visible) == 1
     assert visible[0].payload["value"] == 100.0  # the recv_ts=5.0 event must not leak at t=3.0
@@ -54,7 +54,7 @@ def test_recv_ts_gated_cursor_does_not_leak_future_arriving_event():
 
 def test_recv_ts_gated_cursor_exposes_event_once_actually_received():
     store = _store_with_source_recv_gap()
-    live_cursor = MockFeedCursor(store, "r1", time_attr="recv_ts")
+    live_cursor = ReplayCursor(store, "r1", time_attr="recv_ts")
     live_cursor.advance_to(5.0)
     visible = live_cursor.events_up_to(EventType.SPOT)
     assert len(visible) == 2
@@ -65,7 +65,7 @@ def test_default_event_time_gated_cursor_is_optimistic_relative_to_recv_ts():
     (Phase 2) cursor considers the event visible as soon as its *source*
     timestamp passes, even though it hasn't actually arrived yet."""
     store = _store_with_source_recv_gap()
-    offline_cursor = MockFeedCursor(store, "r1")  # default time_attr="event_time"
+    offline_cursor = ReplayCursor(store, "r1")  # default time_attr="event_time"
     offline_cursor.advance_to(3.0)
     visible = offline_cursor.events_up_to(EventType.SPOT)
     assert len(visible) == 2  # the recv_ts=5.0 event IS visible offline at t=3.0 (event_time=2.0 <= 3.0)
@@ -90,11 +90,11 @@ def test_exchange_execution_book_uses_event_time_not_recv_ts_for_delayed_resolut
         payload={"side": "UP", "book": "asks", "price": 0.60, "size": 100.0},
     )
 
-    execution_truth_cursor = MockFeedCursor(store, "r1")  # default time_attr="event_time"
+    execution_truth_cursor = ReplayCursor(store, "r1")  # default time_attr="event_time"
     execution_truth_cursor.advance_to(matched_ts)
     assert len(execution_truth_cursor.events_up_to(EventType.BOOK_DELTA)) == 1  # exchange truth: already happened
 
-    strategy_view_cursor = MockFeedCursor(store, "r1", time_attr="recv_ts")
+    strategy_view_cursor = ReplayCursor(store, "r1", time_attr="recv_ts")
     strategy_view_cursor.advance_to(matched_ts)
     assert len(strategy_view_cursor.events_up_to(EventType.BOOK_DELTA)) == 0  # this system: hasn't arrived yet
 
@@ -585,7 +585,7 @@ def test_recv_ts_gate_collapses_z_spot_when_canonical_horizon_matches_tick_spaci
     from xamarinbot.events.store import EventStore
     from xamarinbot.features.engine import compute
     from xamarinbot.features.types import FeatureVector
-    from xamarinbot.synthetic.rounds import generate_synthetic_dataset
+    from devtools.synthetic.rounds import generate_synthetic_dataset
 
     store = EventStore(":memory:")
     results = generate_synthetic_dataset(store, n_rounds=1)

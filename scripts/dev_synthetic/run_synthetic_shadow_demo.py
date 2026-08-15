@@ -27,7 +27,11 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+sys.path.insert(0, str(_REPO_ROOT / "src"))
+# `devtools` (the synthetic data fabricator) lives at the repo root,
+# deliberately outside the shipped package - see Phase 12C.1 item 4.
+sys.path.insert(0, str(_REPO_ROOT))
 
 from xamarinbot.events.store import EventStore
 from xamarinbot.execution.config import ExecutionConfig
@@ -42,7 +46,7 @@ from xamarinbot.reports.shadow_report import build_daily_shadow_report, format_d
 from xamarinbot.shadow.config import ShadowConfig
 from xamarinbot.shadow.parity import compare_live_vs_replay
 from xamarinbot.shadow.runner import FaultInjector, ShadowRunner
-from xamarinbot.synthetic.rounds import generate_synthetic_dataset
+from devtools.synthetic.rounds import generate_synthetic_dataset
 
 HEARTBEAT_S = 10.0
 N_TRAIN_ROUNDS = 15

@@ -37,6 +37,7 @@ from xamarinbot.mpc.config import MPCConfig
 from xamarinbot.mpc.scenario import TransitionModel
 from xamarinbot.mpc.types import MPCDecision
 from xamarinbot.optimizer.candidates import candidate_selection_score
+from xamarinbot.market.constraints import MarketConstraints
 from xamarinbot.optimizer.controller import OneStepController
 from xamarinbot.optimizer.types import CandidateAction, OrderMode
 from xamarinbot.portfolio.exposure import RiskView
@@ -119,7 +120,7 @@ class MPCController:
         regime_state: RegimeState,
         book_up: BookSnapshot | None,
         book_down: BookSnapshot | None,
-        tick_size: float,
+        constraints: MarketConstraints,
         is_fresh: bool,
         risk_view: RiskView | None = None,
     ) -> MPCDecision:
@@ -136,7 +137,7 @@ class MPCController:
         silently ignore it exactly where it matters most."""
         start = time.monotonic()
         permitted = ActionPermissionMatrix.permitted_actions(classify_seed_action(regime_state))
-        base = self.one_step.decide(round_id, decision_ts, portfolio, q, permitted, book_up, book_down, tick_size, is_fresh, risk_view=risk_view)
+        base = self.one_step.decide(round_id, decision_ts, portfolio, q, permitted, book_up, book_down, constraints, is_fresh, risk_view=risk_view)
 
         if self.cfg.horizon_steps <= 1:
             # Degenerate horizon (Phase 10 verification: "MPC action
@@ -165,7 +166,7 @@ class MPCController:
                 for next_gap, prob in self.transition_model.next_states(regime_state.gap_regime, self.cfg.transition_top_k):
                     next_state = RegimeState(next_gap, regime_state.clob_direction, regime_state.spot_direction)
                     continuation += prob * self._rollout(
-                        round_id, portfolio_after, next_state, q, book_up_after, book_down_after, tick_size, is_fresh,
+                        round_id, portfolio_after, next_state, q, book_up_after, book_down_after, constraints, is_fresh,
                         self.cfg.horizon_steps - 1, deadline,
                     )
                 sequence_values[candidate.action_id] = candidate_selection_score(candidate, self.one_step.cfg) + continuation
@@ -186,7 +187,7 @@ class MPCController:
         q: float,
         book_up: BookSnapshot | None,
         book_down: BookSnapshot | None,
-        tick_size: float,
+        constraints: MarketConstraints,
         is_fresh: bool,
         depth: int,
         deadline: float,
@@ -200,12 +201,12 @@ class MPCController:
             raise _DeadlineExceeded()
 
         permitted = ActionPermissionMatrix.permitted_actions(classify_seed_action(regime_state))
-        decision = self.one_step.decide(round_id, 0.0, portfolio, q, permitted, book_up, book_down, tick_size, is_fresh)
+        decision = self.one_step.decide(round_id, 0.0, portfolio, q, permitted, book_up, book_down, constraints, is_fresh)
         value = candidate_selection_score(decision.chosen, self.one_step.cfg)
         if depth > 1:
             portfolio_after = _portfolio_after_candidate(portfolio, decision.chosen)
             book_up_after, book_down_after = _deplete_books_for_candidate(book_up, book_down, decision.chosen)
             for next_gap, prob in self.transition_model.next_states(regime_state.gap_regime, self.cfg.transition_top_k):
                 next_state = RegimeState(next_gap, regime_state.clob_direction, regime_state.spot_direction)
-                value += prob * self._rollout(round_id, portfolio_after, next_state, q, book_up_after, book_down_after, tick_size, is_fresh, depth - 1, deadline)
+                value += prob * self._rollout(round_id, portfolio_after, next_state, q, book_up_after, book_down_after, constraints, is_fresh, depth - 1, deadline)
         return value

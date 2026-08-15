@@ -13,6 +13,12 @@ from xamarinbot.execution.taker import DepthWalkResult, TakerOrderResult, walk_a
 from xamarinbot.feeds.base import BookLevel
 from xamarinbot.portfolio.exposure import PendingExposure, exposure_from_pending_takers
 from xamarinbot.portfolio.state import FeeConfig, LiquidityRole, Side
+from xamarinbot.provenance import DataProvenance
+
+
+class SyntheticExecutionRefused(RuntimeError):
+    """Raised when a synthetic execution model is asked to produce an
+    outcome for real data (Phase 12C.1 item 16)."""
 
 
 @dataclass
@@ -274,12 +280,38 @@ class ExecutionSimulator:
         )
 
     def draw_maker_fill(
-        self, order: OrderState, distance_to_touch_ticks: float, queue_ahead_shares: float, horizon_s: float
+        self,
+        order: OrderState,
+        distance_to_touch_ticks: float,
+        queue_ahead_shares: float,
+        horizon_s: float,
+        provenance: DataProvenance = DataProvenance.SYNTHETIC_TEST,
     ) -> MakerFillDraw:
         """One reproducible Bernoulli draw for "does this maker order fill
         within horizon_s", using rho as the fill probability. Keyed by
         (round_id, order_id) so replaying the same round/order always
-        produces the same outcome."""
+        produces the same outcome.
+
+        SIMULATION ONLY (Phase 12C.1 item 16). `rho` is an uncalibrated
+        placeholder - no real fill data has ever been used to estimate it -
+        so a REAL_LIVE/REAL_REPLAY evaluation must not call this and report
+        the result as a real maker fill. Real maker analysis consumes the
+        Phase 12C counterfactual stream (quote timestamp, queue ahead, book
+        changes, trades through the quote, first touch/cross, cumulative
+        volume, cancel/replace time) until a fill model is actually
+        calibrated from real observations.
+
+        The guard raises rather than warning: a fabricated fill silently
+        entering a real-data evaluation is precisely the failure this item
+        exists to prevent.
+        """
+        if provenance.is_real:
+            raise SyntheticExecutionRefused(
+                f"draw_maker_fill is an uncalibrated Bernoulli placeholder and must not "
+                f"be used on {provenance.value} data. Consume the Phase 12C maker "
+                "counterfactual stream instead (realtime/counterfactual.py) until a fill "
+                "model is calibrated from real observations."
+            )
         rho = fill_probability(distance_to_touch_ticks, queue_ahead_shares, horizon_s, self.cfg.maker)
         rng = seeded_random(self.round_id, order.order_id)
         draw = rng.random()

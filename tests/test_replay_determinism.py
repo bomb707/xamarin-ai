@@ -6,13 +6,13 @@ from __future__ import annotations
 
 from dataclasses import asdict
 
-import run_baseline_replay as rbr
+import run_synthetic_baseline_replay as rbr
 
 from xamarinbot.baseline.config import BaselineConfig
 from xamarinbot.events.store import EventStore
 from xamarinbot.journal.schema import AuditRecord, FillRecord, PortfolioStateRecord, SettlementRecord
 from xamarinbot.journal.writer import JournalWriter
-from xamarinbot.synthetic.rounds import generate_synthetic_dataset
+from devtools.synthetic.rounds import generate_synthetic_dataset
 
 
 def _run_once(n_rounds: int = 6):
@@ -44,7 +44,7 @@ def test_synthetic_dataset_generation_itself_is_deterministic():
     r2 = generate_synthetic_dataset(s2, n_rounds=3)
 
     assert [x.outcome for x in r1] == [x.outcome for x in r2]
-    assert [x.final_twap for x in r1] == [x.final_twap for x in r2]
+    assert [x.final_reference for x in r1] == [x.final_reference for x in r2]
     for rid in [x.round_id for x in r1]:
         payloads1 = [(e.event_type, e.payload) for e in s1.all_events(rid)]
         payloads2 = [(e.event_type, e.payload) for e in s2.all_events(rid)]

@@ -25,7 +25,7 @@ from xamarinbot.model.metrics import (
 )
 from xamarinbot.model.registry import ModelRegistry, PromotionGateError, make_artifact
 from xamarinbot.model.walkforward import round_ordered_split, time_ordered_split
-from xamarinbot.synthetic.rounds import generate_synthetic_dataset
+from devtools.synthetic.rounds import generate_synthetic_dataset
 
 # --------------------------------------------------------------------------
 # Logistic regression

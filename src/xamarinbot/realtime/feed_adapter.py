@@ -1,4 +1,23 @@
-"""Phase-1 feed interfaces backed by the Phase 12C real adapters.
+"""THE canonical real-market Phase-1 feed adapter.
+
+Phase 12C.1 item 7: there must not be two apparent production sources for
+the same market datum. This module was `feeds/polymarket_clob.py`; it now
+lives under `realtime/` because `realtime/*` is the real-market
+single-source-of-truth. Its two superseded siblings were deleted outright
+rather than left as a second apparent source:
+
+  * `feeds/chainlink_twap.py` - direct Chainlink Data Streams client.
+    Superseded by `realtime/rtds.py`, which is what Polymarket's own
+    documentation recommends for production Chainlink TWAP and which needs
+    no credentials. The deleted module's auth/subscription handshake was
+    never verified against a live endpoint.
+  * `feeds/spot_composite.py` - Coinbase/Binance REST polling composite.
+    Superseded by the RTDS Binance stream, which arrives on the same socket
+    as the reference feeds and carries a provider timestamp.
+
+Both had zero callers. `feeds/polymarket_user.py` is NOT superseded (there
+is no `realtime/` equivalent of the authenticated user/order stream) and is
+retained, deprecated, for Phase 13.
 
 This module used to contain its own REST+WSS implementation. That
 implementation had the defects Phase 12C item 3 enumerates - a
@@ -9,7 +28,7 @@ discarding every book delta. Rather than patch a second copy of the logic,
 the real behavior now lives in `xamarinbot.realtime` (discovery.py,
 clob_ws.py), and this module is the thin `MarketConfigProvider` / `BookFeed`
 adapter that exposes it through the Phase-1 interfaces the controller,
-`ShadowRunner` and the mock feeds all share.
+`ShadowRunner` and the replay feeds all share.
 
 Concretely:
 

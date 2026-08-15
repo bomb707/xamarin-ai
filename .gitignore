@@ -11,6 +11,6 @@ venv/
 # Phase 12C real capture output. A single 3-round capture is ~500MB of raw
 # market events; captures are data, reproducible with scripts/run_real_recorder.py,
 # and must not be committed. Reports/metrics are small and are kept.
-captures/*.db
-captures/*.db-wal
-captures/*.db-shm
+captures/**/*.db
+captures/**/*.db-wal
+captures/**/*.db-shm

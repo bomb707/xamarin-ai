@@ -36,6 +36,7 @@ from dataclasses import dataclass, field
 
 from xamarinbot.execution.config import ExecutionConfig
 from xamarinbot.execution.simulator import ExecutionSimulator, TakerOrderQueue
+from xamarinbot.market.constraints import MarketConstraints
 from xamarinbot.optimizer.candidates import (
     candidate_exposure,
     evaluate_maker_candidate,
@@ -69,6 +70,11 @@ class TradingSession:
     fee_config: FeeConfig
     exec_cfg: ExecutionConfig
     cfg: OneStepConfig
+    #: Phase 12C.1 item 12: this round's executable market parameters, read
+    #: from the market itself. `tick_size` and `min_order_shares` come from
+    #: here rather than from a static config or a per-call float, so there
+    #: is exactly one source for each.
+    constraints: MarketConstraints
     supervisor_cfg: SupervisorConfig | None = None
     portfolio: PortfolioState = field(default_factory=PortfolioState)
     n_actions: int = 0
@@ -76,6 +82,10 @@ class TradingSession:
     n_maker_placed: int = 0
     n_maker_expired_filled: int = 0
     n_maker_expired_unfilled: int = 0
+    #: Phase 12C.1 item 16: maker quotes that expired on REAL data, where
+    #: no calibrated fill model exists, so the outcome is genuinely unknown
+    #: rather than drawn from a synthetic Bernoulli.
+    n_maker_expired_unresolved: int = 0
     sim: ExecutionSimulator = field(init=False)
     queue: TakerOrderQueue = field(init=False)
     supervisor: OrderSupervisor = field(init=False)
@@ -114,7 +124,7 @@ class TradingSession:
                 )
                 self.n_actions += 1
 
-    def review_open_orders(self, decision_ts: float, regime_state: RegimeState, q: float, book_up, book_down, tau: float, is_fresh: bool, tick_size: float, on_decision=None) -> None:
+    def review_open_orders(self, decision_ts: float, regime_state: RegimeState, q: float, book_up, book_down, tau: float, is_fresh: bool, on_decision=None) -> None:
         """Runs `OrderSupervisor.review_order` against every currently
         open maker order's re-evaluated economics, expiring TTL-lapsed
         orders via a stochastic fill draw, canceling/replacing per the
@@ -143,10 +153,11 @@ class TradingSession:
                 f"review-{order_id}", side, tracked.purpose, tracked.order_state.limit_price,
                 tracked.order_state.remaining_shares, distance_to_touch_ticks=0.0, queue_ahead_shares=0.0,
                 horizon_s=horizon, portfolio=self.portfolio, q=q, exec_cfg=self.exec_cfg, cfg=self.cfg,
+                constraints=self.constraints,
             )
             replacement = evaluate_replacement_plan(
                 side, tracked.order_state.remaining_shares, book.best_bid.price, book.best_ask.price,
-                tick_size, self.cfg.maker_price_offsets_ticks, horizon, self.portfolio, q, self.exec_cfg, self.fee_config, self.cfg,
+                self.constraints, self.cfg.maker_price_offsets_ticks, horizon, self.portfolio, q, self.exec_cfg, self.fee_config, self.cfg,
             )
             current_optimal_ev = replacement.delta_ev if replacement is not None else None
             decision = self.supervisor.review_order(tracked, decision_ts, regime_state, current.delta_ev, current.g_after, tau, is_fresh, current_optimal_ev)
@@ -193,7 +204,26 @@ class TradingSession:
                 # nothing safe to replace it with.
 
     def _expire_maker(self, order_id: str, tracked: TrackedOrder, decision_ts: float, horizon: float) -> None:
-        draw = self.sim.draw_maker_fill(tracked.order_state, 0.0, 0.0, horizon)
+        """Phase 12C.1 item 16: on REAL data this does NOT draw a Bernoulli
+        fill.
+
+        `draw_maker_fill` is an uncalibrated synthetic execution model. Using
+        it on a real replay and then reporting the outcome as a maker fill
+        would fabricate the single most consequential unknown in the whole
+        strategy. On a real store the quote is instead closed UNRESOLVED and
+        counted, leaving the Phase 12C counterfactual stream (queue ahead,
+        trades through the quote, first touch/cross) as the only evidence
+        about whether it would have filled - which is exactly the state of
+        knowledge until a fill model is calibrated from real observations.
+        """
+        if self.constraints.provenance.is_real:
+            tracked.order_state.cancel(decision_ts)
+            self.n_maker_expired_unresolved += 1
+            del self.supervisor.orders[order_id]
+            return
+        draw = self.sim.draw_maker_fill(
+            tracked.order_state, 0.0, 0.0, horizon, provenance=self.constraints.provenance
+        )
         self.n_attempts += 1
         if draw.filled:
             shares = tracked.order_state.remaining_shares
@@ -218,6 +248,15 @@ class TradingSession:
         until it fills, expires, or is replaced - never an immediate
         Bernoulli draw at submission time."""
         if chosen.mode is OrderMode.WAIT or chosen.side is None or chosen.qty <= 0:
+            return
+
+        # Phase 12C.1 item 13, belt-and-braces. `_finalize` already marks any
+        # sub-minimum candidate invalid, so a correctly-generated candidate
+        # can never reach here undersized. This check exists because dispatch
+        # is the last point before an order would become real, and a caller
+        # that hand-builds a CandidateAction (as several tests do) bypasses
+        # candidate generation entirely.
+        if not self.constraints.admits_size(chosen.qty):
             return
 
         risk_view = self.risk_view()

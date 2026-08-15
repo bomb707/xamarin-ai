@@ -21,7 +21,11 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+sys.path.insert(0, str(_REPO_ROOT / "src"))
+# `devtools` (the synthetic data fabricator) lives at the repo root,
+# deliberately outside the shipped package - see Phase 12C.1 item 4.
+sys.path.insert(0, str(_REPO_ROOT))
 
 from xamarinbot.events.replay import ReplayClock
 from xamarinbot.events.store import EventStore
@@ -29,7 +33,7 @@ from xamarinbot.execution.config import ExecutionConfig
 from xamarinbot.features.config import FeatureConfig
 from xamarinbot.features.engine import compute
 from xamarinbot.features.types import FeatureVector
-from xamarinbot.feeds.mock import MockBookFeed, MockFeedCursor
+from xamarinbot.replay.feeds import ReplayBookFeed, ReplayCursor
 from xamarinbot.model.calibrated import fit_calibrated_model
 from xamarinbot.model.dataset import build_examples_multi
 from xamarinbot.model.features import COMBINED_LEAD_LAG, design_vector
@@ -37,12 +41,15 @@ from xamarinbot.model.walkforward import round_ordered_split
 from xamarinbot.mpc.config import MPCConfig
 from xamarinbot.mpc.controller import MPCController
 from xamarinbot.mpc.scenario import build_transition_model
+from xamarinbot.market.constraints import MarketConstraints
+from xamarinbot.provenance import DataProvenance
+from xamarinbot.replay.feeds import market_config_from_payload
 from xamarinbot.optimizer.config import OneStepConfig
 from xamarinbot.optimizer.controller import OneStepController
 from xamarinbot.portfolio.state import FeeConfig, PortfolioState, Side
 from xamarinbot.regime.classifier import RegimeClassifier
 from xamarinbot.reports.mpc_report import build_latency_benchmark, format_latency_benchmark
-from xamarinbot.synthetic.rounds import generate_synthetic_dataset
+from devtools.synthetic.rounds import generate_synthetic_dataset
 
 HEARTBEAT_S = 10.0
 N_TRAIN_ROUNDS = 15
@@ -119,13 +126,17 @@ def main() -> None:
     for result in eval_results:
         events = eval_store.all_events(result.round_id)
         clock = ReplayClock(eval_store, result.round_id)
-        cursor = MockFeedCursor(eval_store, result.round_id, preloaded=events)
-        book_feed = MockBookFeed(cursor)
+        cursor = ReplayCursor(eval_store, result.round_id, preloaded=events)
+        book_feed = ReplayBookFeed(cursor)
         regime_clf = RegimeClassifier(round_id=result.round_id)
         portfolio = PortfolioState()
 
         market_config = next(e.payload for e in events if e.event_type.value == "MARKET_CONFIG")
-        tick_size = market_config["tick_size"]
+        constraints = MarketConstraints.from_market_config(
+                market_config_from_payload(market_config),
+                provenance=DataProvenance.SYNTHETIC_TEST,
+                source="synthetic demo MARKET_CONFIG",
+        )
 
         for decision_ts in clock.decision_points(heartbeat=HEARTBEAT_S):
             cursor.advance_to(decision_ts)
@@ -138,8 +149,8 @@ def main() -> None:
             vec = design_vector(fv, COMBINED_LEAD_LAG)
             q = model.predict_proba(vec) if vec is not None else 0.5
 
-            mpc_decision = mpc.decide(result.round_id, decision_ts, portfolio, q, snapshot.state, book_up, book_down, tick_size, is_fresh=True)
-            one_step_decision = one_step.decide(result.round_id, decision_ts, portfolio, q, snapshot.permitted_actions, book_up, book_down, tick_size, is_fresh=True)
+            mpc_decision = mpc.decide(result.round_id, decision_ts, portfolio, q, snapshot.state, book_up, book_down, constraints, is_fresh=True)
+            one_step_decision = one_step.decide(result.round_id, decision_ts, portfolio, q, snapshot.permitted_actions, book_up, book_down, constraints, is_fresh=True)
 
             n_decisions += 1
             if mpc_decision.chosen.action_id != one_step_decision.chosen.action_id:

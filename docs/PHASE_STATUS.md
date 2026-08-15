@@ -76,7 +76,7 @@ Supporting pieces built to make Phases 0-10 demonstrable end-to-end:
 - `reports/shadow_report.py` - the Phase 12 daily shadow report (decision
   latency percentiles, reconnects, missed deadlines, mean hypothetical G)
   and live-vs-replay parity report formatting.
-- `scripts/run_baseline_replay.py`, `scripts/run_feature_engine_demo.py`,
+- `scripts/dev_synthetic/run_synthetic_baseline_replay.py`,
   `scripts/run_model_training_demo.py`, `scripts/run_regime_classifier_demo.py`,
   `scripts/run_execution_simulator_demo.py`, `scripts/run_one_step_controller_demo.py`,
   `scripts/run_order_supervisor_demo.py`, `scripts/run_mpc_controller_demo.py`,
@@ -99,7 +99,7 @@ PYTHONPATH=src python scripts/run_one_step_controller_demo.py [n_eval_rounds]
 PYTHONPATH=src python scripts/run_order_supervisor_demo.py [n_eval_rounds]
 PYTHONPATH=src python scripts/run_mpc_controller_demo.py [n_eval_rounds]
 PYTHONPATH=src python scripts/run_walk_forward_ablation_demo.py [n_rounds]
-PYTHONPATH=src python scripts/run_shadow_demo.py [n_rounds]
+PYTHONPATH=src python scripts/dev_synthetic/run_synthetic_shadow_demo.py [n_rounds]
 ```
 Tests: `PYTHONPATH=src pytest -q` (or `pip install -e .[dev]` first)
 
@@ -168,6 +168,73 @@ reconstructs the label under both bases every round and reports both
 agreement rates, so which basis actually reproduces Polymarket's
 resolutions is an empirical result of the capture rather than an assumption.
 Binance is never used as a settlement basis under either reading.
+
+## Phase 12C.1 - Production Data Provenance & Runtime Market Constraints
+
+Separates REAL / REAL_REPLAY / SYNTHETIC data paths and removes ambiguous
+mock/default market assumptions from the production path. Full detail in
+[DATA_PROVENANCE.md](DATA_PROVENANCE.md).
+
+Two invariants are now structurally enforced rather than conventionally
+observed:
+
+- **Production/live code can never accidentally consume synthetic data** -
+  `tests/test_import_boundaries.py` AST-parses every shipped module and
+  fails on the import statement.
+- **All executable market constraints come from the current Polymarket
+  market** - `MarketConstraints` is built per round from that market's own
+  metadata; `OneStepConfig.taker_min_size = 1.0` is deleted.
+
+| Change | Detail |
+|---|---|
+| `DataProvenance` | `REAL_LIVE` / `REAL_REPLAY` / `SYNTHETIC_TEST`, carried on `EventStore`, `RoundLabel`, `MarketConstraints`, `ShadowRoundResult`; **defaults to SYNTHETIC_TEST so the system fails closed** |
+| `feeds/mock.py` -> `replay/feeds.py` | `Mock*` -> `Replay*`. The module fabricates nothing - it replays a recorded `EventStore`, including real captures |
+| `synthetic/` -> `devtools/synthetic/` | the data fabricator leaves the shipped package entirely |
+| 10 demo scripts -> `scripts/dev_synthetic/run_synthetic_*` | `scripts/` now holds only real-market entry points |
+| `feeds/polymarket_clob.py` -> `realtime/feed_adapter.py` | `realtime/*` is the canonical real-market SSOT |
+| `feeds/chainlink_twap.py`, `feeds/spot_composite.py` | **deleted** - superseded by `realtime/rtds.py`; zero callers |
+| `feeds/polymarket_user.py` | **deprecated, retained** - no `realtime/` equivalent; Phase 13 needs it |
+| `replay/projection.py` | **REAL raw -> normalized event projection** (the highest-priority gap): a captured round is now consumable by the feature engine |
+| `market/constraints.py` | runtime `MarketConstraints`; `min_order_shares` enforced for every order purpose at one point (`_finalize`) |
+| `market/order_request.py` | BUY dollar-encoding translation boundary; **submits nothing** |
+| `q = 0.5` | removed from the real path - `MODEL_UNAVAILABLE` -> NO_ALPHA |
+| `draw_maker_fill` | raises on `REAL_*`; real expiries are recorded UNRESOLVED |
+| `REPLAY_FRESHNESS_POLICY` | renamed `SYNTHETIC_REPLAY_FRESHNESS_POLICY`; new `REAL_REPLAY_FRESHNESS_POLICY` from measured real cadences |
+| `LabelStatus` | `LABEL_AMBIGUOUS` rounds are excluded from training |
+
+### The static minimum was wrong, not merely un-wired
+
+`OneStepConfig.taker_min_size = 1.0` was the production minimum-order
+fallback. Every BTC five-minute market sampled in the Phase 12C captures
+reports **`min_order_size = 5.0` SHARES** and `tick_size = 0.01`, so the
+static value was wrong by 5x in the direction that generates orders the
+venue rejects. `MarketConfig.min_order_size` already carried the real value
+from discovery and dead-ended - nothing in the optimizer or execution layer
+read it.
+
+`generate_hedge_candidate` and the fixed-quantity maker path checked **no**
+minimum at all; enforcement now happens once, in `_finalize`, which every
+candidate of every purpose flows through.
+
+### REAL_REPLAY acceptance evidence
+
+`scripts/run_real_replay_smoke.py captures/phase12c_verify.db` projects the
+verified capture (round `btc-updown-5m-1786777800`):
+
+```
+MARKET_CONFIG 1  TWAP 793  SPOT 833  BOOK_SNAPSHOT 3144  BOOK_DELTA 177570
+settlement basis   rtds_twap_60 (from the market's own metadata)
+p0                 63010.53498847699 (real observation at/before the open)
+min_order_shares   5.0     tick_size 0.01     fee 0.07
+provenance         REAL_REPLAY, 182342/182342 events, 0 synthetic
+FeatureVectors     23 VALID, 8 STALE_BOOK
+```
+
+**Finding**: the 8 `STALE_BOOK` points are the last ~76 seconds of the
+round. The UP token's ASK side empties entirely at t~223s once the mid
+reaches 0.990 and the outcome is effectively decided, so `clob_mid` is
+genuinely undefined there. Missing real data correctly stays missing rather
+than being interpolated.
 
 ## Not yet implemented (future work)
 

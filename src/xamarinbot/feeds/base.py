@@ -1,10 +1,11 @@
 """Causal market-data adapter interfaces (Roadmap Phase 1).
 
-Every adapter (mock/replay or real) implements these interfaces so the
+Every adapter (replay or real) implements these interfaces so the
 controller can run unchanged against replay data or live feeds. Real
-adapters live in polymarket_clob.py / polymarket_user.py / chainlink_twap.py
-/ spot_composite.py; mock.py provides fully-working replay-driven
-implementations for testing.
+adapters live in realtime/feed_adapter.py (the canonical real-market
+implementation, backed by realtime/clob_ws.py + realtime/rtds.py) and
+feeds/polymarket_user.py; replay/feeds.py provides fully-working
+replay-driven implementations over a recorded EventStore.
 
 "Never infer TWAP window from update cadence."
 "Do not submit orders when state freshness is uncertain."

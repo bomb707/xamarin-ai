@@ -64,6 +64,66 @@ class Outcome(str, Enum):
     DOWN = "DOWN"
 
 
+class LabelStatus(str, Enum):
+    """Whether a round's settlement label can be trusted for training.
+
+    Phase 12C.1 item 15: if the metadata-declared rule, the resolution-source
+    text, and the venue's resolved outcome disagree, the round is
+    LABEL_AMBIGUOUS and must be excluded from training. A label nobody can
+    reproduce is worse than no label, because it trains a model on noise
+    while looking like signal.
+    """
+
+    CONFIRMED = "CONFIRMED"
+    AMBIGUOUS = "LABEL_AMBIGUOUS"
+    UNRESOLVED = "UNRESOLVED"
+
+    @property
+    def is_trainable(self) -> bool:
+        return self is LabelStatus.CONFIRMED
+
+
+#: Substrings that identify a settlement basis in a market's free-text
+#: `resolutionSource` / rules description. Used only to CROSS-CHECK the
+#: structured `cryptoMarketConfig`, never to override it.
+_RULE_TEXT_MARKERS = {
+    "chainlink_twap_60": ("twap-60s", "twap_60", "60s-streams", "60-second"),
+    "chainlink_twap_30": ("twap-30s", "twap_30", "30s-streams", "30-second"),
+}
+
+
+def declared_basis_matches_rule_text(
+    settlement_kind: str, twap_window_s: int | None, *texts: str | None
+) -> bool | None:
+    """Whether the market's free text agrees with its structured settlement
+    configuration.
+
+    Returns None when the text says nothing identifiable - "no evidence" is
+    not "disagreement", and treating it as disagreement would mark every
+    sparsely-described market ambiguous.
+    """
+    blob = " ".join(t.lower() for t in texts if t)
+    if not blob:
+        return None
+    if settlement_kind != "chainlink_twap":
+        # A plain-reference market should NOT be advertising a TWAP stream.
+        mentions_twap = any(
+            m in blob for markers in _RULE_TEXT_MARKERS.values() for m in markers
+        )
+        return not mentions_twap
+    key = f"chainlink_twap_{twap_window_s}"
+    markers = _RULE_TEXT_MARKERS.get(key)
+    if markers is None:
+        return None
+    if any(m in blob for m in markers):
+        return True
+    # The text identifies SOME window, and it is not this one.
+    other = any(
+        m in blob for k, ms in _RULE_TEXT_MARKERS.items() if k != key for m in ms
+    )
+    return False if other else None
+
+
 #: Which RTDS topic supplies the settlement reference for a given basis.
 def topic_for_basis(settlement_kind: str, twap_window_s: int | None) -> str:
     """The RTDS topic carrying the settlement reference series.
@@ -110,6 +170,31 @@ class LabelReconstruction:
     reference: BasisReconstruction
     reported_outcome: Outcome | None
     reported_source: str | None
+    #: Phase 12C.1 item 15: does the market's free-text rule agree with its
+    #: structured settlement configuration? None = the text said nothing
+    #: identifiable, which is not disagreement.
+    rule_text_agrees: bool | None = None
+
+    @property
+    def status(self) -> "LabelStatus":
+        """CONFIRMED only when everything that can be checked agrees.
+
+        AMBIGUOUS when the declared basis reproduces a DIFFERENT outcome from
+        the one the venue published, or when the market's own rule text
+        contradicts its structured configuration. Such a round is excluded
+        from training rather than being labelled by majority vote.
+        """
+        if self.reported_outcome is None or self.declared.outcome is None:
+            return LabelStatus.UNRESOLVED
+        if self.declared.outcome is not self.reported_outcome:
+            return LabelStatus.AMBIGUOUS
+        if self.rule_text_agrees is False:
+            return LabelStatus.AMBIGUOUS
+        return LabelStatus.CONFIRMED
+
+    @property
+    def is_trainable(self) -> bool:
+        return self.status.is_trainable
 
     @property
     def declared_agrees(self) -> bool | None:
@@ -223,8 +308,16 @@ def reconstruct_label(
     reported_outcome: Outcome | None = None,
     reported_source: str | None = None,
     tolerance_s: float = 5.0,
+    resolution_source: str | None = None,
+    description: str | None = None,
 ) -> LabelReconstruction:
-    """Reconstruct under BOTH bases and compare each to the venue's result."""
+    """Reconstruct under BOTH bases and compare each to the venue's result.
+
+    `resolution_source`/`description` are the market's own free text; when
+    supplied they are cross-checked against its structured settlement
+    configuration, and a contradiction marks the round LABEL_AMBIGUOUS
+    (item 15).
+    """
     declared_topic = topic_for_basis(settlement_kind, twap_window_s)
     declared = reconstruct_basis(
         "declared", declared_topic, observations_by_topic.get(declared_topic, []),
@@ -240,6 +333,9 @@ def reconstruct_label(
         reference=reference,
         reported_outcome=reported_outcome,
         reported_source=reported_source,
+        rule_text_agrees=declared_basis_matches_rule_text(
+            settlement_kind, twap_window_s, resolution_source, description
+        ),
     )
 
 
@@ -348,4 +444,10 @@ def summarize_agreement(reconstructions: list[LabelReconstruction]) -> dict:
         # the q model must not be trained (item 8).
         "labels_reproducible": (d_rate == 1.0 if d_rate is not None else False)
         or (r_rate == 1.0 if r_rate is not None else False),
+        # Phase 12C.1 item 15: rounds excluded from training because their
+        # declared rule, rule text and venue outcome do not all agree.
+        "confirmed": sum(1 for r in reconstructions if r.status is LabelStatus.CONFIRMED),
+        "label_ambiguous": sum(1 for r in reconstructions if r.status is LabelStatus.AMBIGUOUS),
+        "unresolved": sum(1 for r in reconstructions if r.status is LabelStatus.UNRESOLVED),
+        "trainable_round_ids": [r.round_id for r in reconstructions if r.is_trainable],
     }

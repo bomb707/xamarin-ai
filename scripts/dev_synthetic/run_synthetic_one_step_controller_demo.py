@@ -17,7 +17,11 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+sys.path.insert(0, str(_REPO_ROOT / "src"))
+# `devtools` (the synthetic data fabricator) lives at the repo root,
+# deliberately outside the shipped package - see Phase 12C.1 item 4.
+sys.path.insert(0, str(_REPO_ROOT))
 
 from xamarinbot.baseline.config import BaselineConfig
 from xamarinbot.baseline.inputs import elapsed_t
@@ -30,17 +34,20 @@ from xamarinbot.execution.simulator import ExecutionSimulator, TakerOrderQueue
 from xamarinbot.features.config import FeatureConfig
 from xamarinbot.features.engine import compute
 from xamarinbot.features.types import FeatureVector
-from xamarinbot.feeds.mock import MockBookFeed, MockFeedCursor, MockSpotFeed, MockTWAPFeed
+from xamarinbot.replay.feeds import ReplayBookFeed, ReplayCursor, ReplaySpotFeed, ReplayTWAPFeed
 from xamarinbot.model.calibrated import fit_calibrated_model
 from xamarinbot.model.dataset import build_examples_multi
 from xamarinbot.model.features import COMBINED_LEAD_LAG
 from xamarinbot.model.walkforward import round_ordered_split
+from xamarinbot.market.constraints import MarketConstraints
+from xamarinbot.provenance import DataProvenance
+from xamarinbot.replay.feeds import market_config_from_payload
 from xamarinbot.optimizer.config import OneStepConfig
 from xamarinbot.optimizer.controller import OneStepController
 from xamarinbot.optimizer.types import OrderMode
 from xamarinbot.portfolio.state import Fill, FeeConfig, LiquidityRole, PortfolioState, Side, apply_fill
 from xamarinbot.regime.classifier import RegimeClassifier
-from xamarinbot.synthetic.rounds import generate_synthetic_dataset
+from devtools.synthetic.rounds import generate_synthetic_dataset
 
 HEARTBEAT_S = 10.0
 N_TRAIN_ROUNDS = 15
@@ -69,17 +76,17 @@ def run_baseline_round(store, round_id, p0, cfg: BaselineConfig, fee_config: Fee
     Tranche 1.2 items 1/2) through the shared `TakerOrderQueue`."""
     events = store.all_events(round_id)
     clock = ReplayClock(store, round_id)
-    cursor = MockFeedCursor(store, round_id, preloaded=events)
-    twap_feed, spot_feed, book_feed = MockTWAPFeed(cursor), MockSpotFeed(cursor), MockBookFeed(cursor)
+    cursor = ReplayCursor(store, round_id, preloaded=events)
+    twap_feed, spot_feed, book_feed = ReplayTWAPFeed(cursor), ReplaySpotFeed(cursor), ReplayBookFeed(cursor)
     portfolio = PortfolioState()
-    prev_clob_cursor = MockFeedCursor(store, round_id, preloaded=events)
-    prev_book_feed = MockBookFeed(prev_clob_cursor)
-    prev_spot_cursor = MockFeedCursor(store, round_id, preloaded=events)
-    prev_spot_feed = MockSpotFeed(prev_spot_cursor)
+    prev_clob_cursor = ReplayCursor(store, round_id, preloaded=events)
+    prev_book_feed = ReplayBookFeed(prev_clob_cursor)
+    prev_spot_cursor = ReplayCursor(store, round_id, preloaded=events)
+    prev_spot_feed = ReplaySpotFeed(prev_spot_cursor)
     # Dedicated cursor/book_feed for fetching the actual causal book at a
     # delayed taker order's matched_ts, only at resolve time.
-    revalidation_cursor = MockFeedCursor(store, round_id, preloaded=events)
-    revalidation_book_feed = MockBookFeed(revalidation_cursor)
+    revalidation_cursor = ReplayCursor(store, round_id, preloaded=events)
+    revalidation_book_feed = ReplayBookFeed(revalidation_cursor)
     sim = ExecutionSimulator(round_id, fee_config, exec_cfg)
     queue = TakerOrderQueue(sim)
     order_seq = 0
@@ -138,16 +145,16 @@ def run_baseline_round(store, round_id, p0, cfg: BaselineConfig, fee_config: Fee
 def run_one_step_round(store, round_id, p0, feature_cfg, model, one_step_cfg, exec_cfg, fee_config, print_sample=False) -> tuple[PortfolioState, int]:
     events = store.all_events(round_id)
     clock = ReplayClock(store, round_id)
-    cursor = MockFeedCursor(store, round_id, preloaded=events)
-    book_feed = MockBookFeed(cursor)
+    cursor = ReplayCursor(store, round_id, preloaded=events)
+    book_feed = ReplayBookFeed(cursor)
     # Dedicated cursor/book_feed for fetching the actual causal book at a
     # delayed taker order's matched_ts, only at resolve time (Phase 12B
     # Tranche 1.1 item 7 / Tranche 1.2 item 2) - kept separate from the
     # main decision-time cursor above since it advances to a different
     # timestamp, mirroring the prev_cursor pattern already used for
     # baseline lookback in this same file.
-    revalidation_cursor = MockFeedCursor(store, round_id, preloaded=events)
-    revalidation_book_feed = MockBookFeed(revalidation_cursor)
+    revalidation_cursor = ReplayCursor(store, round_id, preloaded=events)
+    revalidation_book_feed = ReplayBookFeed(revalidation_cursor)
     regime_clf = RegimeClassifier(round_id=round_id)
     controller = OneStepController(one_step_cfg, exec_cfg, fee_config)
     sim = ExecutionSimulator(round_id, fee_config, exec_cfg)
@@ -162,7 +169,15 @@ def run_one_step_round(store, round_id, p0, feature_cfg, model, one_step_cfg, ex
         if e.event_type.value == "MARKET_CONFIG":
             market_config = e.payload
             break
-    tick_size = market_config["tick_size"] if market_config else 0.01
+    constraints = (
+        MarketConstraints.from_market_config(
+            market_config_from_payload(market_config),
+            provenance=DataProvenance.SYNTHETIC_TEST,
+            source="synthetic demo MARKET_CONFIG",
+        )
+        if market_config
+        else MarketConstraints.for_testing()
+    )
 
     def _book_at(pending) -> tuple:
         revalidation_cursor.advance_to(pending.matched_ts)
@@ -191,7 +206,7 @@ def run_one_step_round(store, round_id, p0, feature_cfg, model, one_step_cfg, ex
         vec = design_vector(fv, COMBINED_LEAD_LAG)
         q = model.predict_proba(vec) if vec is not None else 0.5
 
-        decision = controller.decide(round_id, decision_ts, portfolio, q, snapshot.permitted_actions, book_up, book_down, tick_size, is_fresh=True)
+        decision = controller.decide(round_id, decision_ts, portfolio, q, snapshot.permitted_actions, book_up, book_down, constraints, is_fresh=True)
 
         if print_sample and not printed and len(decision.candidates) > 2:
             printed = True

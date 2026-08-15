@@ -17,7 +17,7 @@ from xamarinbot.model.dataset import build_examples_multi
 from xamarinbot.model.features import COMBINED_LEAD_LAG
 from xamarinbot.model.walkforward import round_ordered_split
 from xamarinbot.portfolio.state import FeeConfig, Side
-from xamarinbot.synthetic.rounds import generate_synthetic_dataset
+from devtools.synthetic.rounds import generate_synthetic_dataset
 from xamarinbot.walkforward.ablations import MANDATORY_ABLATIONS, RoundResult, run_ablation_round
 from xamarinbot.walkforward.bootstrap import bootstrap_ci
 from xamarinbot.walkforward.pipeline import LeakageTrace, fit_window_artifacts

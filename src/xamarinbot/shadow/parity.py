@@ -23,7 +23,8 @@ from xamarinbot.execution.config import ExecutionConfig
 from xamarinbot.features.config import FeatureConfig
 from xamarinbot.features.engine import compute
 from xamarinbot.features.types import FeatureVector
-from xamarinbot.feeds.mock import MockBookFeed, MockFeedCursor
+from xamarinbot.market.constraints import MarketConstraints
+from xamarinbot.replay.feeds import ReplayBookFeed, ReplayCursor, market_config_from_payload
 from xamarinbot.model.features import FeatureSet, design_vector
 from xamarinbot.model.calibrated import CalibratedModel
 from xamarinbot.model.logistic import LogisticModel
@@ -65,14 +66,19 @@ def _offline_decisions_at(
 ) -> dict[float, str]:
     events = store.all_events(round_id)
     clock = ReplayClock(store, round_id)
-    cursor = MockFeedCursor(store, round_id, preloaded=events)  # default time_attr="event_time"
-    book_feed = MockBookFeed(cursor)
+    cursor = ReplayCursor(store, round_id, preloaded=events)  # default time_attr="event_time"
+    book_feed = ReplayBookFeed(cursor)
     regime_clf = RegimeClassifier(round_id=round_id)
     one_step = OneStepController(one_step_cfg, exec_cfg, fee_config)
     frozen_portfolio = PortfolioState()
 
-    market_config = next(e.payload for e in events if e.event_type is EventType.MARKET_CONFIG)
-    tick_size = market_config["tick_size"]
+    constraints = MarketConstraints.from_market_config(
+        market_config_from_payload(
+            next(e.payload for e in events if e.event_type is EventType.MARKET_CONFIG)
+        ),
+        provenance=store.provenance,
+        source=f"replayed MARKET_CONFIG ({store.provenance.value})",
+    )
 
     result: dict[float, str] = {}
     for decision_ts in clock.decision_points(heartbeat=None):
@@ -86,9 +92,19 @@ def _offline_decisions_at(
         book_up = book_feed.get_snapshot(round_id, Side.UP)
         book_down = book_feed.get_snapshot(round_id, Side.DOWN)
         vec = design_vector(fv, feature_set) if (model is not None and feature_set is not None) else None
-        q = model.predict_proba(vec) if (model is not None and vec is not None) else 0.5
+        if model is None or vec is None:
+            # Phase 12C.1 item 10: no model => no opinion. On real data the
+            # offline arm declines the decision point entirely rather than
+            # comparing the shadow against a q=0.5 straw man; on synthetic
+            # data the old fallback is kept so the parity harness still
+            # exercises end to end.
+            if store.provenance.is_real:
+                continue
+            q = 0.5
+        else:
+            q = model.predict_proba(vec)
         permitted = ActionPermissionMatrix.permitted_actions(classify_seed_action(snapshot.state))
-        decision = one_step.decide(round_id, decision_ts, frozen_portfolio, q, permitted, book_up, book_down, tick_size, True)
+        decision = one_step.decide(round_id, decision_ts, frozen_portfolio, q, permitted, book_up, book_down, constraints, True)
         result[decision_ts] = decision.chosen.action_id
     return result
 

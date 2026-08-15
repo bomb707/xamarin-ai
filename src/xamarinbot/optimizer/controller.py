@@ -27,6 +27,7 @@ from xamarinbot.optimizer.candidates import (
     taker_sizing_boundaries,
     wait_candidate,
 )
+from xamarinbot.market.constraints import MarketConstraints
 from xamarinbot.optimizer.config import OneStepConfig
 from xamarinbot.optimizer.types import CandidateAction, OrderMode
 from xamarinbot.portfolio.exposure import RiskView
@@ -83,7 +84,7 @@ class OneStepController:
         permitted_actions: frozenset[SeedAction],
         book_up: BookSnapshot | None,
         book_down: BookSnapshot | None,
-        tick_size: float,
+        constraints: MarketConstraints,
         is_fresh: bool,
         tau: float | None = None,
         sigma: float = 0.0,
@@ -134,7 +135,7 @@ class OneStepController:
         # there is nothing to generate for that side this decision.
         taker_up_ok, taker_up_penalty = self._family_gate(SeedAction.TAKER_UP, permitted_actions)
         if taker_up_ok and book_up is not None and book_up.asks:
-            sizing = taker_sizing_boundaries(book_up.asks, q, self.fee_config, self.cfg, portfolio, Side.UP, tick_size)
+            sizing = taker_sizing_boundaries(book_up.asks, q, self.fee_config, self.cfg, portfolio, Side.UP, constraints)
             if sizing.p_max is not None:
                 for qty in sizing.quantities:
                     idx += 1
@@ -142,12 +143,13 @@ class OneStepController:
                     c = evaluate_taker_candidate(
                         f"taker_up_{idx}", Side.UP, OrderPurpose.ALPHA, qty, limit_price=limit_price,
                         asks=book_up.asks, portfolio=portfolio, q=q, fee_config=self.fee_config, cfg=self.cfg,
+                        constraints=constraints,
                     )
                     candidates.append(replace(c, selection_penalty=taker_up_penalty) if taker_up_penalty else c)
 
         taker_down_ok, taker_down_penalty = self._family_gate(SeedAction.TAKER_DOWN, permitted_actions)
         if taker_down_ok and book_down is not None and book_down.asks:
-            sizing = taker_sizing_boundaries(book_down.asks, 1.0 - q, self.fee_config, self.cfg, portfolio, Side.DOWN, tick_size)
+            sizing = taker_sizing_boundaries(book_down.asks, 1.0 - q, self.fee_config, self.cfg, portfolio, Side.DOWN, constraints)
             if sizing.p_max is not None:
                 for qty in sizing.quantities:
                     idx += 1
@@ -155,6 +157,7 @@ class OneStepController:
                     c = evaluate_taker_candidate(
                         f"taker_down_{idx}", Side.DOWN, OrderPurpose.ALPHA, qty, limit_price=limit_price,
                         asks=book_down.asks, portfolio=portfolio, q=q, fee_config=self.fee_config, cfg=self.cfg,
+                        constraints=constraints,
                     )
                     candidates.append(replace(c, selection_penalty=taker_down_penalty) if taker_down_penalty else c)
 
@@ -165,7 +168,7 @@ class OneStepController:
             # thesis the seed regime classifier has an opinion on.
             asks_up = book_up.asks if book_up is not None else ()
             asks_down = book_down.asks if book_down is not None else ()
-            hedge = generate_hedge_candidate("hedge", portfolio, asks_up, asks_down, q, self.fee_config, self.cfg, tick_size)
+            hedge = generate_hedge_candidate("hedge", portfolio, asks_up, asks_down, q, self.fee_config, self.cfg, constraints)
             if hedge is not None:
                 candidates.append(hedge)
 
@@ -174,7 +177,7 @@ class OneStepController:
             # above - a portfolio-geometry decision, not a directional one.
             asks_up = book_up.asks if book_up is not None else ()
             asks_down = book_down.asks if book_down is not None else ()
-            candidates.extend(generate_buffer_build_candidates("buffer_build", portfolio, asks_up, asks_down, q, self.fee_config, self.cfg, tick_size))
+            candidates.extend(generate_buffer_build_candidates("buffer_build", portfolio, asks_up, asks_down, q, self.fee_config, self.cfg, constraints))
 
         # Roadmap Phase 11 / SS20.1 ablation #6 "taker-only execution":
         # skip maker candidate generation entirely rather than generating
@@ -186,12 +189,12 @@ class OneStepController:
                 if self.cfg.dynamic_maker:
                     up_specs = dynamic_maker_candidates(
                         q, Side.UP, tau, sigma, portfolio, book_up.best_bid.price, book_up.best_ask.price,
-                        tick_size, self.fee_config, self.cfg,
+                        constraints, self.fee_config, self.cfg,
                     )
                 else:
                     up_specs = [
                         MakerCandidateSpec(price, offset, self.cfg.maker_quantity, self.cfg.maker_horizon_s)
-                        for price, offset in maker_price_grid(book_up.best_bid.price, book_up.best_ask.price, tick_size, self.cfg.maker_price_offsets_ticks)
+                        for price, offset in maker_price_grid(book_up.best_bid.price, book_up.best_ask.price, constraints.tick_size, self.cfg.maker_price_offsets_ticks)
                     ]
                 for spec in up_specs:
                     idx += 1
@@ -200,6 +203,7 @@ class OneStepController:
                         f"maker_up_{idx}", Side.UP, OrderPurpose.ALPHA, spec.price, spec.qty,
                         distance_to_touch_ticks=float(spec.offset_ticks), queue_ahead_shares=queue_ahead, horizon_s=spec.ttl_s,
                         portfolio=portfolio, q=q, exec_cfg=self.exec_cfg, cfg=self.cfg,
+                        constraints=constraints,
                     )
                     candidates.append(replace(c, selection_penalty=maker_up_penalty) if maker_up_penalty else c)
 
@@ -208,12 +212,12 @@ class OneStepController:
                 if self.cfg.dynamic_maker:
                     down_specs = dynamic_maker_candidates(
                         q, Side.DOWN, tau, sigma, portfolio, book_down.best_bid.price, book_down.best_ask.price,
-                        tick_size, self.fee_config, self.cfg,
+                        constraints, self.fee_config, self.cfg,
                     )
                 else:
                     down_specs = [
                         MakerCandidateSpec(price, offset, self.cfg.maker_quantity, self.cfg.maker_horizon_s)
-                        for price, offset in maker_price_grid(book_down.best_bid.price, book_down.best_ask.price, tick_size, self.cfg.maker_price_offsets_ticks)
+                        for price, offset in maker_price_grid(book_down.best_bid.price, book_down.best_ask.price, constraints.tick_size, self.cfg.maker_price_offsets_ticks)
                     ]
                 for spec in down_specs:
                     idx += 1
@@ -222,6 +226,7 @@ class OneStepController:
                         f"maker_down_{idx}", Side.DOWN, OrderPurpose.ALPHA, spec.price, spec.qty,
                         distance_to_touch_ticks=float(spec.offset_ticks), queue_ahead_shares=queue_ahead, horizon_s=spec.ttl_s,
                         portfolio=portfolio, q=q, exec_cfg=self.exec_cfg, cfg=self.cfg,
+                        constraints=constraints,
                     )
                     candidates.append(replace(c, selection_penalty=maker_down_penalty) if maker_down_penalty else c)
 

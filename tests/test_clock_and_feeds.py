@@ -6,13 +6,13 @@ from xamarinbot.clock import ClockSync, RoundClock
 from xamarinbot.events.store import EventStore
 from xamarinbot.events.types import EventType
 from xamarinbot.feeds.freshness import FeedFreshnessMonitor, Freshness
-from xamarinbot.feeds.mock import (
-    MockBookFeed,
-    MockFeedCursor,
-    MockMarketConfigProvider,
-    MockSpotFeed,
-    MockTWAPFeed,
-    MockUserOrderFeed,
+from xamarinbot.replay.feeds import (
+    ReplayBookFeed,
+    ReplayCursor,
+    ReplayMarketConfigProvider,
+    ReplaySpotFeed,
+    ReplayTWAPFeed,
+    ReplayUserOrderFeed,
 )
 from xamarinbot.portfolio.state import Side
 
@@ -72,8 +72,8 @@ def _round_id_store_with_config_changes() -> tuple[EventStore, str]:
 
 def test_tick_size_change_is_detected():
     store, round_id = _round_id_store_with_config_changes()
-    cursor = MockFeedCursor(store, round_id, now=200.0)
-    provider = MockMarketConfigProvider(cursor)
+    cursor = ReplayCursor(store, round_id, now=200.0)
+    provider = ReplayMarketConfigProvider(cursor)
 
     seen = []
     provider.subscribe_tick_size_changes(round_id, lambda tick: seen.append(tick))
@@ -85,8 +85,8 @@ def test_tick_size_change_is_detected():
 
 def test_disconnect_reconnect_is_a_safe_noop_for_mock_feeds():
     store, round_id = _round_id_store_with_config_changes()
-    cursor = MockFeedCursor(store, round_id, now=0.0)
-    for feed in (MockTWAPFeed(cursor), MockSpotFeed(cursor), MockBookFeed(cursor), MockUserOrderFeed(cursor)):
+    cursor = ReplayCursor(store, round_id, now=0.0)
+    for feed in (ReplayTWAPFeed(cursor), ReplaySpotFeed(cursor), ReplayBookFeed(cursor), ReplayUserOrderFeed(cursor)):
         feed.reconnect()  # must not raise
 
 
@@ -100,8 +100,8 @@ def test_book_snapshot_plus_deltas_reconstruct_correctly_and_resnapshot_matches(
     store.append(EventType.BOOK_DELTA, round_id, recv_ts=1.0, source_ts=1.0,
                  payload={"side": "UP", "book": "asks", "price": 0.49, "size": 80.0, "book_hash": "h1"})
 
-    cursor = MockFeedCursor(store, round_id, now=0.5)
-    feed = MockBookFeed(cursor)
+    cursor = ReplayCursor(store, round_id, now=0.5)
+    feed = ReplayBookFeed(cursor)
     snap_before = feed.get_snapshot(round_id, Side.UP)
     assert snap_before.best_ask.price == 0.50
 
@@ -124,8 +124,8 @@ def test_book_feed_cache_rebuilds_correctly_if_cursor_moves_backward():
     store.append(EventType.BOOK_DELTA, round_id, recv_ts=5.0, source_ts=5.0,
                  payload={"side": "UP", "book": "asks", "price": 0.6, "size": 20.0})
 
-    cursor = MockFeedCursor(store, round_id, now=10.0)
-    feed = MockBookFeed(cursor)
+    cursor = ReplayCursor(store, round_id, now=10.0)
+    feed = ReplayBookFeed(cursor)
     assert feed.get_snapshot(round_id, Side.UP).best_ask.price == 0.6
 
     cursor.advance_to(0.0)  # rewind past the delta

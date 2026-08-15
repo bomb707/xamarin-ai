@@ -16,7 +16,7 @@ from xamarinbot.execution.config import ExecutionConfig
 from xamarinbot.features.config import FeatureConfig
 from xamarinbot.model.features import COMBINED_LEAD_LAG, SPOT_ONLY, TWAP_ONLY
 from xamarinbot.portfolio.state import FeeConfig, Side
-from xamarinbot.synthetic.rounds import generate_synthetic_dataset
+from devtools.synthetic.rounds import generate_synthetic_dataset
 from xamarinbot.walkforward.ablations import MANDATORY_ABLATIONS
 from xamarinbot.walkforward.pipeline import (
     LeakageTrace,

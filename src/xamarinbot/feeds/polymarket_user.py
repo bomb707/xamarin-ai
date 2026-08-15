@@ -1,4 +1,25 @@
-"""Real Polymarket authenticated user/order WSS adapter [P3].
+"""DEPRECATED - Real Polymarket authenticated user/order WSS adapter [P3].
+
+=============================== DEPRECATED ===============================
+Phase 12C.1 item 7 audited this module and retained it, deprecated, rather
+than deleting it: unlike `feeds/chainlink_twap.py` and
+`feeds/spot_composite.py` (both deleted, both superseded by
+`realtime/rtds.py`), there is NO `realtime/` equivalent of the
+authenticated user/order stream, so deleting it would discard the only
+reference implementation ahead of Phase 13.
+
+It has ZERO callers and MUST keep zero callers for now:
+
+  * Phase 12C/12C.1 are recorder + paper-shadow only. No private key, no
+    authenticated session, no order/cancel/replacement is ever sent.
+  * Its REST fallback path (`open_orders()` / `reconcile()`) has never been
+    verified against a live endpoint - see the CAVEAT below.
+
+`tests/test_import_boundaries.py` asserts nothing imports this module.
+Before Phase 13 uses it, verify the REST schema against current docs and
+move it under `realtime/` so the real-market SSOT stays in one place.
+==========================================================================
+
 
 Endpoint and message shapes pulled from docs.polymarket.com on 2026-08-13
 (https://docs.polymarket.com/market-data/websocket/user-channel):

@@ -13,7 +13,7 @@ from xamarinbot.features.config import FeatureConfig
 from xamarinbot.features.engine import compute
 from xamarinbot.features.types import FeatureVector
 from xamarinbot.model.features import FeatureSet, design_vector
-from xamarinbot.synthetic.rounds import SyntheticRoundResult
+from xamarinbot.rounds import RoundLabel
 
 
 @dataclass(frozen=True)
@@ -27,7 +27,7 @@ class Example:
 
 def build_examples_multi(
     store: EventStore,
-    results: list[SyntheticRoundResult],
+    results: list[RoundLabel],
     feature_cfg: FeatureConfig,
     feature_sets: list[FeatureSet],
     heartbeat_s: float = 5.0,

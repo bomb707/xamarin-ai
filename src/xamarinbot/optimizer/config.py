@@ -37,13 +37,22 @@ class OneStepConfig:
     min_marginal_edge: float = 0.0
 
     # Phase 12B audit item 8: boundary-quantity generation inputs for
-    # taker candidates. taker_min_size is a fallback for the real
-    # exchange minimum order size (MarketConfig.min_order_size once wired
-    # in - Tranche 3 real-adapter work, not yet threaded through here).
-    # taker_qty_step is the configured small-quantity grid spacing.
-    taker_min_size: float = 1.0
+    # taker candidates. `taker_qty_step` is the configured small-quantity
+    # grid spacing.
+    #
+    # `taker_min_size` USED TO LIVE HERE, defaulting to 1.0, described in
+    # its own comment as a fallback for the real exchange minimum "once
+    # wired in". Phase 12C.1 item 11 removed it: every BTC five-minute
+    # market sampled in the Phase 12C captures reports a minimum of 5.0
+    # SHARES, so the static 1.0 was not merely un-wired but wrong by 5x, in
+    # the direction that generates orders the venue rejects. The executable
+    # minimum now comes from `MarketConstraints.min_order_shares`, read per
+    # round from that market's own metadata and passed down the call chain -
+    # it is deliberately NOT copied back into this static config, which
+    # would recreate a second, staleable source of truth (item 12).
     taker_qty_step: float = 1.0
-    # Caps the small-quantity grid to this many steps near taker_min_size,
+    # Caps the small-quantity grid to this many steps near the market
+    # minimum,
     # regardless of how large the feasible range turns out to be - an
     # unbounded dense grid exploded candidate counts (and MPC latency)
     # whenever the risk/spend budget was loose. The boundary quantities

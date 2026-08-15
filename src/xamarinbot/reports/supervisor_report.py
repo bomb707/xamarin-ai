@@ -18,7 +18,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from xamarinbot.events.store import EventStore
-from xamarinbot.feeds.mock import MockBookFeed, MockFeedCursor
+from xamarinbot.replay.feeds import ReplayBookFeed, ReplayCursor
 from xamarinbot.journal.schema import SupervisorDecisionRecord
 from xamarinbot.journal.writer import JournalWriter
 from xamarinbot.portfolio.state import Side
@@ -52,8 +52,8 @@ def _would_have_filled(store: EventStore, round_id: str, side: Side, order_price
     (cancel_ts, cancel_ts + lookback_s]? A real fill also needs queue
     priority and size, which this doesn't model."""
     events = store.all_events(round_id)
-    cursor = MockFeedCursor(store, round_id, preloaded=events, now=cancel_ts)
-    book_feed = MockBookFeed(cursor)
+    cursor = ReplayCursor(store, round_id, preloaded=events, now=cancel_ts)
+    book_feed = ReplayBookFeed(cursor)
     times = sorted({e.event_time for e in events if cancel_ts < e.event_time <= cancel_ts + lookback_s})
     for t in times:
         cursor.advance_to(t)

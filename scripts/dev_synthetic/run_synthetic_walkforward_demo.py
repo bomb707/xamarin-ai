@@ -38,14 +38,18 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+sys.path.insert(0, str(_REPO_ROOT / "src"))
+# `devtools` (the synthetic data fabricator) lives at the repo root,
+# deliberately outside the shipped package - see Phase 12C.1 item 4.
+sys.path.insert(0, str(_REPO_ROOT))
 
 from xamarinbot.events.store import EventStore
 from xamarinbot.execution.config import ExecutionConfig
 from xamarinbot.features.config import FeatureConfig
 from xamarinbot.portfolio.state import FeeConfig
 from xamarinbot.reports.walkforward_report import format_ablation_matrix, format_sensitivity, format_stability, summarize_ablation
-from xamarinbot.synthetic.rounds import generate_synthetic_dataset
+from devtools.synthetic.rounds import generate_synthetic_dataset
 from xamarinbot.walkforward.ablations import MANDATORY_ABLATIONS
 from xamarinbot.walkforward.pipeline import fit_window_artifacts, run_walk_forward_ablations, LeakageTrace
 from xamarinbot.walkforward.sensitivity import parameter_stability_across_windows, sweep_parameter

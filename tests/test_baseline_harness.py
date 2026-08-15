@@ -15,7 +15,7 @@ from xamarinbot.baseline.inputs import elapsed_t
 from xamarinbot.events.store import EventStore
 from xamarinbot.execution.config import ExecutionConfig
 from xamarinbot.portfolio.state import FeeConfig, Side
-from xamarinbot.synthetic.rounds import populate_synthetic_round
+from devtools.synthetic.rounds import populate_synthetic_round
 from xamarinbot.walkforward.ablations import _run_baseline_round
 
 
@@ -71,7 +71,7 @@ def test_baseline_harness_spot_direction_is_not_always_flat():
     from xamarinbot.events.replay import ReplayClock
     from xamarinbot.events.types import EventType
     from xamarinbot.baseline.strategy import BaselineInputs, decide
-    from xamarinbot.feeds.mock import MockFeedCursor, MockSpotFeed, MockTWAPFeed, MockBookFeed
+    from xamarinbot.replay.feeds import ReplayCursor, ReplaySpotFeed, ReplayTWAPFeed, ReplayBookFeed
     from xamarinbot.baseline.inputs import elapsed_t
 
     store = EventStore(":memory:")
@@ -81,10 +81,10 @@ def test_baseline_harness_spot_direction_is_not_always_flat():
     market_config = next(e.payload for e in events if e.event_type is EventType.MARKET_CONFIG)
     cfg = BaselineConfig()
 
-    cursor = MockFeedCursor(store, round_id, preloaded=events)
-    twap_feed, spot_feed, book_feed = MockTWAPFeed(cursor), MockSpotFeed(cursor), MockBookFeed(cursor)
-    prev_spot_cursor = MockFeedCursor(store, round_id, preloaded=events)
-    prev_spot_feed = MockSpotFeed(prev_spot_cursor)
+    cursor = ReplayCursor(store, round_id, preloaded=events)
+    twap_feed, spot_feed, book_feed = ReplayTWAPFeed(cursor), ReplaySpotFeed(cursor), ReplayBookFeed(cursor)
+    prev_spot_cursor = ReplayCursor(store, round_id, preloaded=events)
+    prev_spot_feed = ReplaySpotFeed(prev_spot_cursor)
     clock = ReplayClock(store, round_id)
 
     seen_nonzero_spot_direction = False

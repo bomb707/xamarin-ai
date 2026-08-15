@@ -4,8 +4,32 @@ evolution.")."""
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 
 from xamarinbot.portfolio.state import PortfolioState
+from xamarinbot.provenance import DataProvenance
+
+
+class DecisionBlockReason(str, Enum):
+    """Why a decision point produced no ALPHA candidate.
+
+    Distinct from a WAIT the optimizer chose on the economics: these mean
+    the system declined to have an opinion, and conflating the two would
+    make a blind run look like a deliberately patient one.
+    """
+
+    #: Phase 12C.1 item 10. No probability model, no feature set, or no
+    #: design vector - so there is no `q`. On REAL_LIVE/REAL_REPLAY this
+    #: produces NO_ALPHA rather than the old `q = 0.5` fallback, which
+    #: silently turned "we have no probability estimate" into "the true
+    #: probability is 50%".
+    MODEL_UNAVAILABLE = "MODEL_UNAVAILABLE"
+    #: `compute()` returned an explicit InvalidFeatureState.
+    INVALID_FEATURES = "INVALID_FEATURES"
+    #: A required input was missing or stale.
+    FEED_STALE = "FEED_STALE"
+    #: The feed was disconnected at this decision point.
+    FEED_DISCONNECTED = "FEED_DISCONNECTED"
 
 
 @dataclass(frozen=True)
@@ -40,6 +64,10 @@ class ShadowDecisionRecord:
     #: an input was missing or stale. Distinct from `missed_deadline`
     #: (a latency failure) and from a genuine WAIT (an economic choice).
     suppressed_by_freshness: bool = False
+    #: Phase 12C.1 item 10: why this decision produced no ALPHA, when it
+    #: produced none for a reason other than economics. None on a decision
+    #: the optimizer actually made.
+    blocked_reason: DecisionBlockReason | None = None
 
 
 @dataclass(frozen=True)
@@ -55,3 +83,11 @@ class ShadowRoundResult:
     n_freshness_failures: int = 0
     n_invalid_feature_states: int = 0
     n_orders_reviewed_while_stale: int = 0
+    #: Phase 12C.1 item 10: decision points blocked because no probability
+    #: model was available. On a REAL_* run this is the count of decisions
+    #: that would previously have been made against a fabricated q = 0.5.
+    n_model_unavailable: int = 0
+    #: Phase 12C.1 item 2: what kind of data produced this result. Reports
+    #: print it prominently so a synthetic run can never be mistaken for
+    #: evidence.
+    provenance: DataProvenance = DataProvenance.SYNTHETIC_TEST

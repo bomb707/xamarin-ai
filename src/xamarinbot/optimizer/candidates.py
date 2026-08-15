@@ -27,6 +27,7 @@ from xamarinbot.execution.config import ExecutionConfig
 from xamarinbot.execution.maker import fill_probability, q_fill
 from xamarinbot.execution.taker import walk_depth
 from xamarinbot.feeds.base import BookLevel, BookSnapshot
+from xamarinbot.market.constraints import MarketConstraints
 from xamarinbot.optimizer.config import OneStepConfig
 from xamarinbot.optimizer.types import CandidateAction, OrderMode
 from xamarinbot.portfolio.exposure import ActiveOrderExposure
@@ -311,7 +312,7 @@ def taker_sizing_boundaries(
     cfg: OneStepConfig,
     portfolio: PortfolioState,
     side: Side,
-    tick_size: float = 0.01,
+    constraints: MarketConstraints,
 ) -> TakerSizing:
     """Generates economically meaningful candidate quantities from the
     union of boundaries named in Phase 12B audit item 7: exchange minimum
@@ -333,6 +334,7 @@ def taker_sizing_boundaries(
     used for both the position-capacity boundary and the exact risk-budget
     walk's own side-aware kernel evaluation.
     """
+    tick_size = constraints.tick_size
     if not asks:
         return TakerSizing((), None)
 
@@ -384,7 +386,7 @@ def taker_sizing_boundaries(
 
     quantities: set[float] = set()
     step = max(cfg.taker_qty_step, 1e-9)
-    x = cfg.taker_min_size
+    x = constraints.min_order_shares
     # Bounded to `taker_qty_grid_points` steps near the minimum, not a
     # dense grid across the whole feasible range - when the risk/spend
     # budget is loose, max_feasible can be in the hundreds or thousands
@@ -398,14 +400,14 @@ def taker_sizing_boundaries(
             break
         quantities.add(round(x, 6))
         x += step
-    if max_feasible >= cfg.taker_min_size - 1e-9 and max_feasible > 1e-9:
+    if max_feasible >= constraints.min_order_shares - 1e-9 and max_feasible > 1e-9:
         quantities.add(round(max_feasible, 6))  # the exact tightest-boundary partial quantity
 
     cum = 0.0
     for level in asks[: cfg.max_taker_depth_levels]:
         cum += level.size
         capped = min(cum, max_feasible)
-        if capped >= cfg.taker_min_size - 1e-9 and capped > 1e-9:
+        if capped >= constraints.min_order_shares - 1e-9 and capped > 1e-9:
             quantities.add(round(capped, 6))
 
     final_quantities = tuple(sorted(quantities))
@@ -512,7 +514,7 @@ def _maker_feasible_quantity(
 
 def dynamic_maker_candidates(
     q: float, side: Side, tau: float | None, sigma: float, portfolio: PortfolioState,
-    best_bid: float, best_ask: float, tick_size: float, fee_config: FeeConfig, cfg: OneStepConfig,
+    best_bid: float, best_ask: float, constraints: MarketConstraints, fee_config: FeeConfig, cfg: OneStepConfig,
 ) -> list[MakerCandidateSpec]:
     """Derives maker (price, quantity, TTL) candidates from `(q, tau,
     sigma, G, R, purpose)` instead of `OneStepConfig`'s fixed
@@ -557,6 +559,7 @@ def dynamic_maker_candidates(
     max feasible itself) lets the caller's own EV/fill-probability model
     (`evaluate_maker_candidate`) rank which quantity is actually worth it,
     rather than this function picking a single one."""
+    tick_size = constraints.tick_size
     if tau is not None and tau <= 0:
         return []
     if tau is not None and cfg.min_maker_ttl_s > 0 and tau < cfg.min_maker_ttl_s:
@@ -575,11 +578,11 @@ def dynamic_maker_candidates(
     specs: list[MakerCandidateSpec] = []
     for price, offset in maker_price_grid(best_bid, best_ask, tick_size, offsets):
         max_feasible = _maker_feasible_quantity(u, d, c, cfg.g_min, side, price, fee_config, cfg.spend_cap, cfg.position_limit)
-        if max_feasible < cfg.taker_min_size - 1e-9:
+        if max_feasible < constraints.min_order_shares - 1e-9:
             continue
-        candidate_qtys = sorted({round(v, 6) for v in (cfg.taker_min_size, min(vol_damped_typical, max_feasible), max_feasible)})
+        candidate_qtys = sorted({round(v, 6) for v in (constraints.min_order_shares, min(vol_damped_typical, max_feasible), max_feasible)})
         for qty in candidate_qtys:
-            if qty < cfg.taker_min_size - 1e-9:
+            if qty < constraints.min_order_shares - 1e-9:
                 continue
             specs.append(MakerCandidateSpec(price=price, offset_ticks=offset, qty=qty, ttl_s=ttl))
     return specs
@@ -626,6 +629,7 @@ def _finalize(
     cfg: OneStepConfig,
     apply_edge_min: bool,
     expected_delta_g: float,
+    constraints: MarketConstraints,
     max_execution_price: float | None = None,
 ) -> CandidateAction:
     result = FillSimulationResult(
@@ -640,6 +644,27 @@ def _finalize(
     favored = _favored_side(q) if cfg.p_min is not None else None
     check = evaluate_constraints(result, _risk_constraints(cfg), favored_side=favored)
     violated = list(check.violated)
+
+    # Phase 12C.1 item 13: the venue's minimum order size, applied to EVERY
+    # order purpose in ONE place.
+    #
+    # This is the single enforcement point on purpose. The minimum used to be
+    # `cfg.taker_min_size` (a static 1.0, while the real BTC 5-minute markets
+    # report 5.0 shares) consulted inside three of the five candidate
+    # generators - `generate_hedge_candidate` and the fixed-quantity maker
+    # path never checked it at all, so a HEDGE or maker order could be sized
+    # below what the venue would accept. Every candidate of every purpose
+    # flows through `_finalize`, so checking here covers ALPHA taker, HEDGE,
+    # BUFFER_BUILD, maker and REPLACE without relying on five generators each
+    # remembering to.
+    #
+    # A candidate below the minimum is marked INVALID rather than rounded up:
+    # its size was derived from a risk or economic boundary, and rounding it
+    # upward to reach the minimum would breach exactly the constraint that
+    # produced it. `admits_size`'s tolerance covers float error on a quantity
+    # computed as precisely the minimum, not a genuinely undersized order.
+    if mode is not OrderMode.WAIT and not constraints.admits_size(qty):
+        violated.append("min_order_shares")
 
     delta_ev = delta_ev_raw - cfg.churn_penalty
     # Hedge and BUFFER_BUILD orders are explicitly allowed negative
@@ -708,6 +733,7 @@ def evaluate_taker_candidate(
     q: float,
     fee_config: FeeConfig,
     cfg: OneStepConfig,
+    constraints: MarketConstraints,
 ) -> CandidateAction:
     walk = walk_depth(asks, requested_qty, limit_price, fee_config)
     fill = Fill(side=side, price=walk.avg_price if walk.filled_shares > 0 else limit_price, shares=walk.filled_shares, role=LiquidityRole.TAKER, fee=walk.total_fee)
@@ -728,7 +754,7 @@ def evaluate_taker_candidate(
         requested_qty, ttl_s=0.0, expected_fill=walk.filled_shares,
         delta_U=delta_U, delta_D=delta_D, delta_C=delta_C, delta_ev_raw=delta_ev_raw,
         portfolio=portfolio, portfolio_after=portfolio_after, q=q, cfg=cfg, apply_edge_min=True,
-        expected_delta_g=expected_delta_g, max_execution_price=limit_price,
+        expected_delta_g=expected_delta_g, constraints=constraints, max_execution_price=limit_price,
     )
 
 
@@ -745,6 +771,7 @@ def evaluate_maker_candidate(
     q: float,
     exec_cfg: ExecutionConfig,
     cfg: OneStepConfig,
+    constraints: MarketConstraints,
 ) -> CandidateAction:
     """Constraint checks use the *if-filled* portfolio (conservative: a
     maker order that would breach G_min if it actually fills is rejected
@@ -773,6 +800,7 @@ def evaluate_maker_candidate(
         action_id, purpose, side, OrderMode.POST_ONLY, price, qty, ttl_s=horizon_s, expected_fill=rho * qty,
         delta_U=delta_U, delta_D=delta_D, delta_C=delta_C, delta_ev_raw=delta_ev_raw,
         portfolio=portfolio, portfolio_after=portfolio_after_if_filled, q=q, cfg=cfg, apply_edge_min=True,
+        constraints=constraints,
         expected_delta_g=expected_delta_g,
     )
 
@@ -816,7 +844,7 @@ def evaluate_replacement_plan(
     remaining_shares: float,
     best_bid: float,
     best_ask: float,
-    tick_size: float,
+    constraints: MarketConstraints,
     offsets_ticks: tuple[int, ...],
     horizon_s: float,
     portfolio: PortfolioState,
@@ -833,12 +861,13 @@ def evaluate_replacement_plan(
     grid price. Returns `None` if the book has no valid grid at all, or
     every grid price is itself hard-constraint-invalid (e.g. would breach
     g_min if filled) - REPLACE is then simply not offered this review."""
+    tick_size = constraints.tick_size
     best: CandidateAction | None = None
     for price, offset in maker_price_grid(best_bid, best_ask, tick_size, offsets_ticks):
         c = evaluate_maker_candidate(
             "replacement_eval", side, OrderPurpose.ALPHA, price, remaining_shares,
             distance_to_touch_ticks=float(offset), queue_ahead_shares=0.0, horizon_s=horizon_s,
-            portfolio=portfolio, q=q, exec_cfg=exec_cfg, cfg=cfg,
+            portfolio=portfolio, q=q, exec_cfg=exec_cfg, cfg=cfg, constraints=constraints,
         )
         if not c.is_valid:
             continue
@@ -869,7 +898,7 @@ def generate_hedge_candidate(
     q: float,
     fee_config: FeeConfig,
     cfg: OneStepConfig,
-    tick_size: float = 0.01,
+    constraints: MarketConstraints,
 ) -> CandidateAction | None:
     """Portfolio-repair / hedge candidate (Strategy doc SS17, Roadmap
     Phase 11 / SS20.1 ablation #5 "Lead-lag + CLOB without portfolio
@@ -897,6 +926,7 @@ def generate_hedge_candidate(
     the floor (`x_min_hedge <= 0` - no repair needed) or the opposite
     side's book has no ask to hedge against.
     """
+    tick_size = constraints.tick_size
     if math.isclose(portfolio.Pi_U, portfolio.Pi_D):
         return None
 
@@ -944,7 +974,7 @@ def generate_hedge_candidate(
 
     return evaluate_taker_candidate(
         action_id, side, OrderPurpose.HEDGE, x_min, limit_price=max_price, asks=asks,
-        portfolio=portfolio, q=q, fee_config=fee_config, cfg=cfg,
+        portfolio=portfolio, q=q, fee_config=fee_config, cfg=cfg, constraints=constraints,
     )
 
 
@@ -974,7 +1004,7 @@ def generate_buffer_build_candidates(
     q: float,
     fee_config: FeeConfig,
     cfg: OneStepConfig,
-    tick_size: float = 0.01,
+    constraints: MarketConstraints,
 ) -> list[CandidateAction]:
     """BUFFER_BUILD candidates (Phase 12B Tranche 2B, Strategy doc SS17;
     redesigned into a bounded multi-quantity set in Tranche 2.1 item 7):
@@ -1005,6 +1035,7 @@ def generate_buffer_build_candidates(
     BUFFER_BUILD trades expected value for improved worst-case
     settlement, same allowance as HEDGE) - `edge_min` does not apply (see
     `_EDGE_MIN_EXEMPT_PURPOSES`)."""
+    tick_size = constraints.tick_size
     side = Side.UP if portfolio.U <= portfolio.D else Side.DOWN
     asks = asks_up if side is Side.UP else asks_down
     if not asks:
@@ -1071,9 +1102,9 @@ def generate_buffer_build_candidates(
     # minimum, silently discarding the exact-minimum candidate even when
     # it was individually delta_g>0-feasible.
     exact_quantities: set[float] = set()
-    exact_quantities.add(min(cfg.taker_min_size, max_feasible))  # exchange minimum - never margined
+    exact_quantities.add(min(constraints.min_order_shares, max_feasible))  # exchange minimum - never margined
     step = max(cfg.taker_qty_step, 1e-9)
-    x = cfg.taker_min_size
+    x = constraints.min_order_shares
     for _ in range(cfg.taker_qty_grid_points):  # small-quantity grid - interior points, exact
         if x >= max_feasible - 1e-9:
             break
@@ -1092,7 +1123,7 @@ def generate_buffer_build_candidates(
 
     quantities: set[float] = set()
     for raw_qty in exact_quantities:
-        if raw_qty >= cfg.taker_min_size - 1e-9:
+        if raw_qty >= constraints.min_order_shares - 1e-9:
             quantities.add(raw_qty)
     for raw_qty in boundary_quantities:
         # Safety margin (matching generate_hedge_candidate's own
@@ -1101,7 +1132,7 @@ def generate_buffer_build_candidates(
         # side of it after chained floating-point arithmetic. Applied
         # only here, never to an already-exact quantity above.
         margined = raw_qty * 0.999
-        if margined >= cfg.taker_min_size - 1e-9:
+        if margined >= constraints.min_order_shares - 1e-9:
             quantities.add(margined)
 
     candidates: list[CandidateAction] = []
@@ -1123,6 +1154,7 @@ def generate_buffer_build_candidates(
         candidates.append(evaluate_taker_candidate(
             f"{action_id_prefix}_{idx}", side, OrderPurpose.BUFFER_BUILD, walk.filled_shares, limit_price=max_price,
             asks=asks, portfolio=portfolio, q=q, fee_config=fee_config, cfg=cfg,
+            constraints=constraints,
         ))
     return candidates
 

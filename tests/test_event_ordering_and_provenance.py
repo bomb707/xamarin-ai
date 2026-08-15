@@ -17,6 +17,13 @@ from xamarinbot.events.types import (
     causal_sort,
     ordering_ambiguities,
 )
+from xamarinbot.market.constraints import MarketConstraints
+
+# Phase 12C.1 item 12: executable market parameters are a runtime object read
+# from the market, not static config. `for_testing` is explicitly stamped
+# SYNTHETIC_TEST and defaults min_order_shares to 1.0, so this file's sizing
+# arithmetic is unchanged - but it can no longer be inherited by a live path.
+CONSTRAINTS = MarketConstraints.for_testing()
 
 
 def ev(seq, etype, source_ts, recv_ts=None, **payload):
@@ -148,7 +155,7 @@ def test_replacement_plan_carries_its_own_thesis():
 
     plan = evaluate_replacement_plan(
         Side.UP, remaining_shares=10.0, best_bid=0.44, best_ask=0.46,
-        tick_size=0.01, offsets_ticks=(0, 1, 2), horizon_s=30.0,
+        constraints=CONSTRAINTS, offsets_ticks=(0, 1, 2), horizon_s=30.0,
         portfolio=PortfolioState(), q=0.62,
         exec_cfg=ExecutionConfig(), fee_config=FeeConfig(),
         cfg=OneStepConfig(g_min=-100.0, spend_cap=200.0, position_limit=200.0),
@@ -172,7 +179,7 @@ def test_down_side_fair_value_is_one_minus_q():
     # this test is about).
     plan = evaluate_replacement_plan(
         Side.DOWN, remaining_shares=10.0, best_bid=0.44, best_ask=0.46,
-        tick_size=0.01, offsets_ticks=(0, 1, 2), horizon_s=30.0,
+        constraints=CONSTRAINTS, offsets_ticks=(0, 1, 2), horizon_s=30.0,
         portfolio=PortfolioState(), q=0.30,
         exec_cfg=ExecutionConfig(), fee_config=FeeConfig(),
         cfg=OneStepConfig(g_min=-100.0, spend_cap=200.0, position_limit=200.0),
@@ -203,7 +210,7 @@ def test_replacement_tracked_order_does_not_inherit_the_canceled_orders_thesis()
     )
 
     cfg = OneStepConfig(g_min=-1000.0, spend_cap=10_000.0, position_limit=10_000.0)
-    session = TradingSession("r1", FeeConfig(), ExecutionConfig(), cfg)
+    session = TradingSession("r1", FeeConfig(), ExecutionConfig(), cfg, CONSTRAINTS)
     state = RegimeState(GapRegime.UPPER_MIDDLE, Direction.UP, Direction.UP)
 
     def book(side, bid, ask):
@@ -228,7 +235,7 @@ def test_replacement_tracked_order_does_not_inherit_the_canceled_orders_thesis()
     ):
         session.review_open_orders(
             10.0, state, 0.70, book(Side.UP, 0.44, 0.46), book(Side.DOWN, 0.54, 0.56),
-            120.0, True, 0.01,
+            120.0, True,
         )
 
     new_orders = [t for oid, t in session.supervisor.orders.items() if oid != "old"]
@@ -257,7 +264,7 @@ def replacement_plan_expected_delta_g(session, q, horizon_s):
     from xamarinbot.portfolio.state import Side
 
     plan = evaluate_replacement_plan(
-        Side.UP, 10.0, 0.44, 0.46, 0.01,
+        Side.UP, 10.0, 0.44, 0.46, session.constraints,
         session.cfg.maker_price_offsets_ticks, horizon_s,
         session.portfolio, q, session.exec_cfg, session.fee_config, session.cfg,
     )

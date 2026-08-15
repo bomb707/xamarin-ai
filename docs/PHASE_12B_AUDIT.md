@@ -1,5 +1,18 @@
 # Phase 12B Audit
 
+> **Path note (added Phase 12C.1).** This document is a historical record and
+> its file references are to the layout at the time of the audit. Several
+> paths have since moved, deliberately, to separate real from fabricated data:
+> `src/xamarinbot/synthetic/` -> `devtools/synthetic/`,
+> `src/xamarinbot/feeds/mock.py` -> `src/xamarinbot/replay/feeds.py`
+> (`Mock*` -> `Replay*`), `scripts/run_*_demo.py` ->
+> `scripts/dev_synthetic/run_synthetic_*.py`, and
+> `src/xamarinbot/feeds/polymarket_clob.py` ->
+> `src/xamarinbot/realtime/feed_adapter.py`. See
+> [DATA_PROVENANCE.md](DATA_PROVENANCE.md). The findings below are unchanged.
+
+
+
 Audit of `main` against `Xamarinbot_V2_Phase12B_Claude_Prompt.pdf`'s 38
 numbered items. **This is an audit only — no implementation changes were
 made in this pass**, per the prompt's explicit instruction ("Start with

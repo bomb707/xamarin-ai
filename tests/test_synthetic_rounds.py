@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from xamarinbot.events.store import EventStore
 from xamarinbot.events.types import EventType
-from xamarinbot.synthetic.rounds import generate_synthetic_dataset
+from devtools.synthetic.rounds import generate_synthetic_dataset
 
 
 def test_default_id_offset_reproduces_prior_behavior():

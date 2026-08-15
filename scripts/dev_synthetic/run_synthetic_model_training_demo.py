@@ -23,7 +23,11 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+sys.path.insert(0, str(_REPO_ROOT / "src"))
+# `devtools` (the synthetic data fabricator) lives at the repo root,
+# deliberately outside the shipped package - see Phase 12C.1 item 4.
+sys.path.insert(0, str(_REPO_ROOT))
 
 from xamarinbot.events.store import EventStore
 from xamarinbot.features.config import FeatureConfig
@@ -36,7 +40,7 @@ from xamarinbot.model.logistic import fit_logistic_regression
 from xamarinbot.model.metrics import brier_score, calibration_by_group, calibration_table, log_loss, settlement_accuracy
 from xamarinbot.model.registry import ModelRegistry, PromotionGateError, make_artifact
 from xamarinbot.model.walkforward import round_ordered_split
-from xamarinbot.synthetic.rounds import generate_synthetic_dataset
+from devtools.synthetic.rounds import generate_synthetic_dataset
 
 HEARTBEAT_S = 10.0
 FEATURE_SETS = [TWAP_ONLY, SPOT_ONLY, COMBINED_LEAD_LAG]
