@@ -251,15 +251,24 @@ class RiskView:
 
     def admits(
         self, candidate: ActiveOrderExposure, g_min: float, spend_cap: float | None,
-        exact_subset_cap: int = DEFAULT_EXACT_SUBSET_CAP,
+        position_limit: float | None = None, exact_subset_cap: int = DEFAULT_EXACT_SUBSET_CAP,
     ) -> bool:
         """Would admitting `candidate` (as one more active order,
         alongside every order already tracked in this view) ever risk a
-        `g_min` or `spend_cap` breach under some fill subset? Runs the
-        full scenario envelope over `existing orders UNION {candidate}` -
-        not "candidate always fills," since the worst subset might or
-        might not include it, exactly like any other order (Phase 12B
-        Tranche 2A item 1's fix applies here too)."""
+        `g_min`, `spend_cap`, or `position_limit` breach under some fill
+        subset? Runs the full scenario envelope over `existing orders
+        UNION {candidate}` - not "candidate always fills," since the
+        worst subset might or might not include it, exactly like any
+        other order (Phase 12B Tranche 2A item 1's fix applies here too).
+
+        `position_limit` (Phase 12B Tranche 2.1 item 2 - previously
+        exposed via `potential_up_position`/`potential_down_position` but
+        never actually enforced here) uses a plain sum over every UP/DOWN
+        order, not the subset envelope `worst_g` needs: unlike `G`, a
+        side's potential position can only ever grow as more orders on
+        that side fill (no non-monotonic min() interaction), so "every
+        order on this side fills" genuinely is the worst (and only
+        relevant) case for a position ceiling."""
         combined_orders = self.combined_exposure.orders + (candidate,)
         worst_g = PendingExposure(orders=combined_orders).worst_case_g(self.confirmed_portfolio, exact_subset_cap)
         if worst_g < g_min:
@@ -267,5 +276,10 @@ class RiskView:
         if spend_cap is not None:
             total_worst_spend = self.confirmed_portfolio.C + sum(o.max_cost for o in combined_orders)
             if total_worst_spend > spend_cap:
+                return False
+        if position_limit is not None:
+            up_potential = self.confirmed_portfolio.U + sum(o.max_fill_qty for o in combined_orders if o.side is Side.UP)
+            down_potential = self.confirmed_portfolio.D + sum(o.max_fill_qty for o in combined_orders if o.side is Side.DOWN)
+            if up_potential > position_limit or down_potential > position_limit:
                 return False
         return True

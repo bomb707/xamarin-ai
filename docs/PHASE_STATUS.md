@@ -729,6 +729,30 @@ reported to the user in earlier sessions:
   thrashing, keeping only feed-staleness and risk-breach as
   unconditional hard-safety cancels. Full detail (formulas, files, test
   list): `docs/PHASE_12B_AUDIT.md`'s Tranche 2B-2E section.
+- **(Phase 12B Tranche 2.1)** Thirteen integration/math corrections
+  closing gaps left in Tranche 2's architecture: hard safety overrides
+  (feed-stale/risk-breach) now precede the supervisor's rate limiter
+  rather than following it; `RiskView.admits()` gained `position_limit`
+  enforcement and is now the universal pre-dispatch gate for every
+  executable order type (taker, maker, REPLACE), not just maker
+  placement; `OneStepController.decide()` checks aggregate risk *before*
+  selection so a rejected top candidate reranks to the next-best legal
+  one instead of vanishing; HEDGE/BUFFER_BUILD taker candidates get a
+  purpose-aware worst-price ceiling instead of an unconstrained
+  `limit_price=1.0`; breach-recovery semantics allow a partial repair to
+  be admitted once already below `g_min` (prohibiting new ALPHA risk,
+  requiring `G_after > G_before`); the selection formula's maker
+  soft-risk term is now fill-probability-weighted (`expected_delta_g`)
+  instead of using the absolute if-filled `G` level; BUFFER_BUILD
+  generates a bounded multi-quantity candidate set instead of a single
+  peak-quantity candidate; `dynamic_maker_sizing`'s dimensionally
+  invalid dollar-vs-share comparison was replaced with an exact
+  per-price feasible-quantity walk; REPLACE now actually reaches
+  `OrderSupervisor.apply_replace` through both integration harnesses via
+  a real re-evaluated `ReplacementPlan`, itself RiskView-gated; and
+  `V_cancel` no longer double-counts `edge_min` (moved to a proper
+  `hold_eligible` threshold). Full detail (formulas, files, test list):
+  `docs/PHASE_12B_AUDIT.md`'s Tranche 2.1 section.
 
 **Phase 7 demo limitation worth flagging (not a bug)**: `run_execution_simulator_demo.py`
 always reports 0 repriced orders. The synthetic generator emits book events

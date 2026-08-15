@@ -2353,3 +2353,144 @@ config.py`, `tests/test_portfolio_math.py`, `tests/test_optimizer.py`,
 `SupervisorConfig` economic coefficients, are documented structural
 placeholders defaulting to values that reduce to prior behavior, not
 tuned settings.
+
+# Tranche 2.1 — Implemented (integration and mathematical closure)
+
+**Approved and implemented**, closing 13 integration/math gaps in
+Tranche 2's architecture before real-market-data work begins. Full
+suite: 340 passed, 0 failed (up from 317 at the end of Tranche 2 -
+23 new tests added across items 1-13's acceptance list).
+
+1. **Safety-override/rate-limit ordering** (`supervisor/supervisor.py`):
+   `feed_stale`/`risk_breach` are now checked *before*
+   `min_action_interval_s`, not after - a stale feed or risk breach
+   arriving inside the rate-limit window must still CANCEL immediately.
+   Only ordinary economic HOLD/CANCEL/REPLACE churn is throttled.
+2. **RiskView as the universal dispatch gate**
+   (`portfolio/exposure.py`, `optimizer/candidates.py`,
+   `walkforward/ablations.py`, `scripts/run_order_supervisor_demo.py`):
+   `RiskView.admits()` gained a `position_limit` parameter (previously
+   exposed via `potential_up_position`/`potential_down_position` but
+   never enforced) using a plain sum (not the subset envelope - a side's
+   position only ever grows as more of its own orders fill, unlike `G`).
+   `candidate_exposure()` converts any not-yet-submitted
+   `CandidateAction` into the same `ActiveOrderExposure` shape pending/
+   open orders already use, and every dispatch site - ALPHA/BUFFER_BUILD/
+   HEDGE taker, MAKER, REPLACE - now calls `risk_view.admits()`
+   immediately before submission, not just maker placement.
+3. **Hard admission before final selection** (`optimizer/controller.py`):
+   `OneStepController.decide()` gained an optional `risk_view` parameter;
+   when provided, every non-WAIT candidate is checked against it *before*
+   `argmax` runs, marking aggregate-risk-unsafe candidates invalid via
+   `violated_constraints += ("aggregate_risk",)` rather than only
+   rejecting the winner at dispatch with nothing to fall back to - so
+   `chosen = argmax_{a in HardRiskAdmissibleActions} J(a)` holds, and a
+   rejected top candidate reranks to the next-best legal one automatically.
+4. **Purpose-aware taker execution price** (`optimizer/candidates.py`):
+   `purpose_aware_max_execution_price()` replaces HEDGE/BUFFER_BUILD's
+   `limit_price=1.0` (effectively unconstrained). ALPHA delegates
+   unchanged to `taker_max_execution_price` (marginal-edge/g_min/spend
+   bounded). BUFFER_BUILD:
+   `K_max^buffer(x) = min[min(U+x,D)-min(U,D), min(U+x,D)-C-G_min, B-C]`
+   (UP; DOWN symmetric). HEDGE: the same G_min/spend bound without the
+   parity term (its quantity is already sized to land at G_min against
+   the best-ask assumption; this ceiling guarantees that target survives
+   adverse execution).
+5. **Breach-recovery semantics** (`optimizer/candidates.py::_finalize`):
+   when `G_before < g_min`, ALPHA is prohibited outright regardless of
+   its own numbers; every other purpose is admitted precisely when
+   `G_after > G_before` (even short of `g_min`) and rejected when
+   `G_after <= G_before` - "never allow G_after < G_before" while already
+   breached. The ordinary hard rule (`G_after >= g_min`) is unchanged
+   when `G_before >= g_min`.
+6. **Maker soft-risk weighting corrected** (`optimizer/types.py`,
+   `optimizer/candidates.py`, `optimizer/controller.py`):
+   `CandidateAction.expected_delta_g` is `ΔG` for a deterministic taker
+   fill, `ρ*ΔG` for a fill-probability-weighted maker fill, `0.0` for
+   WAIT. Selection is now `J = delta_ev + lambda_g*expected_delta_g -
+   selection_penalty` - the prior formula used `c.g_after` (the
+   ABSOLUTE, if-filled, and for makers *unweighted* G level) directly in
+   an additive score with `delta_ev` (always a marginal quantity), both
+   dimensionally and probabilistically wrong. `g_after` itself is
+   unchanged and still used for the unconditional hard safety check.
+7. **BUFFER_BUILD multi-quantity candidate set**
+   (`optimizer/candidates.py::generate_buffer_build_candidates`):
+   replaced the single "buy the ΔG-peak quantity" candidate with a
+   bounded set - exchange minimum, small-quantity grid, book-depth
+   boundaries, spend boundary, `g_min` risk boundary, and the parity
+   (`ΔG=0`) boundary - each independently evaluated for `ΔEV(x)`/`ΔG(x)`
+   and kept only when `ΔG(x) > 0`, letting the controller's own `argmax`
+   choose the quantity actually worth it.
+8. **`dynamic_maker_sizing` dimensional bug fixed**
+   (`optimizer/candidates.py`, now `dynamic_maker_candidates`
+   /`MakerCandidateSpec`/`_maker_feasible_quantity`): the prior draft
+   compared `qty` (shares) directly against `portfolio.G - g_min`
+   (dollars) via `min()` - dimensionally invalid whenever price != 1.0.
+   Replaced with an exact per-PRICE feasible-quantity walk (reusing
+   `_risk_boundary_step`'s tested unimodal `G(x)` shape, treating one
+   resting maker price as a single "infinite-depth level"), respecting
+   `G_min`/`spend_cap`/`position_limit` together. TTL: if `tau` is
+   positive but below the new `cfg.min_maker_ttl_s`, no maker candidate
+   is generated at all, instead of the prior `max(1.0, ttl)` clamp
+   silently proposing a TTL that outlives the round.
+9. **REPLACE completed end-to-end** (`optimizer/candidates.py`
+   - `ReplacementPlan`/`evaluate_replacement_plan` -,
+   `walkforward/ablations.py`, `scripts/run_order_supervisor_demo.py`):
+   both integration sites previously called `review_order` with
+   `current_optimal_ev=None` always, making REPLACE structurally
+   unreachable. `evaluate_replacement_plan` re-evaluates every price on
+   the current maker grid (via `evaluate_maker_candidate`) and returns
+   the highest-`delta_ev` valid tick; if REPLACE wins, the plan's own
+   `ActiveOrderExposure` is checked against a `RiskView` that EXCLUDES
+   the order being replaced (about to be torn up) before `apply_replace`
+   ever executes.
+10. **V_cancel corrected** (`supervisor/predicates.py`): `V_cancel =
+    -cancel_cost` only - `edge_min` is a decision THRESHOLD on whether
+    holding is worth it, not economic value received from canceling. It
+    now lives in a new `hold_eligible(effective_delta_ev, cfg)` gate
+    (`effective_delta_ev >= edge_min - hysteresis_margin`, a classic
+    control-theory hysteresis band) that determines whether HOLD is even
+    a candidate action, rather than being additively folded into any
+    V()'s magnitude - the first draft's attempt to fold it into `V_hold`
+    instead of `V_cancel` was tried and rejected during this pass (it
+    distorted the HOLD-vs-REPLACE comparison for permissive `edge_min`
+    configurations, caught by the existing test suite before landing).
+11. **Soft regime penalty marked STRUCTURAL/UNCALIBRATED**
+    (`optimizer/config.py`): `regime_prior_penalty`'s docstring now
+    states explicitly that a flat dollar penalty has quantity-scale
+    dependence and is not a calibrated prior, pending real data to
+    determine whether the correct representation is per-share,
+    probability/logit, or state-dependent.
+12. **`lambda_g=0.01` renamed `TEST_ONLY_LAMBDA_G`**
+    (`walkforward/ablations.py`): a named module constant, documented as
+    an ablation-harness knob selected by observing this repository's own
+    synthetic dataset (with the item-6 correction noted as superseding
+    the original magnitude analysis), never to be promoted into a
+    production `OneStepConfig`.
+13. **Acceptance tests added**: `tests/test_supervisor.py` (safety-
+    override-bypasses-rate-limit x2, hold_eligible unit tests, V_cancel
+    correction), `tests/test_exposure.py` (position_limit enforcement x3,
+    combined pending-taker+open-maker admission), `tests/test_optimizer.py`
+    (BUFFER_BUILD multi-quantity x2, purpose-aware price ceilings
+    survive-adverse-repricing x2, HEDGE never uses limit_price=1.0,
+    breach-recovery x4, maker expected_delta_g rho-weighted x2,
+    candidate reranking to next-best-legal), `tests/test_walkforward.py`
+    (REPLACE actually reaches `apply_replace` and is RiskView-gated,
+    integration-level).
+
+**Files changed (Tranche 2.1):** `src/xamarinbot/supervisor/{predicates,
+supervisor,config}.py`, `src/xamarinbot/portfolio/exposure.py`,
+`src/xamarinbot/optimizer/{candidates,controller,types,config}.py`,
+`src/xamarinbot/walkforward/ablations.py`,
+`scripts/run_order_supervisor_demo.py`, `tests/{test_supervisor,
+test_exposure,test_optimizer,test_walkforward}.py`, this file.
+
+**Known limitation carried forward, scope-noted not silently dropped**:
+`RiskView.admits()`'s hard `g_min` check remains a strict floor
+regardless of purpose - it does not itself apply Tranche 2.1 item 5's
+per-candidate breach-recovery relaxation, since `ActiveOrderExposure`
+carries no purpose tag and extending the aggregate envelope to be
+purpose-aware would be a materially larger change than requested here.
+Breach-recovery is enforced at the single-candidate `_finalize` layer,
+which is where every candidate is generated and where the
+purpose/before/after state is already available.

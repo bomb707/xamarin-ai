@@ -223,6 +223,74 @@ def test_risk_view_admits_rejects_on_spend_cap_breach():
 
 
 # --------------------------------------------------------------------------
+# Phase 12B Tranche 2.1 item 2: aggregate position_limit enforcement -
+# previously only exposed via potential_up_position/potential_down_position
+# but never actually enforced inside admits().
+# --------------------------------------------------------------------------
+
+
+def test_risk_view_admits_rejects_on_position_limit_breach():
+    confirmed = PortfolioState(U=90.0)
+    candidate = ActiveOrderExposure(Side.UP, 20.0, 10.0)  # 90+20=110 > 100
+    view = RiskView(confirmed)
+    assert not view.admits(candidate, g_min=-1_000_000.0, spend_cap=None, position_limit=100.0)
+
+
+def test_risk_view_admits_uses_plain_sum_for_position_limit_not_the_subset_envelope():
+    """Unlike G, a side's position can only ever grow as more orders on
+    that side fill (no min() interaction) - "every order on this side
+    fills" genuinely is the (only relevant) worst case, per the reviewer's
+    own U_potential=U+sum(UP_pending) formula."""
+    confirmed = PortfolioState(U=50.0)
+    order_a = ActiveOrderExposure(Side.UP, 30.0, 15.0)
+    candidate = ActiveOrderExposure(Side.UP, 30.0, 15.0)  # 50+30+30=110 > 100
+    view = RiskView(confirmed, pending_taker_exposure=PendingExposure(orders=(order_a,), potential_up_shares=30.0))
+    assert not view.admits(candidate, g_min=-1_000_000.0, spend_cap=None, position_limit=100.0)
+
+
+def test_risk_view_admits_position_limit_none_skips_the_check():
+    confirmed = PortfolioState(U=90.0)
+    candidate = ActiveOrderExposure(Side.UP, 500.0, 10.0)
+    view = RiskView(confirmed)
+    # g_min permissive, spend_cap None, position_limit None (default) -
+    # a huge position must not be rejected when the caller passed no limit.
+    assert view.admits(candidate, g_min=-1_000_000.0, spend_cap=None)
+
+
+# --------------------------------------------------------------------------
+# Phase 12B Tranche 2.1 item 2: combined pending-taker + open-maker
+# admission - "taker + open-maker RiskView admission" acceptance item.
+# --------------------------------------------------------------------------
+
+
+def test_risk_view_admits_combines_pending_taker_and_open_maker_exposure():
+    """An open maker A and a pending (in-flight, delayed) taker B are each
+    individually safe against confirmed alone, but a new candidate C is
+    only rejected once BOTH A's and B's exposure are combined in the
+    view - proving admits() truly aggregates across both exposure kinds,
+    not just one."""
+    confirmed = PortfolioState()
+    g_min = -90.0
+    # All three same-side (UP): D never moves, so min(U,D)=0 regardless of
+    # how many fill - cost only ever accumulates, making "all fill" the
+    # worst subset here (unlike the opposite-side counterexample above).
+    maker_a = ActiveOrderExposure(Side.UP, 50.0, 50.0 * 0.5)  # alone: G=min(50,0)-25=-25 >= -90
+    taker_b = ActiveOrderExposure(Side.UP, 50.0, 50.0 * 0.5)  # alone: G=min(50,0)-25=-25 >= -90
+    candidate_c = ActiveOrderExposure(Side.UP, 50.0, 50.0 * 0.5)  # alone: G=min(50,0)-25=-25 >= -90
+
+    view = RiskView(
+        confirmed,
+        pending_taker_exposure=PendingExposure(orders=(taker_b,), max_committed_spend=taker_b.max_cost, potential_up_shares=taker_b.max_fill_qty),
+        open_maker_exposure=PendingExposure(orders=(maker_a,), max_committed_spend=maker_a.max_cost, potential_up_shares=maker_a.max_fill_qty),
+    )
+    # A+B+C all UP, all-fill: G = min(150,0) - 75 = -75 >= -90, still admits.
+    assert view.admits(candidate_c, g_min, spend_cap=None)
+    # Tighten g_min just past that combined worst case - now must reject,
+    # proving the check really did combine all three orders' exposure.
+    assert not view.admits(candidate_c, g_min=-70.0, spend_cap=None)
+
+
+# --------------------------------------------------------------------------
 # TakerOrderQueue integration (unchanged behavior, new fee-inclusive exposure)
 # --------------------------------------------------------------------------
 

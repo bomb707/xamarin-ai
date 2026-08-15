@@ -28,11 +28,11 @@ from xamarinbot.model.calibrated import fit_calibrated_model
 from xamarinbot.model.dataset import build_examples_multi
 from xamarinbot.model.features import COMBINED_LEAD_LAG, design_vector
 from xamarinbot.model.walkforward import round_ordered_split
-from xamarinbot.optimizer.candidates import evaluate_maker_candidate, maker_price_grid
+from xamarinbot.optimizer.candidates import candidate_exposure, evaluate_maker_candidate, evaluate_replacement_plan
 from xamarinbot.optimizer.config import OneStepConfig
 from xamarinbot.optimizer.controller import OneStepController
 from xamarinbot.optimizer.types import OrderMode
-from xamarinbot.portfolio.exposure import ActiveOrderExposure, RiskView, exposure_from_open_maker_orders
+from xamarinbot.portfolio.exposure import RiskView, exposure_from_open_maker_orders
 from xamarinbot.portfolio.math import OrderPurpose
 from xamarinbot.portfolio.state import Fill, FeeConfig, LiquidityRole, PortfolioState, Side, apply_fill
 from xamarinbot.regime.classifier import RegimeClassifier
@@ -115,8 +115,19 @@ def run_round(store, round_id, p0, feature_cfg, model, controller_cfg, superviso
                 horizon_s=tracked.ttl_s or controller_cfg.maker_horizon_s, portfolio=portfolio, q=q,
                 exec_cfg=exec_cfg, cfg=recompute_cfg,
             )
+            # Phase 12B Tranche 2.1 item 9: a real ReplacementPlan,
+            # re-evaluated against the current book/portfolio, so REPLACE
+            # can actually be selected instead of current_optimal_ev
+            # staying permanently None.
+            horizon = tracked.ttl_s or controller_cfg.maker_horizon_s
+            replacement = evaluate_replacement_plan(
+                side, tracked.order_state.remaining_shares, book.best_bid.price, book.best_ask.price,
+                tick_size, controller_cfg.maker_price_offsets_ticks, horizon, portfolio, q, exec_cfg, fee_config, recompute_cfg,
+            )
+            current_optimal_ev = replacement.delta_ev if replacement is not None else None
             decision = supervisor.review_order(
                 tracked, decision_ts, snapshot.state, current.delta_ev, current.g_after, fv.tau, is_fresh=True,
+                current_optimal_ev=current_optimal_ev,
             )
             journal.write(SupervisorDecisionRecord(
                 round_id=round_id, order_id=order_id, decision_ts=decision_ts, action=decision.action.value,
@@ -125,16 +136,23 @@ def run_round(store, round_id, p0, feature_cfg, model, controller_cfg, superviso
 
             if decision.action is SupervisorActionType.CANCEL:
                 supervisor.apply_cancel(decision, decision_ts)
-            elif decision.action is SupervisorActionType.REPLACE:
-                grid = maker_price_grid(book.best_bid.price, book.best_ask.price, tick_size, controller_cfg.maker_price_offsets_ticks)
-                if grid:
-                    new_price, _ = grid[0]
+            elif decision.action is SupervisorActionType.REPLACE and replacement is not None:
+                # Item 2/3: the replacement must clear the same aggregate
+                # hard-risk bar any other new order would, built EXCLUDING
+                # this order's own exposure (it is being torn up, not
+                # staying open alongside the replacement).
+                other_makers = [t for oid, t in supervisor.orders.items() if oid != order_id]
+                replace_risk_view = RiskView(
+                    portfolio, pending_taker_exposure=queue.exposure,
+                    open_maker_exposure=exposure_from_open_maker_orders(other_makers, fee_config),
+                )
+                if replace_risk_view.admits(replacement.exposure, supervisor_cfg.g_min, controller_cfg.spend_cap, controller_cfg.position_limit):
                     order_seq += 1
-                    result = supervisor.apply_replace(decision, decision_ts, f"{round_id}-o{order_seq}", new_price, tracked.order_state.remaining_shares)
+                    result = supervisor.apply_replace(decision, decision_ts, f"{round_id}-o{order_seq}", replacement.price, replacement.qty)
                     if result and result.new_order is not None:
                         supervisor.register(TrackedOrder(
                             result.new_order, snapshot.state, tracked.purpose, q, tracked.fair_value_at_submit,
-                            current.g_after, current.delta_ev, tracked.ttl_s, decision_ts, decision_ts,
+                            current.g_after, replacement.delta_ev, replacement.ttl_s, decision_ts, decision_ts,
                         ))
 
         # 2) resolve TTL-expired orders (stochastic maker fill, Phase 7)
@@ -155,33 +173,39 @@ def run_round(store, round_id, p0, feature_cfg, model, controller_cfg, superviso
             del supervisor.orders[order_id]
 
         # 3) place a new order if the one-step controller wants a maker candidate
-        decision = controller.decide(round_id, decision_ts, portfolio, q, snapshot.permitted_actions, book_up, book_down, tick_size, is_fresh=True)
+        # Phase 12B Tranche 2.1 items 2/3: one shared RiskView threaded
+        # into decide() itself (aggregate-unsafe candidates excluded from
+        # selection before argmax runs) and re-checked at every dispatch
+        # site, not just maker placement.
+        risk_view = RiskView(
+            portfolio, pending_taker_exposure=queue.exposure,
+            open_maker_exposure=exposure_from_open_maker_orders(list(supervisor.orders.values()), fee_config),
+        )
+        decision = controller.decide(round_id, decision_ts, portfolio, q, snapshot.permitted_actions, book_up, book_down, tick_size, is_fresh=True, risk_view=risk_view)
         if decision.chosen.mode is OrderMode.FAK and decision.chosen.qty > 0 and not queue.has_pending:
-            # Phase 12B audit items 13/E/L, Tranche 1.2 items 1/2/5: real
-            # submit->(delay)->resolve lifecycle via the shared
-            # TakerOrderQueue - never mutated before matched_ts, and at
-            # most one PENDING_DELAY taker outstanding at a time.
-            order_seq += 1
-            asks = book_up.asks if decision.chosen.side is Side.UP else book_down.asks
+            # Phase 12B audit items 13/E/L, Tranche 1.2 items 1/2/5,
+            # Tranche 2.1 item 2: real submit->(delay)->resolve lifecycle
+            # via the shared TakerOrderQueue - never mutated before
+            # matched_ts, and at most one PENDING_DELAY taker outstanding
+            # at a time - gated by the same aggregate RiskView maker
+            # placement already used.
             limit_price = decision.chosen.max_execution_price if decision.chosen.max_execution_price is not None else decision.chosen.price
-            new_pending = queue.try_submit(f"{round_id}-o{order_seq}", decision.chosen.side, decision.chosen.qty, limit_price, asks, decision_ts)
-            if new_pending is not None and not new_pending.was_delayed:
-                taker_result = sim.resolve_taker(new_pending)
-                if taker_result.walk.filled_shares > 0:
-                    portfolio = apply_fill(portfolio, Fill(decision.chosen.side, taker_result.walk.avg_price, taker_result.walk.filled_shares, LiquidityRole.TAKER, taker_result.walk.total_fee))
+            exposure = candidate_exposure(decision.chosen, fee_config)
+            if exposure is not None and risk_view.admits(exposure, supervisor_cfg.g_min, controller_cfg.spend_cap, controller_cfg.position_limit):
+                order_seq += 1
+                asks = book_up.asks if decision.chosen.side is Side.UP else book_down.asks
+                new_pending = queue.try_submit(f"{round_id}-o{order_seq}", decision.chosen.side, decision.chosen.qty, limit_price, asks, decision_ts)
+                if new_pending is not None and not new_pending.was_delayed:
+                    taker_result = sim.resolve_taker(new_pending)
+                    if taker_result.walk.filled_shares > 0:
+                        portfolio = apply_fill(portfolio, Fill(decision.chosen.side, taker_result.walk.avg_price, taker_result.walk.filled_shares, LiquidityRole.TAKER, taker_result.walk.total_fee))
         elif decision.chosen.mode is OrderMode.POST_ONLY:
             # Phase 12B Tranche 2A item 4: admit against a RiskView that
             # includes every currently open maker order, not just
             # confirmed portfolio - several individually-safe open makers
-            # can still jointly breach g_min/spend_cap.
-            maker_fee = fee_config.fee_for(LiquidityRole.MAKER, decision.chosen.qty, decision.chosen.price)
-            candidate_order = ActiveOrderExposure(decision.chosen.side, decision.chosen.qty, decision.chosen.qty * decision.chosen.price + maker_fee)
-            risk_view = RiskView(
-                portfolio,
-                pending_taker_exposure=queue.exposure,
-                open_maker_exposure=exposure_from_open_maker_orders(list(supervisor.orders.values()), fee_config),
-            )
-            if risk_view.admits(candidate_order, supervisor_cfg.g_min, controller_cfg.spend_cap):
+            # can still jointly breach g_min/spend_cap/position_limit.
+            exposure = candidate_exposure(decision.chosen, fee_config)
+            if exposure is not None and risk_view.admits(exposure, supervisor_cfg.g_min, controller_cfg.spend_cap, controller_cfg.position_limit):
                 order_seq += 1
                 order_id = f"{round_id}-o{order_seq}"
                 order_state = sim.submit_maker_order(order_id, decision.chosen.side, decision.chosen.qty, decision.chosen.price, decision_ts)

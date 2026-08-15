@@ -96,18 +96,37 @@ class OneStepConfig:
     # prompt's own instruction ("keep current hard regime matrix as an
     # ablation").
     soft_regime: bool = False
+    # STRUCTURAL / UNCALIBRATED (Phase 12B Tranche 2.1 item 11): a flat
+    # dollar penalty subtracted from the selection score, NOT a calibrated
+    # prior - a fixed dollar amount has quantity-scale dependence (the
+    # same $5 penalty is decisive against a 1-share candidate and
+    # meaningless against a 1000-share one), which a genuine prior
+    # shouldn't. Left as a flat placeholder deliberately, pending real
+    # data to determine whether the correct representation is a per-share
+    # penalty, a probability/logit adjustment, or a state-dependent EV
+    # penalty - none of which should be guessed and tuned against this
+    # repository's synthetic PnL.
     regime_prior_penalty: float = 0.0
 
     # Phase 12B Tranche 2D: dynamic maker price/quantity/TTL - when True,
-    # `dynamic_maker_sizing` derives quantity/TTL from (q, tau, sigma, G,
-    # R) instead of the fixed maker_quantity/maker_horizon_s constants
-    # below, and price offsets widen with volatility instead of using a
-    # fixed tick grid. Defaults False so every existing ablation/demo/test
-    # is unaffected until explicitly enabled - only after aggregate
-    # hard-risk admission (Tranche 2A) is wired, per the prompt's own
-    # sequencing. Explicitly NOT calibrated against synthetic PnL (item
-    # 37/Addendum J) - a structural placeholder for real-data calibration.
+    # `dynamic_maker_candidates` derives (price, quantity, TTL) from
+    # (q, tau, sigma, G, R) instead of the fixed maker_quantity/
+    # maker_horizon_s constants below, and price offsets widen with
+    # volatility instead of using a fixed tick grid. Defaults False so
+    # every existing ablation/demo/test is unaffected until explicitly
+    # enabled - only after aggregate hard-risk admission (Tranche 2A) is
+    # wired, per the prompt's own sequencing. Explicitly NOT calibrated
+    # against synthetic PnL (item 37/Addendum J) - a structural placeholder
+    # for real-data calibration.
     dynamic_maker: bool = False
+    # Phase 12B Tranche 2.1 item 8: the minimum passive-order lifetime
+    # considered sensible to propose at all - when `cfg.dynamic_maker=True`
+    # and the round's remaining time (`tau`) is positive but shorter than
+    # this, no maker candidate is generated for that decision (rather than
+    # clamping the TTL back up past the round's own remaining time, the
+    # bug this item fixes). Only consulted in dynamic-maker mode; the
+    # fixed-constant path is unaffected regardless of this value.
+    min_maker_ttl_s: float = 1.0
 
     # SS18's actual objective is J = E[PnL_T] + lambda_G*G_T - ... , not
     # plain EV - selection under pure delta_ev can *never* pick a hedge

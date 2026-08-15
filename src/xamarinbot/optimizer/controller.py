@@ -14,7 +14,9 @@ from dataclasses import dataclass, replace
 from xamarinbot.execution.config import ExecutionConfig
 from xamarinbot.feeds.base import BookSnapshot
 from xamarinbot.optimizer.candidates import (
-    dynamic_maker_sizing,
+    MakerCandidateSpec,
+    candidate_exposure,
+    dynamic_maker_candidates,
     evaluate_maker_candidate,
     evaluate_taker_candidate,
     generate_buffer_build_candidates,
@@ -24,7 +26,8 @@ from xamarinbot.optimizer.candidates import (
     wait_candidate,
 )
 from xamarinbot.optimizer.config import OneStepConfig
-from xamarinbot.optimizer.types import CandidateAction
+from xamarinbot.optimizer.types import CandidateAction, OrderMode
+from xamarinbot.portfolio.exposure import RiskView
 from xamarinbot.portfolio.math import OrderPurpose
 from xamarinbot.portfolio.state import FeeConfig, PortfolioState, Side
 from xamarinbot.regime.types import SeedAction
@@ -82,13 +85,30 @@ class OneStepController:
         is_fresh: bool,
         tau: float = 0.0,
         sigma: float = 0.0,
+        risk_view: RiskView | None = None,
     ) -> OneStepDecision:
         """`tau`/`sigma` (Phase 12B Tranche 2D) are optional and default
         to 0.0 - existing callers that don't pass them are unaffected,
         since they're only consulted when `cfg.dynamic_maker=True`
         (itself defaulting False). Callers that want dynamic maker
         sizing should pass `tau=fv.tau, sigma=fv.realized_vol` from the
-        same `FeatureVector` already computed for `q`."""
+        same `FeatureVector` already computed for `q`.
+
+        `risk_view` (Phase 12B Tranche 2.1 items 2/3) is the caller's
+        aggregate exposure (confirmed portfolio + pending takers + open
+        makers) - when provided, every non-WAIT candidate is ALSO checked
+        against it before selection, on top of its own confirmed-
+        portfolio-only hard-constraint check. This is what makes
+        `chosen = argmax_{a in HardRiskAdmissibleActions} J(a)` true
+        instead of "choose best -> reject -> do nothing": a candidate that
+        would jointly breach g_min/spend_cap/position_limit alongside
+        already-active orders is marked invalid HERE, before `argmax`
+        runs, so the next-best legal candidate is chosen automatically
+        rather than the top (aggregate-unsafe) one silently vanishing at a
+        separate dispatch-time check with nothing to fall back to.
+        Optional and defaults to `None` (skip the aggregate check,
+        confirmed-portfolio-only - the pre-2.1 behavior) so callers with
+        no exposure to report are unaffected."""
         wait = wait_candidate("wait", portfolio)
         candidates: list[CandidateAction] = [wait]
 
@@ -139,7 +159,7 @@ class OneStepController:
             # thesis the seed regime classifier has an opinion on.
             asks_up = book_up.asks if book_up is not None else ()
             asks_down = book_down.asks if book_down is not None else ()
-            hedge = generate_hedge_candidate("hedge", portfolio, asks_up, asks_down, q, self.fee_config, self.cfg)
+            hedge = generate_hedge_candidate("hedge", portfolio, asks_up, asks_down, q, self.fee_config, self.cfg, tick_size)
             if hedge is not None:
                 candidates.append(hedge)
 
@@ -148,41 +168,53 @@ class OneStepController:
             # above - a portfolio-geometry decision, not a directional one.
             asks_up = book_up.asks if book_up is not None else ()
             asks_down = book_down.asks if book_down is not None else ()
-            candidates.extend(generate_buffer_build_candidates("buffer_build", portfolio, asks_up, asks_down, q, self.fee_config, self.cfg))
+            candidates.extend(generate_buffer_build_candidates("buffer_build", portfolio, asks_up, asks_down, q, self.fee_config, self.cfg, tick_size))
 
         # Roadmap Phase 11 / SS20.1 ablation #6 "taker-only execution":
         # skip maker candidate generation entirely rather than generating
         # and then discarding them, so the candidate table itself reflects
         # what the ablation is testing.
         if not self.cfg.taker_only:
-            if self.cfg.dynamic_maker:
-                up_qty, up_ttl, up_offsets = dynamic_maker_sizing(q, Side.UP, tau, sigma, portfolio, self.cfg)
-                down_qty, down_ttl, down_offsets = dynamic_maker_sizing(q, Side.DOWN, tau, sigma, portfolio, self.cfg)
-            else:
-                up_qty = down_qty = self.cfg.maker_quantity
-                up_ttl = down_ttl = self.cfg.maker_horizon_s
-                up_offsets = down_offsets = self.cfg.maker_price_offsets_ticks
-
             maker_up_ok, maker_up_penalty = self._family_gate(SeedAction.MAKER_UP, permitted_actions)
             if maker_up_ok and book_up is not None and book_up.best_bid and book_up.best_ask:
-                for price, offset in maker_price_grid(book_up.best_bid.price, book_up.best_ask.price, tick_size, up_offsets):
+                if self.cfg.dynamic_maker:
+                    up_specs = dynamic_maker_candidates(
+                        q, Side.UP, tau, sigma, portfolio, book_up.best_bid.price, book_up.best_ask.price,
+                        tick_size, self.fee_config, self.cfg,
+                    )
+                else:
+                    up_specs = [
+                        MakerCandidateSpec(price, offset, self.cfg.maker_quantity, self.cfg.maker_horizon_s)
+                        for price, offset in maker_price_grid(book_up.best_bid.price, book_up.best_ask.price, tick_size, self.cfg.maker_price_offsets_ticks)
+                    ]
+                for spec in up_specs:
                     idx += 1
-                    queue_ahead = book_up.best_bid.size if offset == 0 else 0.0
+                    queue_ahead = book_up.best_bid.size if spec.offset_ticks == 0 else 0.0
                     c = evaluate_maker_candidate(
-                        f"maker_up_{idx}", Side.UP, OrderPurpose.ALPHA, price, up_qty,
-                        distance_to_touch_ticks=float(offset), queue_ahead_shares=queue_ahead, horizon_s=up_ttl,
+                        f"maker_up_{idx}", Side.UP, OrderPurpose.ALPHA, spec.price, spec.qty,
+                        distance_to_touch_ticks=float(spec.offset_ticks), queue_ahead_shares=queue_ahead, horizon_s=spec.ttl_s,
                         portfolio=portfolio, q=q, exec_cfg=self.exec_cfg, cfg=self.cfg,
                     )
                     candidates.append(replace(c, selection_penalty=maker_up_penalty) if maker_up_penalty else c)
 
             maker_down_ok, maker_down_penalty = self._family_gate(SeedAction.MAKER_DOWN, permitted_actions)
             if maker_down_ok and book_down is not None and book_down.best_bid and book_down.best_ask:
-                for price, offset in maker_price_grid(book_down.best_bid.price, book_down.best_ask.price, tick_size, down_offsets):
+                if self.cfg.dynamic_maker:
+                    down_specs = dynamic_maker_candidates(
+                        q, Side.DOWN, tau, sigma, portfolio, book_down.best_bid.price, book_down.best_ask.price,
+                        tick_size, self.fee_config, self.cfg,
+                    )
+                else:
+                    down_specs = [
+                        MakerCandidateSpec(price, offset, self.cfg.maker_quantity, self.cfg.maker_horizon_s)
+                        for price, offset in maker_price_grid(book_down.best_bid.price, book_down.best_ask.price, tick_size, self.cfg.maker_price_offsets_ticks)
+                    ]
+                for spec in down_specs:
                     idx += 1
-                    queue_ahead = book_down.best_bid.size if offset == 0 else 0.0
+                    queue_ahead = book_down.best_bid.size if spec.offset_ticks == 0 else 0.0
                     c = evaluate_maker_candidate(
-                        f"maker_down_{idx}", Side.DOWN, OrderPurpose.ALPHA, price, down_qty,
-                        distance_to_touch_ticks=float(offset), queue_ahead_shares=queue_ahead, horizon_s=down_ttl,
+                        f"maker_down_{idx}", Side.DOWN, OrderPurpose.ALPHA, spec.price, spec.qty,
+                        distance_to_touch_ticks=float(spec.offset_ticks), queue_ahead_shares=queue_ahead, horizon_s=spec.ttl_s,
                         portfolio=portfolio, q=q, exec_cfg=self.exec_cfg, cfg=self.cfg,
                     )
                     candidates.append(replace(c, selection_penalty=maker_down_penalty) if maker_down_penalty else c)
@@ -191,11 +223,42 @@ class OneStepController:
         # WAIT candidate already present - neither is a "new position"
         # proposal (CANCEL concerns existing open orders, Phase 9's job).
 
+        if risk_view is not None:
+            # Phase 12B Tranche 2.1 items 2/3: aggregate hard admission
+            # BEFORE selection, not only at dispatch. A candidate that is
+            # individually safe against confirmed_portfolio alone but
+            # would jointly breach g_min/spend_cap/position_limit once
+            # already-active exposure (pending takers, open makers) is
+            # included gets marked invalid here - excluded from `valid`
+            # below exactly like any other constraint violation, so the
+            # argmax naturally falls through to the next-best candidate
+            # that IS jointly safe, rather than the top candidate getting
+            # silently dropped at a separate dispatch-time check with no
+            # fallback.
+            updated: list[CandidateAction] = []
+            for c in candidates:
+                if c.is_valid and c.mode is not OrderMode.WAIT:
+                    exposure = candidate_exposure(c, self.fee_config)
+                    if exposure is not None and not risk_view.admits(exposure, self.cfg.g_min, self.cfg.spend_cap, self.cfg.position_limit):
+                        c = replace(c, violated_constraints=c.violated_constraints + ("aggregate_risk",))
+                updated.append(c)
+            candidates = updated
+
         valid = [c for c in candidates if c.is_valid]
-        # SS18: J = E[PnL_T] + lambda_G*G_T - ...; lambda_g=0 (the default)
-        # reduces this to plain delta_ev ranking, identical to Phases
-        # 8-10. selection_penalty (Tranche 2C soft-regime mode) is 0.0 for
-        # every candidate unless cfg.soft_regime=True, so this is a no-op
-        # in the default/hard-gate configuration.
-        chosen = max(valid, key=lambda c: c.delta_ev + self.cfg.lambda_g * c.g_after - c.selection_penalty) if valid else wait
+        # SS18: J = delta_ev + lambda_G*ExpectedDeltaG - selection_penalty
+        # (Phase 12B Tranche 2.1 item 6 correction). Earlier drafts used
+        # `c.g_after` here - the ABSOLUTE, if-filled worst-case G level,
+        # not a marginal quantity, and for makers specifically not even
+        # fill-probability-weighted (a maker's true expected risk
+        # contribution is `rho*delta_g`, not the full if-filled delta) -
+        # mixing that into an additive score with `delta_ev` (itself
+        # always a marginal quantity) was dimensionally/conceptually
+        # inconsistent. `c.expected_delta_g` is the corrected term: `ΔG`
+        # for a deterministic taker fill, `rho*ΔG` for a probabilistic
+        # maker fill, `0.0` for WAIT. lambda_g=0 (the default) reduces
+        # this to plain delta_ev ranking, identical to Phases 8-10.
+        # selection_penalty (Tranche 2C soft-regime mode) is 0.0 for every
+        # candidate unless cfg.soft_regime=True, so this is a no-op in the
+        # default/hard-gate configuration.
+        chosen = max(valid, key=lambda c: c.delta_ev + self.cfg.lambda_g * c.expected_delta_g - c.selection_penalty) if valid else wait
         return OneStepDecision(round_id, decision_ts, chosen, tuple(candidates), skip_reason=None)

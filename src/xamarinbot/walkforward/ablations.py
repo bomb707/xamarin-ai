@@ -38,7 +38,7 @@ from xamarinbot.model.logistic import LogisticModel
 from xamarinbot.mpc.config import MPCConfig
 from xamarinbot.mpc.controller import MPCController
 from xamarinbot.mpc.scenario import TransitionModel
-from xamarinbot.optimizer.candidates import evaluate_maker_candidate
+from xamarinbot.optimizer.candidates import candidate_exposure, evaluate_maker_candidate, evaluate_replacement_plan
 from xamarinbot.optimizer.config import OneStepConfig
 from xamarinbot.optimizer.controller import OneStepController
 from xamarinbot.optimizer.types import OrderMode
@@ -70,18 +70,17 @@ def _default_one_step_cfg(**overrides) -> OneStepConfig:
     return OneStepConfig(**base)
 
 
-# lambda_g=0.01 (ablations 6-8) was tuned against this dataset's typical
-# magnitudes, not guessed - two rounds of it: g_after for a meaningful taker
-# position runs in the hundreds (a one-sided fill necessarily drags G down
-# by roughly its own cost) while delta_ev runs in the tens, so an initial
-# lambda_g=0.5 made every directional candidate's selection score negative
-# and suppressed all trading (the same class of scale mismatch as Phase
-# 10's churn_penalty=5.0 finding). Backing off to 0.05 fixed taker but then
-# suppressed *maker* candidates specifically: their delta_ev is properly
-# fill-probability-weighted but the g_after used in the same score is the
-# pessimistic if-filled value, unweighted, so the same lambda_g penalizes
-# maker's risk far more than its true expected contribution. 0.01 is small
-# enough to keep both viable in this dataset. See docs/PHASE_STATUS.md.
+# Phase 12B Tranche 2.1 item 12: TEST_ONLY_LAMBDA_G is a coefficient
+# selected by observing THIS repository's own synthetic dataset behavior
+# (originally to keep both taker and maker candidates viable under the
+# pre-Tranche-2.1 selection formula - see docs/PHASE_STATUS.md's "Notable
+# bugs" for the original magnitude analysis, superseded by item 6's
+# expected_delta_g correction). It is an ablation-harness knob to exercise
+# the enable_portfolio_repair/lambda_g code paths in THIS synthetic
+# dataset, not a value with any claim to being a correct or calibrated
+# production setting - never promote it into a real OneStepConfig outside
+# this ablation matrix.
+TEST_ONLY_LAMBDA_G = 0.01
 
 
 MANDATORY_ABLATIONS: tuple[AblationSpec, ...] = (
@@ -90,9 +89,9 @@ MANDATORY_ABLATIONS: tuple[AblationSpec, ...] = (
     AblationSpec("3_spot_only", "V2 current-BTC-only model", controller="one_step", feature_set=SPOT_ONLY, one_step_cfg=_default_one_step_cfg()),
     AblationSpec("4_lead_lag", "V2 TWAP + current-BTC lead-lag model", controller="one_step", feature_set=LEAD_LAG_ONLY, one_step_cfg=_default_one_step_cfg()),
     AblationSpec("5_lead_lag_clob_no_repair", "Lead-lag + CLOB without portfolio repair", controller="one_step", feature_set=COMBINED_LEAD_LAG, one_step_cfg=_default_one_step_cfg(enable_portfolio_repair=False)),
-    AblationSpec("6_portfolio_control_taker_only", "Full model with portfolio control but taker-only execution", controller="one_step", feature_set=COMBINED_LEAD_LAG, one_step_cfg=_default_one_step_cfg(enable_portfolio_repair=True, taker_only=True, lambda_g=0.01)),
-    AblationSpec("7_maker_taker_cancel_replace", "Full model with maker/taker timing and cancel/replace", controller="one_step", feature_set=COMBINED_LEAD_LAG, one_step_cfg=_default_one_step_cfg(enable_portfolio_repair=True, lambda_g=0.01), use_supervisor=True),
-    AblationSpec("8_full_mpc", "Full MPC versus one-step optimizer", controller="mpc", feature_set=COMBINED_LEAD_LAG, one_step_cfg=_default_one_step_cfg(enable_portfolio_repair=True, lambda_g=0.01), use_supervisor=True, mpc_cfg=MPCConfig(horizon_steps=2, time_budget_ms=50.0)),
+    AblationSpec("6_portfolio_control_taker_only", "Full model with portfolio control but taker-only execution", controller="one_step", feature_set=COMBINED_LEAD_LAG, one_step_cfg=_default_one_step_cfg(enable_portfolio_repair=True, taker_only=True, lambda_g=TEST_ONLY_LAMBDA_G)),
+    AblationSpec("7_maker_taker_cancel_replace", "Full model with maker/taker timing and cancel/replace", controller="one_step", feature_set=COMBINED_LEAD_LAG, one_step_cfg=_default_one_step_cfg(enable_portfolio_repair=True, lambda_g=TEST_ONLY_LAMBDA_G), use_supervisor=True),
+    AblationSpec("8_full_mpc", "Full MPC versus one-step optimizer", controller="mpc", feature_set=COMBINED_LEAD_LAG, one_step_cfg=_default_one_step_cfg(enable_portfolio_repair=True, lambda_g=TEST_ONLY_LAMBDA_G), use_supervisor=True, mpc_cfg=MPCConfig(horizon_steps=2, time_budget_ms=50.0)),
 )
 
 
@@ -318,64 +317,108 @@ def _run_controller_round(
                 # of the hardcoded current_delta_ev=0.0 / current portfolio.G
                 # placeholders this call used before - mirrors the already-
                 # correct pattern in scripts/run_order_supervisor_demo.py.
-                # current_optimal_ev is left None here, same as that
-                # reference demo - computing a real replacement candidate is
-                # a Tranche 2 concern (item 17's cancellation redesign), not
-                # a placeholder-correctness fix.
                 current = evaluate_maker_candidate(
                     f"review-{order_id}", tracked.order_state.side, tracked.purpose, tracked.order_state.limit_price,
                     tracked.order_state.remaining_shares, distance_to_touch_ticks=0.0, queue_ahead_shares=0.0,
                     horizon_s=horizon, portfolio=portfolio, q=q, exec_cfg=exec_cfg, cfg=spec.one_step_cfg,
                 )
-                decision = supervisor.review_order(tracked, decision_ts, snapshot.state, current.delta_ev, current.g_after, fv.tau, True)
+                # Phase 12B Tranche 2.1 item 9: a real ReplacementPlan,
+                # re-evaluated against the current book/portfolio, so
+                # REPLACE can actually fire through this harness instead of
+                # `current_optimal_ev` staying permanently None.
+                replacement = evaluate_replacement_plan(
+                    tracked.order_state.side, tracked.order_state.remaining_shares, book.best_bid.price, book.best_ask.price,
+                    tick_size, spec.one_step_cfg.maker_price_offsets_ticks, horizon, portfolio, q, exec_cfg, fee_config, spec.one_step_cfg,
+                )
+                current_optimal_ev = replacement.delta_ev if replacement is not None else None
+                decision = supervisor.review_order(tracked, decision_ts, snapshot.state, current.delta_ev, current.g_after, fv.tau, True, current_optimal_ev)
                 if decision.action is SupervisorActionType.CANCEL:
                     supervisor.apply_cancel(decision, decision_ts)
+                elif decision.action is SupervisorActionType.REPLACE and replacement is not None:
+                    # Item 2/3: the replacement must clear the SAME
+                    # aggregate hard-risk bar any other new order would -
+                    # built EXCLUDING this order's own exposure (it is
+                    # being torn up, not staying open alongside the
+                    # replacement).
+                    other_makers = [t for oid, t in supervisor.orders.items() if oid != order_id]
+                    replace_risk_view = RiskView(
+                        portfolio, pending_taker_exposure=queue.exposure,
+                        open_maker_exposure=exposure_from_open_maker_orders(other_makers, fee_config),
+                    )
+                    if replace_risk_view.admits(replacement.exposure, spec.one_step_cfg.g_min, spec.one_step_cfg.spend_cap, spec.one_step_cfg.position_limit):
+                        order_seq += 1
+                        result = supervisor.apply_replace(decision, decision_ts, f"{round_id}-o{order_seq}", replacement.price, replacement.qty)
+                        if result and result.new_order is not None:
+                            supervisor.register(TrackedOrder(
+                                result.new_order, snapshot.state, tracked.purpose, q, tracked.fair_value_at_submit,
+                                current.g_after, replacement.delta_ev, replacement.ttl_s, decision_ts, decision_ts,
+                            ))
+                    # else: the replacement itself would breach aggregate
+                    # risk - hold the original order rather than tear it up
+                    # with nothing safe to replace it with.
+
+        # Phase 12B Tranche 2.1 items 2/3: one shared RiskView, combining
+        # every currently pending taker and open maker order, threaded
+        # into decide() itself (so an aggregate-unsafe candidate is
+        # excluded from selection before argmax runs, not merely rejected
+        # after winning it) AND re-checked at dispatch for both taker and
+        # maker submission - "every new executable order must be admitted
+        # against confirmed + pending + resting + candidate before
+        # submission," not just maker placement.
+        risk_view = RiskView(
+            portfolio, pending_taker_exposure=queue.exposure,
+            open_maker_exposure=exposure_from_open_maker_orders(list(supervisor.orders.values()) if supervisor is not None else [], fee_config),
+        )
 
         permitted = ActionPermissionMatrix.permitted_actions(classify_seed_action(snapshot.state))
         if mpc is not None:
             mpc_decision = mpc.decide(round_id, decision_ts, portfolio, q, snapshot.state, book_up, book_down, tick_size, True)
             chosen = mpc_decision.chosen
         else:
-            one_step_decision = one_step.decide(round_id, decision_ts, portfolio, q, permitted, book_up, book_down, tick_size, True)
+            one_step_decision = one_step.decide(round_id, decision_ts, portfolio, q, permitted, book_up, book_down, tick_size, True, risk_view=risk_view)
             chosen = one_step_decision.chosen
 
         if chosen.mode is OrderMode.FAK and chosen.qty > 0 and not queue.has_pending:
             # Phase 12B audit items 13/E/L, Tranche 1.1 item 7, Tranche 1.2
-            # items 1/2/5: route through the real submit->(delay)->resolve
-            # lifecycle via the shared TakerOrderQueue instead of directly
-            # converting the candidate's own pre-evaluation walk estimate
-            # into a Fill. A genuinely delayed order is queued and only
+            # items 1/2/5, Tranche 2.1 item 2: route through the real
+            # submit->(delay)->resolve lifecycle via the shared
+            # TakerOrderQueue instead of directly converting the
+            # candidate's own pre-evaluation walk estimate into a Fill -
+            # and, like maker dispatch below, re-check aggregate hard
+            # admission immediately before submission (defense in depth on
+            # top of decide()'s own pre-selection check above - nothing
+            # changes between the two within one synchronous decision, but
+            # every dispatch site must independently clear this gate per
+            # the reviewer's own instruction, not rely solely on upstream
+            # filtering). A genuinely delayed order is queued and only
             # mutates portfolio once this loop's own decision_ts reaches
             # its matched_ts (resolved at the top of the loop above),
             # using the actual causal book fetched only then - never the
             # submission book, and never computed/leaked at submit time.
             # The `not queue.has_pending` guard is the conservative item 5
             # admission gate: at most one PENDING_DELAY taker outstanding.
-            n_attempts += 1
-            order_seq += 1
-            asks = book_up.asks if chosen.side is Side.UP else book_down.asks
             limit_price = chosen.max_execution_price if chosen.max_execution_price is not None else chosen.price
-            new_pending = queue.try_submit(f"{round_id}-o{order_seq}", chosen.side, chosen.qty, limit_price, asks, decision_ts)
-            if new_pending is not None and not new_pending.was_delayed:
-                taker_result = sim.resolve_taker(new_pending)
-                if taker_result.walk.filled_shares > 0:
-                    portfolio = apply_fill(portfolio, Fill(chosen.side, taker_result.walk.avg_price, taker_result.walk.filled_shares, LiquidityRole.TAKER, taker_result.walk.total_fee))
-                    n_actions += 1
+            exposure = candidate_exposure(chosen, fee_config)
+            if exposure is not None and risk_view.admits(exposure, spec.one_step_cfg.g_min, spec.one_step_cfg.spend_cap, spec.one_step_cfg.position_limit):
+                n_attempts += 1
+                order_seq += 1
+                asks = book_up.asks if chosen.side is Side.UP else book_down.asks
+                new_pending = queue.try_submit(f"{round_id}-o{order_seq}", chosen.side, chosen.qty, limit_price, asks, decision_ts)
+                if new_pending is not None and not new_pending.was_delayed:
+                    taker_result = sim.resolve_taker(new_pending)
+                    if taker_result.walk.filled_shares > 0:
+                        portfolio = apply_fill(portfolio, Fill(chosen.side, taker_result.walk.avg_price, taker_result.walk.filled_shares, LiquidityRole.TAKER, taker_result.walk.total_fee))
+                        n_actions += 1
         elif chosen.mode is OrderMode.POST_ONLY and supervisor is not None:
-            # Phase 12B Tranche 2A item 4: check the new maker candidate
-            # against a RiskView that includes every currently open maker
-            # order (not just confirmed portfolio) before admitting it -
-            # several individually-safe open makers filling together can
-            # still jointly breach g_min/spend_cap (item 1's own
-            # counterexample), which per-placement-time-only checks miss.
-            maker_fee = fee_config.fee_for(LiquidityRole.MAKER, chosen.qty, chosen.price)
-            candidate_order = ActiveOrderExposure(chosen.side, chosen.qty, chosen.qty * chosen.price + maker_fee)
-            risk_view = RiskView(
-                portfolio,
-                pending_taker_exposure=queue.exposure,
-                open_maker_exposure=exposure_from_open_maker_orders(list(supervisor.orders.values()), fee_config),
-            )
-            if risk_view.admits(candidate_order, spec.one_step_cfg.g_min, spec.one_step_cfg.spend_cap):
+            # Phase 12B Tranche 2A item 4, Tranche 2.1 item 2: check the
+            # new maker candidate against the same shared RiskView
+            # (confirmed + pending takers + every currently open maker
+            # order) before admitting it - several individually-safe open
+            # makers filling together can still jointly breach
+            # g_min/spend_cap/position_limit (item 1's own counterexample),
+            # which per-placement-time-only checks miss.
+            exposure = candidate_exposure(chosen, fee_config)
+            if exposure is not None and risk_view.admits(exposure, spec.one_step_cfg.g_min, spec.one_step_cfg.spend_cap, spec.one_step_cfg.position_limit):
                 order_seq += 1
                 order_state = sim.submit_maker_order(f"{round_id}-o{order_seq}", chosen.side, chosen.qty, chosen.price, decision_ts)
                 supervisor.register(TrackedOrder(order_state, snapshot.state, chosen.purpose, q, q if chosen.side is Side.UP else 1 - q, chosen.g_after, chosen.delta_ev, chosen.ttl_s or spec.one_step_cfg.maker_horizon_s, decision_ts, decision_ts))

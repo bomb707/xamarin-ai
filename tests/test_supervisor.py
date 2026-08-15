@@ -17,7 +17,7 @@ from xamarinbot.portfolio.state import LiquidityRole, Side
 from xamarinbot.regime.types import Direction, GapRegime, RegimeState
 from xamarinbot.reports.supervisor_report import build_supervisor_report
 from xamarinbot.supervisor.config import SupervisorConfig
-from xamarinbot.supervisor.predicates import book_displacement, edge_failure, feed_stale, regime_flip, risk_breach, time_compression, value_cancel, value_hold, value_replace
+from xamarinbot.supervisor.predicates import book_displacement, edge_failure, feed_stale, hold_eligible, regime_flip, risk_breach, time_compression, value_cancel, value_hold, value_replace
 from xamarinbot.supervisor.supervisor import OrderSupervisor
 from xamarinbot.supervisor.types import CancelReason, SupervisorActionType, TrackedOrder
 
@@ -96,9 +96,30 @@ def test_value_hold_applies_time_compression_penalty_only_when_compressed():
     assert value_hold(7.0, STATE_A, STATE_A, tau=20.0, cfg=cfg) == 7.0  # not compressed
 
 
-def test_value_cancel_is_edge_min_minus_cancel_cost():
+def test_value_cancel_is_only_the_negative_cancel_cost():
+    """Phase 12B Tranche 2.1 item 10 regression: V_cancel must not include
+    edge_min - canceling realizes no economic value at all, only the
+    (negative) cost of executing the cancel itself."""
     cfg = SupervisorConfig(edge_min=1.0, cancel_cost=0.4)
-    assert math.isclose(value_cancel(cfg), 0.6)
+    assert math.isclose(value_cancel(cfg), -0.4)
+
+
+def test_edge_min_gates_hold_eligibility_not_value_hold_magnitude():
+    """Phase 12B Tranche 2.1 item 10: edge_min must not shift value_hold's
+    own magnitude (that would wrongly distort the HOLD-vs-REPLACE
+    comparison too) - it only gates whether HOLD is eligible at all, via
+    `hold_eligible`."""
+    cfg = SupervisorConfig(edge_min=1.0)
+    v = value_hold(7.0, STATE_A, STATE_A, tau=200.0, cfg=cfg)
+    assert v == 7.0  # unaffected by edge_min
+    assert hold_eligible(v, cfg)  # 7.0 >= 1.0 - 0.0
+    assert not hold_eligible(0.5, cfg)  # 0.5 < 1.0 - 0.0
+
+
+def test_hold_eligible_threshold_widens_by_hysteresis_margin():
+    cfg = SupervisorConfig(edge_min=0.0, hysteresis_margin=1.0)
+    assert hold_eligible(-0.5, cfg)  # -0.5 >= 0.0 - 1.0
+    assert not hold_eligible(-1.5, cfg)  # -1.5 < 0.0 - 1.0
 
 
 def test_value_replace_is_none_without_an_evaluated_optimal_tick():
@@ -135,6 +156,49 @@ def test_feed_stale_takes_priority_over_everything_else():
     decision = supervisor.review_order(tracked, now_ts=5.0, current_regime_state=STATE_A, current_delta_ev=5.0, current_g_after_if_fill=-1.0, tau=200.0, is_fresh=False)
     assert decision.action is SupervisorActionType.CANCEL
     assert decision.reason is CancelReason.FEED_STALE
+
+
+# --------------------------------------------------------------------------
+# Phase 12B Tranche 2.1 item 1: hard safety overrides must fire even
+# inside the rate-limit window - a stale feed or risk breach occurring
+# 100ms after the previous action must still CANCEL immediately, not wait
+# for a 1s min_action_interval_s to clear.
+# --------------------------------------------------------------------------
+
+
+def test_feed_stale_bypasses_rate_limiter_even_100ms_after_last_action():
+    cfg = SupervisorConfig(g_min=-1000.0, edge_min=-1000.0, min_tau_for_passive_s=0.0, min_action_interval_s=1.0)
+    supervisor = OrderSupervisor(cfg)
+    tracked = _tracked(submit_ts=0.0)
+    tracked.last_action_ts = 0.0  # last action just happened
+    decision = supervisor.review_order(tracked, now_ts=0.1, current_regime_state=STATE_A, current_delta_ev=5.0, current_g_after_if_fill=-1.0, tau=200.0, is_fresh=False)
+    assert decision.action is SupervisorActionType.CANCEL
+    assert decision.reason is CancelReason.FEED_STALE
+    assert decision.detail != "rate_limited"
+
+
+def test_risk_breach_bypasses_rate_limiter_even_100ms_after_last_action():
+    cfg = SupervisorConfig(g_min=-10.0, edge_min=-1000.0, min_tau_for_passive_s=0.0, min_action_interval_s=1.0)
+    supervisor = OrderSupervisor(cfg)
+    tracked = _tracked(submit_ts=0.0)
+    tracked.last_action_ts = 0.0
+    decision = supervisor.review_order(tracked, now_ts=0.1, current_regime_state=STATE_A, current_delta_ev=5.0, current_g_after_if_fill=-20.0, tau=200.0, is_fresh=True)
+    assert decision.action is SupervisorActionType.CANCEL
+    assert decision.reason is CancelReason.RISK_BREACH
+    assert decision.detail != "rate_limited"
+
+
+def test_ordinary_economic_churn_is_still_rate_limited():
+    """Confirms item 1 only reordered the two hard-safety triggers ahead
+    of the limiter - ordinary economic HOLD/CANCEL/REPLACE churn (a
+    regime flip with no safety issue) is still throttled."""
+    cfg = SupervisorConfig(g_min=-1000.0, edge_min=0.0, min_tau_for_passive_s=0.0, min_action_interval_s=2.0, regime_flip_penalty=100.0)
+    supervisor = OrderSupervisor(cfg)
+    tracked = _tracked(origin=STATE_A, submit_ts=0.0)
+    tracked.last_action_ts = 0.0
+    decision = supervisor.review_order(tracked, now_ts=0.5, current_regime_state=STATE_B, current_delta_ev=5.0, current_g_after_if_fill=-1.0, tau=200.0, is_fresh=True)
+    assert decision.action is SupervisorActionType.HOLD
+    assert decision.detail == "rate_limited"
 
 
 # --------------------------------------------------------------------------

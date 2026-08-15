@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from xamarinbot.execution.order_state import CancelResult, ReplaceResult, replace_order
 from xamarinbot.regime.types import RegimeState
 from xamarinbot.supervisor.config import SupervisorConfig
-from xamarinbot.supervisor.predicates import feed_stale, regime_flip, risk_breach, time_compression, value_cancel, value_hold, value_replace
+from xamarinbot.supervisor.predicates import feed_stale, hold_eligible, regime_flip, risk_breach, time_compression, value_cancel, value_hold, value_replace
 from xamarinbot.supervisor.types import CancelReason, SupervisorActionType, SupervisorDecision, TrackedOrder
 
 
@@ -41,29 +41,46 @@ class OrderSupervisor:
         is_fresh: bool,
         current_optimal_ev: float | None = None,
     ) -> SupervisorDecision:
-        """Phase 12B Tranche 2E: the two hard-safety triggers (stale data,
-        risk breach) are still checked first, unconditionally - these are
-        genuine safety constraints, not economic tradeoffs. Everything
-        else (regime flip, edge failure, time compression, book
-        displacement) is no longer a categorical "if true, cancel/replace"
-        rule; it now feeds V_hold/V_cancel/V_replace, and the action taken
-        is whichever scores highest - `argmax(V_hold + hysteresis_margin,
-        V_cancel, V_replace)`. This is what makes a regime flip alone
-        insufficient to force a cancel: a still strongly profitable order
-        can outscore V_cancel even after the flip's penalty is applied."""
-        if now_ts - tracked.last_action_ts < self.cfg.min_action_interval_s:
-            return SupervisorDecision(tracked.order_id, SupervisorActionType.HOLD, None, "rate_limited")
-
+        """Phase 12B Tranche 2.1 item 1: the two hard-safety triggers (stale
+        data, risk breach) are checked FIRST, unconditionally, ahead of the
+        rate limiter - these are genuine safety constraints, not ordinary
+        economic churn, and must fire immediately even if the previous
+        action was inside `min_action_interval_s` (a stale feed or a risk
+        breach 100ms after the last action still needs an immediate
+        CANCEL, not a wait for the rate-limit window to clear). The rate
+        limiter only throttles ordinary economic HOLD/CANCEL/REPLACE
+        churn - regime flip, edge failure, time compression, book
+        displacement - which feed V_hold/V_cancel/V_replace, and the
+        action taken is whichever scores highest - `argmax(V_hold +
+        hysteresis_margin, V_cancel, V_replace)`. This is what makes a
+        regime flip alone insufficient to force a cancel: a still
+        strongly profitable order can outscore V_cancel even after the
+        flip's penalty is applied."""
         if feed_stale(is_fresh):
             return SupervisorDecision(tracked.order_id, SupervisorActionType.CANCEL, CancelReason.FEED_STALE)
         if risk_breach(current_g_after_if_fill, self.cfg):
             return SupervisorDecision(tracked.order_id, SupervisorActionType.CANCEL, CancelReason.RISK_BREACH)
 
-        v_hold = value_hold(current_delta_ev, tracked.origin_regime_state, current_regime_state, tau, self.cfg) + self.cfg.hysteresis_margin
+        if now_ts - tracked.last_action_ts < self.cfg.min_action_interval_s:
+            return SupervisorDecision(tracked.order_id, SupervisorActionType.HOLD, None, "rate_limited")
+
+        v_hold = value_hold(current_delta_ev, tracked.origin_regime_state, current_regime_state, tau, self.cfg)
         v_cancel = value_cancel(self.cfg)
         v_replace = value_replace(current_optimal_ev, self.cfg)
 
-        scores = {SupervisorActionType.HOLD: v_hold, SupervisorActionType.CANCEL: v_cancel}
+        # Phase 12B Tranche 2.1 item 10: edge_min/hysteresis_margin gate
+        # whether HOLD is even a live option (via hold_eligible's widened
+        # threshold), rather than being folded additively into v_hold's
+        # magnitude - the latter would also (wrongly) tilt the
+        # HOLD-vs-REPLACE comparison below, which has nothing to do with
+        # the edge floor. Once HOLD is ineligible, the only live choice is
+        # CANCEL vs REPLACE - an order not worth holding as-is may still
+        # be worth repricing rather than simply abandoning.
+        scores: dict[SupervisorActionType, float] = {}
+        if hold_eligible(v_hold, self.cfg):
+            scores[SupervisorActionType.HOLD] = v_hold
+        else:
+            scores[SupervisorActionType.CANCEL] = v_cancel
         if v_replace is not None:
             scores[SupervisorActionType.REPLACE] = v_replace
         best_action = max(scores, key=scores.get)

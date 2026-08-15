@@ -59,6 +59,18 @@ class CandidateAction:
     # rather than never existing at all (the old hard-gate behavior,
     # still available as `cfg.soft_regime=False`, the default).
     selection_penalty: float = 0.0
+    # Phase 12B Tranche 2.1 item 6: the risk contribution actually usable
+    # for selection-time weighting - `ΔG` (the full, deterministic delta)
+    # for a TAKER fill, `ρ*ΔG` (fill-probability-weighted) for a MAKER
+    # candidate, `0.0` for WAIT. `g_after` above stays the *absolute*,
+    # if-filled worst-case G (used for the unconditional hard safety
+    # check - a maker that would breach g_min IF it fills is rejected
+    # now); this field is the probability-consistent MARGINAL quantity the
+    # selection score must use instead - mixing an absolute level into an
+    # additive score with delta_ev (itself a marginal/delta quantity) was
+    # the bug this field fixes. See `optimizer/controller.py`'s selection
+    # formula.
+    expected_delta_g: float = 0.0
 
     @property
     def is_valid(self) -> bool:

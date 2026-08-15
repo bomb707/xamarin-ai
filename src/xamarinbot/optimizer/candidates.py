@@ -29,6 +29,7 @@ from xamarinbot.execution.taker import walk_depth
 from xamarinbot.feeds.base import BookLevel, BookSnapshot
 from xamarinbot.optimizer.config import OneStepConfig
 from xamarinbot.optimizer.types import CandidateAction, OrderMode
+from xamarinbot.portfolio.exposure import ActiveOrderExposure
 from xamarinbot.portfolio.math import (
     FillSimulationResult,
     OrderPurpose,
@@ -225,6 +226,73 @@ def taker_max_execution_price(
     return max(0.0, round(ticks * tick_size, 10))
 
 
+def purpose_aware_max_execution_price(
+    portfolio: PortfolioState,
+    side: Side,
+    x: float,
+    purpose: OrderPurpose,
+    fee_config: FeeConfig,
+    cfg: OneStepConfig,
+    tick_size: float,
+    q_effective: float | None = None,
+) -> float | None:
+    """Purpose-aware worst-price limit (Phase 12B Tranche 2.1 item 4) -
+    HEDGE and BUFFER_BUILD must never be evaluated/submitted with an
+    effectively unconstrained `limit_price=1.0` (a bug: neither purpose's
+    quantity is re-derived from the actual execution price, so a deep,
+    expensive walk could silently blow through the repair target the
+    quantity was sized for). This is the single execution-price function
+    every purpose routes through:
+
+    ALPHA: delegates to `taker_max_execution_price` unchanged - `K_max` is
+    still bounded by marginal EV (`min_marginal_edge`), `g_min`, and
+    `spend_cap`, exactly as before.
+
+    HEDGE / BUFFER_BUILD: no marginal-edge term (both are explicitly
+    allowed negative standalone EV - `_EDGE_MIN_EXEMPT_PURPOSES` - so
+    gating their price on per-share EV would be wrong). BUFFER_BUILD adds
+    the parity-headroom bound so the walk can never pay more than the
+    settlement-geometry benefit it is buying:
+
+        K_max^buffer(x) = min[ min(U+x,D)-min(U,D), min(U+x,D)-C-G_min, B-C ]  (UP; DOWN symmetric)
+
+    HEDGE uses only the G_min/spend bound (its quantity is already sized
+    to land at exactly `G_min` against the best-ask assumption at sizing
+    time - this ceiling is what guarantees that repair target survives
+    even if the walk executes worse than that assumption, instead of
+    silently allowing execution up to 1.00):
+
+        K_max^hedge(x) = min[ min(U+x,D)-C-G_min, B-C ]  (UP; DOWN symmetric)
+
+    Returns `None` if `x` is not feasible at any positive price."""
+    if x <= 0:
+        return None
+    if purpose is OrderPurpose.ALPHA:
+        if q_effective is None:
+            raise ValueError("q_effective is required for ALPHA")
+        return taker_max_execution_price(portfolio, side, x, q_effective, fee_config, cfg, tick_size)
+
+    u, d, c = portfolio.U, portfolio.D, portfolio.C
+    k_max = directional_projected_g(u, d, c, side, x, 0.0) - cfg.g_min
+    if purpose is OrderPurpose.BUFFER_BUILD:
+        k_max = min(k_max, delta_g_directional(u, d, side, x, 0.0))
+    if cfg.spend_cap is not None:
+        k_max = min(k_max, cfg.spend_cap - c)
+    if k_max <= 0:
+        return None
+
+    c_max = k_max / x
+    if c_max <= 0:
+        return None
+
+    p = _invert_all_in_cost(c_max, fee_config)
+    if p is None or p <= 0:
+        return None
+
+    ticks = math.floor(p / tick_size + 1e-9)
+    return max(0.0, round(ticks * tick_size, 10))
+
+
 def taker_sizing_boundaries(
     asks: tuple[BookLevel, ...],
     q_effective: float,
@@ -362,40 +430,101 @@ def maker_price_grid(best_bid: float, best_ask: float, tick_size: float, offsets
     return out
 
 
-def dynamic_maker_sizing(
-    q: float, side: Side, tau: float, sigma: float, portfolio: PortfolioState, cfg: OneStepConfig,
-) -> tuple[float, float, tuple[int, ...]]:
-    """Derives maker (quantity, TTL, price_offsets_ticks) from
-    `(q, tau, sigma, G, R, purpose)` instead of `OneStepConfig`'s fixed
-    `maker_quantity`/`maker_horizon_s`/`maker_price_offsets_ticks`
-    constants (Phase 12B Tranche 2D). This is a STRUCTURAL replacement
-    for the fixed constants, not a calibrated economic model - per item
-    37/Addendum J, no coefficient here has been tuned against synthetic
-    PnL; the specific functional form is a placeholder for real-data
-    calibration (Tranche 4) to replace, gated behind `cfg.dynamic_maker`
-    so the default (fixed) behavior is exactly Phases 8-12B's.
+@dataclass(frozen=True)
+class MakerCandidateSpec:
+    """One (price, quantity, TTL) maker candidate to evaluate (Phase 12B
+    Tranche 2.1 item 8) - the common unit both the fixed-constant and
+    dynamic maker paths in `OneStepController.decide()` produce, so the
+    controller's own candidate-generation loop treats them identically
+    regardless of source."""
 
-    Quantity: damped by volatility (`sigma`) - a larger resting order
-    carries more adverse-selection risk in a faster-moving market before
-    it can be reconsidered - and capped by the current risk budget
-    (`G - g_min`, the same risk-budget concept `taker_sizing_boundaries`
-    already uses), so a maker candidate's size responds to the same risk
-    state a taker candidate would, rather than being a market-state-blind
-    constant.
+    price: float
+    offset_ticks: int
+    qty: float
+    ttl_s: float
+
+
+# Effectively-unbounded upper search range for _maker_feasible_quantity's
+# single-flat-price walk (Phase 12B Tranche 2.1 item 8) - a resting maker
+# has no book-depth limit of its own the way a taker's walk does, so the
+# real ceiling always comes from the g_min/spend_cap/position_limit
+# constraints computed inside that walk, never from this cap itself.
+_MAKER_QTY_SEARCH_CAP = 1e9
+
+
+def _maker_feasible_quantity(
+    u: float, d: float, c: float, g_min: float, side: Side, price: float,
+    fee_config: FeeConfig, spend_cap: float | None, position_limit: float | None,
+) -> float:
+    """Phase 12B Tranche 2.1 item 8: the exact maximum resting-maker
+    quantity at a FIXED price `p` such that, if it fully fills:
+
+        G_after(x, p) >= G_min
+        C + p*x + fee <= spend_cap
+        position_after <= position_limit
+
+    Corrects the prior draft's `qty = min(vol_damped_qty, portfolio.G -
+    g_min)`, which compared a SHARE quantity directly against a DOLLAR
+    budget (`G - g_min` is dollars; `qty` is shares) - dimensionally
+    invalid whenever `price != 1.0`. A maker resting at one fixed price is
+    equivalent to a single "infinite-depth level" at per-share cost
+    `c_i = p + fee_per_share(p)` - reuses `_risk_boundary_step`'s own
+    tested unimodal `G(x)` walk (the same shape a taker's multi-level
+    depth walk has) rather than re-deriving the algebra."""
+    c_i = price + fee_config.fee_for(LiquidityRole.MAKER, 1.0, price)
+    if c_i <= 0:
+        return 0.0
+    x0 = max(0.0, (d - u) if side is Side.UP else (u - d))
+    max_feasible, _ = _risk_boundary_step(u, d, c, g_min, side, x0, 0.0, 0.0, _MAKER_QTY_SEARCH_CAP, c_i)
+    if spend_cap is not None:
+        max_feasible = min(max_feasible, max(0.0, spend_cap - c) / c_i)
+    if position_limit is not None:
+        side_position = u if side is Side.UP else d
+        max_feasible = min(max_feasible, max(0.0, position_limit - side_position))
+    return max(0.0, max_feasible)
+
+
+def dynamic_maker_candidates(
+    q: float, side: Side, tau: float, sigma: float, portfolio: PortfolioState,
+    best_bid: float, best_ask: float, tick_size: float, fee_config: FeeConfig, cfg: OneStepConfig,
+) -> list[MakerCandidateSpec]:
+    """Derives maker (price, quantity, TTL) candidates from `(q, tau,
+    sigma, G, R, purpose)` instead of `OneStepConfig`'s fixed
+    `maker_quantity`/`maker_horizon_s`/`maker_price_offsets_ticks`
+    constants (Phase 12B Tranche 2D; quantity formula corrected, TTL
+    floor-clamp bug fixed, in Tranche 2.1 item 8). STRUCTURAL, not a
+    calibrated economic model - per item 37/Addendum J, no coefficient
+    here has been tuned against synthetic PnL; gated behind
+    `cfg.dynamic_maker` so the default (fixed) behavior is exactly Phases
+    8-12B's.
 
     TTL: damped by volatility (a stale quote is riskier in a fast market)
-    and capped by remaining round time (`tau`), so a maker candidate
-    never proposes resting past the round's own decision window.
+    and capped by remaining round time (`tau`). Item 8: if `tau` is
+    positive but shorter than `cfg.min_maker_ttl_s` (the minimum sensible
+    passive-order lifetime), NO maker candidate is generated at all this
+    decision - the prior draft's `ttl = max(1.0, ttl)` silently clamped
+    the TTL back UP past the round's own remaining time instead, proposing
+    a resting order that could never legitimately live out its horizon.
 
-    Price offsets: widen with volatility (a wider grid gives more price
-    points to react to a faster-moving touch) - three offsets in calm
+    Price offsets: widen with volatility - three offsets in calm
     conditions, growing with `sigma`, capped to avoid an unbounded grid.
-    """
-    vol = max(0.0, sigma)
-    risk_budget = max(0.0, portfolio.G - cfg.g_min)
-    vol_damped_qty = cfg.maker_quantity / (1.0 + vol)
-    qty = max(cfg.taker_min_size, min(vol_damped_qty, risk_budget)) if risk_budget > 0 else cfg.taker_min_size
 
+    Quantity: for EACH price in the offset grid, `_maker_feasible_quantity`
+    derives the exact G_min/spend/position-feasible maximum AT THAT PRICE
+    (a maker's cost-per-share varies with its own quoted price, unlike a
+    taker's fixed book levels) - not one dollar-budget-derived number
+    reused across every price. A small quantity set per price (exchange
+    minimum, a volatility-damped "typical size" point - preserving the
+    original "larger resting orders carry more adverse-selection risk in
+    a faster-moving market" intent, now correctly clamped against the
+    price-aware feasible ceiling instead of a raw dollar budget - and the
+    max feasible itself) lets the caller's own EV/fill-probability model
+    (`evaluate_maker_candidate`) rank which quantity is actually worth it,
+    rather than this function picking a single one."""
+    if tau > 0 and cfg.min_maker_ttl_s > 0 and tau < cfg.min_maker_ttl_s:
+        return []
+
+    vol = max(0.0, sigma)
     ttl = cfg.maker_horizon_s / (1.0 + vol)
     if tau > 0:
         ttl = min(ttl, tau)
@@ -403,8 +532,20 @@ def dynamic_maker_sizing(
 
     n_offsets = min(8, 3 + round(vol * 4))
     offsets = tuple(range(n_offsets))
+    vol_damped_typical = cfg.maker_quantity / (1.0 + vol)
 
-    return qty, ttl, offsets
+    u, d, c = portfolio.U, portfolio.D, portfolio.C
+    specs: list[MakerCandidateSpec] = []
+    for price, offset in maker_price_grid(best_bid, best_ask, tick_size, offsets):
+        max_feasible = _maker_feasible_quantity(u, d, c, cfg.g_min, side, price, fee_config, cfg.spend_cap, cfg.position_limit)
+        if max_feasible < cfg.taker_min_size - 1e-9:
+            continue
+        candidate_qtys = sorted({round(v, 6) for v in (cfg.taker_min_size, min(vol_damped_typical, max_feasible), max_feasible)})
+        for qty in candidate_qtys:
+            if qty < cfg.taker_min_size - 1e-9:
+                continue
+            specs.append(MakerCandidateSpec(price=price, offset_ticks=offset, qty=qty, ttl_s=ttl))
+    return specs
 
 
 def _risk_constraints(cfg: OneStepConfig) -> RiskConstraints:
@@ -447,6 +588,7 @@ def _finalize(
     q: float,
     cfg: OneStepConfig,
     apply_edge_min: bool,
+    expected_delta_g: float,
     max_execution_price: float | None = None,
 ) -> CandidateAction:
     result = FillSimulationResult(
@@ -474,6 +616,31 @@ def _finalize(
     if apply_edge_min and purpose not in _EDGE_MIN_EXEMPT_PURPOSES and delta_ev < cfg.edge_min:
         violated.append("edge_min")
 
+    # Phase 12B Tranche 2.1 item 5: breach-recovery semantics. The
+    # ordinary hard rule (G_after >= g_min, enforced above via
+    # evaluate_constraints) only makes sense when the portfolio was
+    # already safe before this candidate - once already breached
+    # (G_before < g_min), demanding full restoration in one fill would
+    # reject every partial repair, including the best one available. In
+    # that state: ALPHA (new speculative one-sided risk) is prohibited
+    # outright regardless of its own numbers; every other purpose
+    # (HEDGE/BUFFER_BUILD/REPAIR-type) is admitted precisely when it
+    # improves G relative to where it started (G_after > G_before), even
+    # if it can't reach g_min in a single fill, and rejected if it would
+    # make things worse (G_after <= G_before) - "never allow G_after <
+    # G_before" while already in recovery.
+    g_before = portfolio.G
+    g_after = portfolio_after.G
+    if g_before < cfg.g_min:
+        if purpose is OrderPurpose.ALPHA:
+            if "breach_recovery_alpha_prohibited" not in violated:
+                violated.append("breach_recovery_alpha_prohibited")
+        else:
+            if "g_min" in violated and g_after > g_before:
+                violated.remove("g_min")
+            if g_after <= g_before and "breach_recovery_no_improvement" not in violated:
+                violated.append("breach_recovery_no_improvement")
+
     return CandidateAction(
         action_id=action_id,
         purpose=purpose,
@@ -484,11 +651,12 @@ def _finalize(
         ttl_s=ttl_s,
         expected_fill=expected_fill,
         delta_ev=delta_ev,
-        g_after=portfolio_after.G,
+        g_after=g_after,
         pi_u_after=portfolio_after.Pi_U,
         pi_d_after=portfolio_after.Pi_D,
         violated_constraints=tuple(violated),
         max_execution_price=max_execution_price,
+        expected_delta_g=expected_delta_g,
     )
 
 
@@ -512,13 +680,18 @@ def evaluate_taker_candidate(
     delta_D = portfolio_after.D - portfolio.D
     delta_C = portfolio_after.C - portfolio.C
     delta_ev_raw = q * delta_U + (1.0 - q) * delta_D - delta_C
+    # Phase 12B Tranche 2.1 item 6: a taker fill is deterministic (FAK
+    # against the book, no probability draw involved) - its expected risk
+    # contribution IS its full delta, not a fill-probability-weighted
+    # fraction of it.
+    expected_delta_g = portfolio_after.G - portfolio.G
 
     return _finalize(
         action_id, purpose, side, OrderMode.FAK, walk.avg_price if walk.filled_shares > 0 else limit_price,
         requested_qty, ttl_s=0.0, expected_fill=walk.filled_shares,
         delta_U=delta_U, delta_D=delta_D, delta_C=delta_C, delta_ev_raw=delta_ev_raw,
         portfolio=portfolio, portfolio_after=portfolio_after, q=q, cfg=cfg, apply_edge_min=True,
-        max_execution_price=limit_price,
+        expected_delta_g=expected_delta_g, max_execution_price=limit_price,
     )
 
 
@@ -552,11 +725,82 @@ def evaluate_maker_candidate(
     qf = q_fill(q, side, exec_cfg.maker)
     ev_if_filled = qf * delta_U + (1.0 - qf) * delta_D - delta_C
     delta_ev_raw = rho * ev_if_filled - cfg.opportunity_cost
+    # Phase 12B Tranche 2.1 item 6: a maker only realizes its G contribution
+    # with probability rho - using the unweighted if-filled delta here
+    # (the bug this item fixes) would let the selection score treat an
+    # unlikely-to-fill maker as if its risk contribution were certain,
+    # exactly the "maker soft-risk weighting" the reviewer's fix targets.
+    expected_delta_g = rho * (portfolio_after_if_filled.G - portfolio.G)
 
     return _finalize(
         action_id, purpose, side, OrderMode.POST_ONLY, price, qty, ttl_s=horizon_s, expected_fill=rho * qty,
         delta_U=delta_U, delta_D=delta_D, delta_C=delta_C, delta_ev_raw=delta_ev_raw,
         portfolio=portfolio, portfolio_after=portfolio_after_if_filled, q=q, cfg=cfg, apply_edge_min=True,
+        expected_delta_g=expected_delta_g,
+    )
+
+
+@dataclass(frozen=True)
+class ReplacementPlan:
+    """A concrete, re-evaluated REPLACE proposal for an open maker order
+    (Phase 12B Tranche 2.1 item 9) - "re-evaluate the current book and
+    create a real ReplacementPlan" instead of leaving
+    `current_optimal_ev=None` (which silently made REPLACE unreachable
+    through `OrderSupervisor.review_order` in every integrated harness).
+    `exposure` is the plan's own `ActiveOrderExposure`, ready for a
+    `RiskView.admits()` hard-admission check before it is actually
+    dispatched - a REPLACE must clear the same aggregate risk bar any
+    other new order would (item 2)."""
+
+    side: Side
+    price: float
+    qty: float
+    ttl_s: float
+    delta_ev: float
+    expected_delta_g: float
+    exposure: ActiveOrderExposure
+
+
+def evaluate_replacement_plan(
+    side: Side,
+    remaining_shares: float,
+    best_bid: float,
+    best_ask: float,
+    tick_size: float,
+    offsets_ticks: tuple[int, ...],
+    horizon_s: float,
+    portfolio: PortfolioState,
+    q: float,
+    exec_cfg: ExecutionConfig,
+    fee_config: FeeConfig,
+    cfg: OneStepConfig,
+) -> ReplacementPlan | None:
+    """Re-evaluates every price on the current maker grid for `side` (via
+    `evaluate_maker_candidate`, the same EV/fill-probability model any
+    other maker candidate uses) and returns the highest-`delta_ev` valid
+    tick as a `ReplacementPlan` - the real "best alternative tick" a
+    REPLACE decision needs, rather than blindly taking the first (tightest)
+    grid price. Returns `None` if the book has no valid grid at all, or
+    every grid price is itself hard-constraint-invalid (e.g. would breach
+    g_min if filled) - REPLACE is then simply not offered this review."""
+    best: CandidateAction | None = None
+    for price, offset in maker_price_grid(best_bid, best_ask, tick_size, offsets_ticks):
+        c = evaluate_maker_candidate(
+            "replacement_eval", side, OrderPurpose.ALPHA, price, remaining_shares,
+            distance_to_touch_ticks=float(offset), queue_ahead_shares=0.0, horizon_s=horizon_s,
+            portfolio=portfolio, q=q, exec_cfg=exec_cfg, cfg=cfg,
+        )
+        if not c.is_valid:
+            continue
+        if best is None or c.delta_ev > best.delta_ev:
+            best = c
+    if best is None:
+        return None
+    fee = fee_config.fee_for(LiquidityRole.MAKER, best.qty, best.price)
+    exposure = ActiveOrderExposure(side, best.qty, best.qty * best.price + fee)
+    return ReplacementPlan(
+        side=side, price=best.price, qty=best.qty, ttl_s=horizon_s,
+        delta_ev=best.delta_ev, expected_delta_g=best.expected_delta_g, exposure=exposure,
     )
 
 
@@ -568,6 +812,7 @@ def generate_hedge_candidate(
     q: float,
     fee_config: FeeConfig,
     cfg: OneStepConfig,
+    tick_size: float = 0.01,
 ) -> CandidateAction | None:
     """Portfolio-repair / hedge candidate (Strategy doc SS17, Roadmap
     Phase 11 / SS20.1 ablation #5 "Lead-lag + CLOB without portfolio
@@ -629,8 +874,19 @@ def generate_hedge_candidate(
     # comparison.
     x_min *= 1.0001
 
+    # Phase 12B Tranche 2.1 item 4: HEDGE must never execute at an
+    # effectively unconstrained limit_price=1.0 - x_min was sized against
+    # the best ask's own price, but nothing previously stopped the actual
+    # FAK walk from filling worse than that (a thinner top level, or a
+    # book that moved), silently blowing through the g_min repair target
+    # x_min was computed to hit. This ceiling guarantees the repair target
+    # survives even under adverse execution.
+    max_price = purpose_aware_max_execution_price(portfolio, side, x_min, OrderPurpose.HEDGE, fee_config, cfg, tick_size)
+    if max_price is None or max_price <= 0:
+        return None
+
     return evaluate_taker_candidate(
-        action_id, side, OrderPurpose.HEDGE, x_min, limit_price=1.0, asks=asks,
+        action_id, side, OrderPurpose.HEDGE, x_min, limit_price=max_price, asks=asks,
         portfolio=portfolio, q=q, fee_config=fee_config, cfg=cfg,
     )
 
@@ -661,37 +917,37 @@ def generate_buffer_build_candidates(
     q: float,
     fee_config: FeeConfig,
     cfg: OneStepConfig,
+    tick_size: float = 0.01,
 ) -> list[CandidateAction]:
-    """BUFFER_BUILD candidates (Phase 12B Tranche 2B, Strategy doc SS17):
+    """BUFFER_BUILD candidates (Phase 12B Tranche 2B, Strategy doc SS17;
+    redesigned into a bounded multi-quantity set in Tranche 2.1 item 7):
     proactively accumulate cheap opposite-side inventory to improve
-    settlement geometry, generated independent of any `G < g_min` breach
-    - unlike `generate_hedge_candidate`, which only ever fires once
-    already at/below the risk floor. Buys the currently underrepresented
-    side (`U <= D` -> buy UP, else buy DOWN) - buying that side raises
+    settlement geometry, generated independent of any `G < g_min` breach -
+    unlike `generate_hedge_candidate`, which only ever fires once already
+    at/below the risk floor. Buys the currently underrepresented side
+    (`U <= D` -> buy UP, else buy DOWN) - buying that side raises
     `min(U,D)`; buying the already-overrepresented side never can (see
     `delta_g_directional`'s proof).
 
-    Sizes the single candidate at `x0 = |U-D|` (clamped to available book
-    depth) - the exact quantity at which `ΔG_side(x)` peaks (see
-    `delta_g_directional`'s docstring: non-decreasing for `x<=x0`,
-    non-increasing after), i.e. the largest settlement-geometry
-    improvement reachable without walking past the point where it starts
-    giving cost back. Reuses `_risk_boundary_step`'s own tested unimodal-
-    walk logic to find this exactly, by observing that "the max x with
-    `G_side(x) >= G_current`" (i.e. `ΔG_side(x) >= 0`) is the SAME kind of
-    boundary `_risk_boundary_step` already computes for an arbitrary
-    `g_min` - passing `g_min=G_current` finds the ΔG=0 crossing directly.
-    The candidate is then sized to the earlier of that crossing and `x0`
-    itself, since `x0` is where `ΔG` is maximized, not merely non-negative.
+    Item 7 correction: the prior draft generated exactly ONE candidate, at
+    the single quantity where `ΔG_side(x)` peaks. That silently assumed
+    "buy the maximum parity-improving amount" is always the best choice,
+    when a smaller quantity might have better EV per share, or a tighter
+    risk/spend budget might make the peak infeasible for other reasons.
+    This generates a whole BOUNDED candidate SET instead - exchange
+    minimum, a small-quantity grid, book-depth boundaries, the spend
+    boundary, the `g_min` risk boundary, and the parity boundary (the
+    `ΔG=0` crossing, `x0 = |U-D|`'s own peak) - evaluates `ΔEV(x)` and
+    `ΔG(x)` independently at each, and keeps only `ΔG(x) > 0` (SS17: a
+    BUFFER_BUILD trade whose cost exceeds its parity benefit is never
+    generated at all). The controller's own `argmax` then picks whichever
+    quantity is actually worth it - 5, 20, 50, or the full parity gap -
+    rather than this function assuming more is always better.
 
     Every returned candidate's own `delta_ev` may be negative (SS17:
     BUFFER_BUILD trades expected value for improved worst-case
     settlement, same allowance as HEDGE) - `edge_min` does not apply (see
-    `_EDGE_MIN_EXEMPT_PURPOSES`). `ΔG>0` alone is the admission bar for
-    generating the candidate at all; the controller's own `argmax`
-    (weighing `delta_ev + lambda_g*g_after`) decides whether it's
-    actually worth choosing over other candidates, same as any other
-    purpose."""
+    `_EDGE_MIN_EXEMPT_PURPOSES`)."""
     side = Side.UP if portfolio.U <= portfolio.D else Side.DOWN
     asks = asks_up if side is Side.UP else asks_down
     if not asks:
@@ -703,35 +959,131 @@ def generate_buffer_build_candidates(
         return []  # already at parity or overrepresented - no buffer opportunity in this direction
 
     g_current = min(u, d) - c
+    spend_budget = (cfg.spend_cap - c) if cfg.spend_cap is not None else None
+
     cum_qty = 0.0
     cum_cost = 0.0
-    boundary_qty = 0.0
+    risk_boundary_qty = 0.0
+    risk_walk_done = False
+    parity_boundary_qty = 0.0
+    parity_walk_done = False
+    spend_capacity_qty: float | None = None
+    depth_points: list[float] = []
+
     for level in asks[: cfg.max_taker_depth_levels]:
         c_i = level.price + fee_config.taker_fee(1.0, level.price)
-        boundary_qty, keep_going = _risk_boundary_step(u, d, c, g_current, side, x0, cum_qty, cum_cost, level.size, c_i)
+        level_cost = level.size * c_i
+        if spend_budget is not None and spend_capacity_qty is None and cum_cost + level_cost > spend_budget:
+            remaining_budget = max(0.0, spend_budget - cum_cost)
+            spend_capacity_qty = cum_qty + remaining_budget / c_i
+        if not risk_walk_done:
+            risk_boundary_qty, keep_going = _risk_boundary_step(u, d, c, cfg.g_min, side, x0, cum_qty, cum_cost, level.size, c_i)
+            risk_walk_done = not keep_going
+        if not parity_walk_done:
+            parity_boundary_qty, keep_going = _risk_boundary_step(u, d, c, g_current, side, x0, cum_qty, cum_cost, level.size, c_i)
+            parity_walk_done = not keep_going
         cum_qty += level.size
-        cum_cost += level.size * c_i
-        if not keep_going:
+        cum_cost += level_cost
+        depth_points.append(cum_qty)
+
+    if spend_budget is not None and spend_capacity_qty is None:
+        spend_capacity_qty = cum_qty
+
+    # ΔG(x) > 0 only inside (0, min(x0, parity_boundary_qty)] - beyond the
+    # parity boundary, cost exceeds the parity benefit even at the peak
+    # (delta_g_directional's proof), so this is a hard prefilter, not the
+    # g_min risk boundary (which stays a candidate QUANTITY in the set
+    # below, not a truncation - a partial buffer build below the g_min
+    # boundary is still a legitimate, independently-evaluated candidate;
+    # _finalize's own hard-constraint/breach-recovery check is what
+    # ultimately decides admissibility, not this generator).
+    max_feasible = min(x0, parity_boundary_qty)
+    if spend_capacity_qty is not None:
+        max_feasible = min(max_feasible, spend_capacity_qty)
+    max_feasible = max(0.0, max_feasible)
+    if max_feasible <= 0:
+        return []
+
+    quantities: set[float] = set()
+    quantities.add(min(cfg.taker_min_size, max_feasible))  # exchange minimum
+    step = max(cfg.taker_qty_step, 1e-9)
+    x = cfg.taker_min_size
+    for _ in range(cfg.taker_qty_grid_points):  # small-quantity grid
+        if x >= max_feasible - 1e-9:
             break
+        quantities.add(x)
+        x += step
+    for dp in depth_points:  # book-depth boundaries
+        quantities.add(min(dp, max_feasible))
+    if spend_capacity_qty is not None:  # spend boundary
+        quantities.add(min(spend_capacity_qty, max_feasible))
+    if risk_boundary_qty > 0:  # g_min risk boundary
+        quantities.add(min(risk_boundary_qty, max_feasible))
+    quantities.add(max_feasible)  # parity boundary itself
 
-    # A small safety margin (matching generate_hedge_candidate's own
-    # x_min*1.0001 pattern) since `boundary_qty` alone lands exactly on
-    # the ΔG=0 crossing - chained floating-point arithmetic can put the
-    # literal boundary a few ULPs on the wrong (non-positive-ΔG) side.
-    target_qty = min(x0, boundary_qty) * 0.999
-    if target_qty <= 0:
-        return []
-    walk = walk_depth(asks, target_qty, limit_price=1.0, fee_config=fee_config)
-    if walk.filled_shares <= 0:
-        return []
-    k_x = walk.total_paid
-    if delta_g_directional(u, d, side, walk.filled_shares, k_x) <= 0:
-        return []  # cost exceeds the parity gain even at the peak quantity (e.g. a very expensive book)
+    candidates: list[CandidateAction] = []
+    idx = 0
+    for raw_qty in sorted(quantities):
+        # Safety margin (matching generate_hedge_candidate's own
+        # x_min*1.0001 pattern) - a quantity landing exactly on the
+        # parity/risk/spend boundary can end up a few ULPs on the wrong
+        # side of it after chained floating-point arithmetic.
+        qty = raw_qty * 0.999
+        if qty < cfg.taker_min_size - 1e-9 or qty <= 0:
+            continue
+        max_price = purpose_aware_max_execution_price(portfolio, side, qty, OrderPurpose.BUFFER_BUILD, fee_config, cfg, tick_size)
+        if max_price is None or max_price <= 0:
+            continue
+        walk = walk_depth(asks, qty, limit_price=max_price, fee_config=fee_config)
+        if walk.filled_shares <= 0:
+            continue
+        k_x = walk.total_paid
+        delta_g = delta_g_directional(u, d, side, walk.filled_shares, k_x)
+        if delta_g <= 0:
+            continue  # keep only ΔG>0 (SS17) - cost exceeds the parity benefit at this quantity
+        idx += 1
+        candidates.append(evaluate_taker_candidate(
+            f"{action_id_prefix}_{idx}", side, OrderPurpose.BUFFER_BUILD, walk.filled_shares, limit_price=max_price,
+            asks=asks, portfolio=portfolio, q=q, fee_config=fee_config, cfg=cfg,
+        ))
+    return candidates
 
-    return [evaluate_taker_candidate(
-        f"{action_id_prefix}_1", side, OrderPurpose.BUFFER_BUILD, walk.filled_shares, limit_price=1.0,
-        asks=asks, portfolio=portfolio, q=q, fee_config=fee_config, cfg=cfg,
-    )]
+
+def candidate_exposure(candidate: CandidateAction, fee_config: FeeConfig) -> ActiveOrderExposure | None:
+    """Converts a not-yet-submitted `CandidateAction` into the same
+    `ActiveOrderExposure` shape `portfolio/exposure.py` uses for already-
+    pending taker/maker orders (Phase 12B Tranche 2.1 items 2/3) - the
+    single conversion every dispatch site and `OneStepController.decide`
+    itself route through before checking `RiskView.admits()`, so a
+    not-yet-submitted candidate is judged by the exact same worst-case
+    convention an already-active order would be.
+
+    FAK (taker): worst case is the full REQUESTED quantity filling at its
+    own hard price ceiling (`max_execution_price`, falling back to
+    `price`) - mirrors `exposure_from_pending_takers`'s convention for an
+    order that has already been submitted and is awaiting delayed
+    resolution, since a delayed fill can still consume the full requested
+    size at that ceiling.
+
+    POST_ONLY (maker): worst case is the full quoted quantity filling at
+    its quoted price - mirrors `exposure_from_open_maker_orders`.
+
+    Returns `None` for WAIT (no exposure) or a candidate missing the
+    price/side information needed to build one."""
+    if candidate.side is None or candidate.qty <= 0:
+        return None
+    if candidate.mode is OrderMode.FAK:
+        price = candidate.max_execution_price if candidate.max_execution_price is not None else candidate.price
+        if price is None:
+            return None
+        fee = fee_config.taker_fee(candidate.qty, price)
+        return ActiveOrderExposure(candidate.side, candidate.qty, candidate.qty * price + fee)
+    if candidate.mode is OrderMode.POST_ONLY:
+        if candidate.price is None:
+            return None
+        fee = fee_config.fee_for(LiquidityRole.MAKER, candidate.qty, candidate.price)
+        return ActiveOrderExposure(candidate.side, candidate.qty, candidate.qty * candidate.price + fee)
+    return None
 
 
 def wait_candidate(action_id: str, portfolio: PortfolioState) -> CandidateAction:

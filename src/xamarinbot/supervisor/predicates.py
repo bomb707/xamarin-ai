@@ -63,16 +63,17 @@ def value_hold(
     tau: float,
     cfg: SupervisorConfig,
 ) -> float:
-    """Phase 12B Tranche 2E: SS18's "V_hold" for the argmax(V_hold,
-    V_cancel, V_replace) cancel/replace policy - replaces the old
-    unconditional "regime flip -> cancel immediately" rule with a *soft*
-    economic degradation: a flipped regime or compressed remaining time
-    lowers the order's held value by a configurable penalty rather than
-    vetoing it outright, so a still strongly profitable order can survive
-    a flip it can economically absorb, while a marginal one gets canceled
-    precisely because the flip pushed it under the edge floor - not merely
-    because a flip occurred. At `cfg`'s default zero penalties this
-    reduces to plain `current_delta_ev`."""
+    """Phase 12B Tranche 2E: SS18's "V_hold" for the cancel/replace policy
+    - a flipped regime or compressed remaining time lowers the order's
+    held value by a configurable penalty rather than vetoing it outright,
+    so a still strongly profitable order can survive a flip it can
+    economically absorb. This is a pure economic value (what the order is
+    actually worth if left resting) - `edge_min` is deliberately NOT
+    subtracted here (Tranche 2.1 item 10): it is a decision THRESHOLD on
+    whether holding is even eligible (see `hold_eligible` below), not a
+    value term, so it must not distort this number's comparison against
+    `value_replace`, which has no symmetric edge_min term of its own. At
+    `cfg`'s default zero penalties this reduces to plain `current_delta_ev`."""
     v = current_delta_ev
     if regime_flip(origin_regime_state, current_regime_state):
         v -= cfg.regime_flip_penalty
@@ -81,13 +82,30 @@ def value_hold(
     return v
 
 
+def hold_eligible(effective_delta_ev: float, cfg: SupervisorConfig) -> bool:
+    """Phase 12B Tranche 2.1 item 10: `edge_min` is a decision THRESHOLD -
+    "is this order's (penalty-adjusted) edge still above the floor worth
+    continuing to hold for" - not an economic value folded into any V()
+    term. `cfg.hysteresis_margin` widens the threshold itself (classic
+    control-theory hysteresis: don't flip state until crossing threshold
+    minus/plus a margin), rather than being added as a flat bonus to
+    `value_hold`'s magnitude - a flat bonus would also (wrongly) tilt the
+    HOLD-vs-REPLACE comparison, which has nothing to do with edge_min or
+    hysteresis at all. `effective_delta_ev` should be `value_hold(...)`'s
+    own return value, so regime-flip/time-compression penalties are
+    already netted in before this threshold is applied."""
+    return effective_delta_ev >= cfg.edge_min - cfg.hysteresis_margin
+
+
 def value_cancel(cfg: SupervisorConfig) -> float:
-    """Phase 12B Tranche 2E: SS18's "V_cancel" - the baseline value of
-    walking away: no further forward EV from this order, floored at
-    `edge_min` (the same "expected filled edge" floor `edge_failure` used,
-    now framed as an indifference point rather than a hard veto) minus the
-    fixed cost of actually executing a cancel."""
-    return cfg.edge_min - cfg.cancel_cost
+    """Phase 12B Tranche 2.1 item 10: SS18's "V_cancel" is the economic
+    value actually received from canceling - none, beyond avoiding the
+    fixed cost of executing the cancel itself. `edge_min` is a decision
+    threshold on whether an order is worth *holding* (see
+    `hold_eligible`), not a value received from walking away, so it must
+    not appear here (a bug in the prior Tranche 2E draft, which folded it
+    in as `edge_min - cancel_cost`)."""
+    return -cfg.cancel_cost
 
 
 def value_replace(current_optimal_ev: float | None, cfg: SupervisorConfig) -> float | None:

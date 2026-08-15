@@ -365,6 +365,51 @@ def test_ablations_maker_admission_uses_risk_view_and_rejects_when_unsafe(eval_d
     assert n_blocked == 0, "RiskView.admits()==False must block every maker registration"
 
 
+def test_ablations_replace_actually_fires_and_is_risk_view_admitted(eval_dataset, feature_cfg, fee_config, exec_cfg, trained_model):
+    """Phase 12B Tranche 2.1 item 9 integration proof: `current_optimal_ev`
+    is no longer permanently None (evaluate_replacement_plan now supplies
+    a real re-evaluated ReplacementPlan), so REPLACE can actually reach
+    `OrderSupervisor.apply_replace` through this harness - and, like maker
+    placement, that REPLACE must still be gated by RiskView.admits before
+    it executes. Forces every review to prefer REPLACE (whenever a real
+    plan exists) and proves: admits()==True lets at least one REPLACE
+    execute; admits()==False blocks every one of them."""
+    from unittest.mock import patch
+
+    import xamarinbot.supervisor.supervisor as supervisor_mod
+    import xamarinbot.walkforward.ablations as ablations_mod
+    from xamarinbot.supervisor.types import SupervisorActionType, SupervisorDecision
+
+    store, results = eval_dataset
+    spec = next(s for s in MANDATORY_ABLATIONS if s.name == "7_maker_taker_cancel_replace")
+
+    def force_replace_when_a_plan_exists(self, tracked, now_ts, current_regime_state, current_delta_ev, current_g_after_if_fill, tau, is_fresh, current_optimal_ev=None):
+        if current_optimal_ev is not None:
+            return SupervisorDecision(tracked.order_id, SupervisorActionType.REPLACE)
+        return SupervisorDecision(tracked.order_id, SupervisorActionType.HOLD, None)
+
+    def count_replacements(admits_return: bool) -> int:
+        calls = {"n": 0}
+        real_apply_replace = supervisor_mod.OrderSupervisor.apply_replace
+
+        def spy_apply_replace(self, decision, now_ts, new_order_id, new_price, new_qty):
+            calls["n"] += 1
+            return real_apply_replace(self, decision, now_ts, new_order_id, new_price, new_qty)
+
+        with patch.object(ablations_mod.RiskView, "admits", return_value=admits_return), \
+             patch.object(supervisor_mod.OrderSupervisor, "apply_replace", spy_apply_replace), \
+             patch.object(supervisor_mod.OrderSupervisor, "review_order", force_replace_when_a_plan_exists):
+            for r in results:
+                run_ablation_round(spec, store, r.round_id, r.p0, r.outcome, feature_cfg, fee_config, exec_cfg, trained_model, None)
+        return calls["n"]
+
+    n_admitted = count_replacements(True)
+    n_blocked = count_replacements(False)
+
+    assert n_admitted > 0, "REPLACE must actually reach apply_replace at least once when forced and RiskView admission is forced True"
+    assert n_blocked == 0, "RiskView.admits()==False must block every REPLACE"
+
+
 def test_supervisor_receives_recomputed_economics_not_placeholders(eval_dataset, feature_cfg, fee_config, exec_cfg, trained_model):
     """Phase 12B audit item 12/18 regression: `_run_controller_round`
     previously called `supervisor.review_order` with a hardcoded
