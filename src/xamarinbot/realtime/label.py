@@ -91,6 +91,14 @@ _RULE_TEXT_MARKERS = {
     "chainlink_twap_30": ("twap-30s", "twap_30", "30s-streams", "30-second"),
 }
 
+#: Positive evidence that a market settles on the PLAIN Chainlink reference
+#: price (Gate A.0.2 item 5). A market that names none of these has not
+#: corroborated that basis, whatever else its text does or does not say.
+_REFERENCE_BASIS_MARKERS = (
+    "chainlink", "data.chain.link", "reference price", "spot price feed",
+    "price feed", "oracle price",
+)
+
 
 class RuleTextStatus(str, Enum):
     """The outcome of cross-checking a market's free text against its
@@ -150,11 +158,20 @@ def declared_basis_matches_rule_text(
     if not blob:
         return None
     if settlement_kind != "chainlink_twap":
-        # A plain-reference market should NOT be advertising a TWAP stream.
+        # Gate A.0.2 item 5. This used to return `not mentions_twap`, i.e. it
+        # treated the ABSENCE of a TWAP mention as confirmation of the plain
+        # Chainlink reference basis. That is not evidence of anything: a
+        # market described only as "Bitcoin Up or Down" mentions no TWAP and
+        # would have been VERIFIED_TRUE for a settlement basis its text never
+        # names. The same reasoning that requires positive evidence for a
+        # TWAP window requires it here.
         mentions_twap = any(
             m in blob for markers in _RULE_TEXT_MARKERS.values() for m in markers
         )
-        return not mentions_twap
+        if mentions_twap:
+            return False
+        names_reference = any(m in blob for m in _REFERENCE_BASIS_MARKERS)
+        return True if names_reference else None
     key = f"chainlink_twap_{twap_window_s}"
     markers = _RULE_TEXT_MARKERS.get(key)
     if markers is None:

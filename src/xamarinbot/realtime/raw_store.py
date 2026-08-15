@@ -291,6 +291,30 @@ class RawEventStore:
             )
             self._conn.commit()
 
+    def last_recv_before(self, topics: Sequence[Topic], ts_ns: int) -> int | None:
+        """Receive time of the last DATA event on `topics` at or before
+        `ts_ns` (Gate A.0.2: reconstructing a legacy outage's true start)."""
+        marks = ",".join("?" * len(topics))
+        with self._lock:
+            row = self._conn.execute(
+                f"SELECT MAX(recv_wall_timestamp_ns) FROM raw_events "
+                f"WHERE topic IN ({marks}) AND recv_wall_timestamp_ns <= ?",
+                [t.value for t in topics] + [int(ts_ns)],
+            ).fetchone()
+        return row[0] if row and row[0] is not None else None
+
+    def first_recv_after(self, topics: Sequence[Topic], ts_ns: int) -> int | None:
+        """Receive time of the first DATA event on `topics` strictly after
+        `ts_ns` - i.e. when the feed genuinely resumed."""
+        marks = ",".join("?" * len(topics))
+        with self._lock:
+            row = self._conn.execute(
+                f"SELECT MIN(recv_wall_timestamp_ns) FROM raw_events "
+                f"WHERE topic IN ({marks}) AND recv_wall_timestamp_ns > ?",
+                [t.value for t in topics] + [int(ts_ns)],
+            ).fetchone()
+        return row[0] if row and row[0] is not None else None
+
     def upsert_session_meta(self, session_id: str, identity) -> None:
         """Stamp the recorder's identity into the capture (item 6)."""
         row = dict(identity.as_dict(), session_id=session_id)

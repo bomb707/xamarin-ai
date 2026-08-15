@@ -33,6 +33,7 @@ from xamarinbot.realtime.attribution import (
     RoundWindow,
     Stream,
     attribute_failure,
+    attribute_gap,
 )
 from xamarinbot.realtime.clob_ws import PolymarketMarketStream
 from xamarinbot.realtime.identity import RecorderIdentity
@@ -149,6 +150,7 @@ class RealRecorderService:
             builder=self._rtds_builder,
             on_raw_event=self.recorder.submit,
             on_parse_failure=self._on_rtds_parse_failure,
+            on_data_gap=self._on_data_gap,
             on_reconnect=lambda gen: self.metrics.record_reconnect(),
             on_observation=self._on_observation,
         )
@@ -174,6 +176,47 @@ class RealRecorderService:
             )
             for c in self.captures.values()
         ]
+
+    def _on_data_gap(self, gap) -> None:
+        """Persist a completed feed outage as a structured attribution.
+
+        Gate A.0.2 items 1-3. The previous `stream_stalled` control event was
+        outside the eligibility gate entirely: preflight read only
+        `parse_failure`, so a 30+ second RTDS blackout - the exact failure
+        the watchdog exists to catch - could be recorded in full and still
+        leave every overlapping round `data_valid=True`, because no frame had
+        happened to fail parsing.
+
+        A gap shorter than one publication interval is NOT recorded as
+        damage: a clean reconnect that resubscribes in milliseconds loses no
+        observation, and disqualifying rounds for it would make the whole
+        signal noise.
+        """
+        if not gap.is_material:
+            self._log(
+                f"[data-gap] {gap.stream} {gap.failure_kind}: "
+                f"{gap.duration_ns / 1e9:.3f}s - below one publication interval, "
+                "no observation lost"
+            )
+            return
+        self.metrics.record_data_gap()
+        self._log(
+            f"[data-gap] {gap.stream} {gap.failure_kind}: "
+            f"{gap.duration_ns / 1e9:.1f}s of missing observations"
+        )
+        try:
+            attribution = attribute_gap(gap, self.round_windows())
+            self.recorder.submit(self._clob_builder.build(
+                Topic.RECORDER_CONTROL, "data_gap",
+                dict(attribution.as_payload(), duration_s=gap.duration_ns / 1e9),
+                round_id=(attribution.affected_round_ids[0]
+                          if len(attribution.affected_round_ids) == 1 else None),
+            ))
+        except Exception:
+            # As with parse failures: the counter above already incremented,
+            # so a record lost here becomes an UNRECORDED failure and forces
+            # the conservative session-wide fallback rather than vanishing.
+            pass
 
     def _on_clob_parse_failure(self, raw, exc) -> None:
         self._on_parse_failure(raw, exc, Stream.CLOB)
@@ -410,6 +453,7 @@ class RealRecorderService:
                 round_for_token=round_map,
                 condition_for_token=cond_map,
                 on_parse_failure=self._on_clob_parse_failure,
+                on_data_gap=self._on_data_gap,
                 on_reconnect=lambda gen: self.metrics.record_reconnect(),
                 on_resnapshot=lambda tid: self.metrics.record_resnapshot(),
             )

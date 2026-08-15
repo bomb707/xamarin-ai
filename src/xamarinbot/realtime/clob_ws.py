@@ -65,6 +65,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, Iterable
 
+from xamarinbot.realtime.attribution import Stream, StreamGapTracker
 from xamarinbot.realtime.raw_events import RawEvent, RawEventBuilder, Topic, ms_to_ns
 
 CLOB_REST_BASE_URL = "https://clob.polymarket.com"
@@ -241,6 +242,7 @@ class PolymarketMarketStream:
         on_parse_failure: Callable[[str, Exception], None] | None = None,
         on_reconnect: Callable[[int], None] | None = None,
         on_resnapshot: Callable[[str], None] | None = None,
+        on_data_gap: Callable[[object], None] | None = None,
     ):
         self._token_ids = list(token_ids)
         self._builder = builder
@@ -257,6 +259,9 @@ class PolymarketMarketStream:
         self._on_parse_failure = on_parse_failure or (lambda raw, exc: None)
         self._on_reconnect = on_reconnect or (lambda gen: None)
         self._on_resnapshot = on_resnapshot or (lambda token_id: None)
+        #: Gate A.0.2 item 2: CLOB outages as INTERVALS, ending only when the
+        #: books have resnapshotted and are usable again.
+        self.gaps = StreamGapTracker(Stream.CLOB, on_gap=on_data_gap)
 
         self._books: dict[str, BookState] = {t: BookState(t) for t in self._token_ids}
         self._lock = threading.RLock()
@@ -464,6 +469,12 @@ class PolymarketMarketStream:
                         with self._lock:
                             for book in self._books.values():
                                 book.awaiting_snapshot = True
+                        # Gate A.0.2 item 2: a disconnect is an interval. If
+                        # the stall watchdog did not already open one (a
+                        # socket can drop without going silent first), open
+                        # it here - it still starts at the last event we
+                        # actually received, not at this moment.
+                        self.gaps.begin("connection_gap")
                         self._on_reconnect(self._builder.reconnect_generation)
                         self._emit(self._build(
                             Topic.RECORDER_CONTROL, "reconnect",
@@ -474,6 +485,13 @@ class PolymarketMarketStream:
                     self._connected.set()
                     # Resync from REST before trusting further deltas.
                     self.bootstrap_all()
+                    # Item 2: the books are only USABLE again once they have
+                    # resnapshotted. A resumed socket carrying deltas against
+                    # a stale book is not recovery - it is silent corruption,
+                    # which is why `awaiting_snapshot` exists above. The gap
+                    # therefore closes here, after the REST resync, and not
+                    # when the socket opened.
+                    self.gaps.close()
                     backoff = 1.0
                     last_ping = time.monotonic()
                     last_data = time.monotonic()
@@ -488,8 +506,10 @@ class PolymarketMarketStream:
                         if raw:
                             if raw not in ("PONG", "pong"):
                                 last_data = time.monotonic()
+                                self.gaps.note_data()
                             self.handle_message(raw)
                         if time.monotonic() - last_data > self._stall_timeout:
+                            self.gaps.begin("stream_stalled")
                             self._emit(self._build(
                                 Topic.RECORDER_CONTROL, "stream_stalled",
                                 {

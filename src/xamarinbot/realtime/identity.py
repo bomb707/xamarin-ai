@@ -27,15 +27,28 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-#: Bumped whenever the recorder changes what it writes or what it means.
-#: 1 = Phase 12C .. Gate A.0; 2 = Gate A.0.1 (structured failure attribution,
-#: session identity).
-RECORDER_SCHEMA_VERSION = 2
+#: Bumped whenever the recorder changes what it PERSISTS or what it means.
+#:
+#:   1  Phase 12C .. Gate A.0     session counters only
+#:   2  Gate A.0.1                structured parse-failure attribution,
+#:                                session identity
+#:   3  Gate A.0.2                structured `data_gap` events with measured
+#:                                outage intervals; feed stalls inside the
+#:                                eligibility gate
+#:
+#: A v2 capture is not merely older: its stalls were recorded as
+#: zero-duration points outside the gate, so its data-quality verdicts are
+#: not comparable with a v3 capture's until it is reprocessed.
+RECORDER_SCHEMA_VERSION = 3
 
 #: Captures with no session identity at all. They were written by a process
 #: that predates this module, so their generation is known only negatively.
 LEGACY_RECORDER = "LEGACY_RECORDER"
 POST_A0_1_RECORDER = "POST_A0_1_RECORDER"
+POST_A0_2_RECORDER = "POST_A0_2_RECORDER"
+
+#: The generation a capture belongs to, by the schema it was written with.
+GENERATION_BY_SCHEMA = {1: LEGACY_RECORDER, 2: POST_A0_1_RECORDER, 3: POST_A0_2_RECORDER}
 
 
 #: The paths whose state decides whether the LOADED CODE is a commit.
@@ -91,7 +104,7 @@ class RecorderIdentity:
             process_started_at=time.time(),
             python_version=sys.version.split()[0],
             recorder_schema_version=RECORDER_SCHEMA_VERSION,
-            recorder_generation=POST_A0_1_RECORDER,
+            recorder_generation=GENERATION_BY_SCHEMA[RECORDER_SCHEMA_VERSION],
             host=platform.node(),
         )
 

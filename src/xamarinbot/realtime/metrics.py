@@ -98,6 +98,8 @@ class RecorderMetrics:
     queue_high_water: int = 0
     dropped_events: int = 0
     parse_failures: int = 0
+    #: Gate A.0.2: material feed outages (RTDS stalls, CLOB connection gaps).
+    data_gaps: int = 0
     duplicate_events: int = 0
     reconnect_count: int = 0
     resnapshot_count: int = 0
@@ -131,6 +133,14 @@ class RecorderMetrics:
     def record_parse_failure(self) -> None:
         with self._lock:
             self.parse_failures += 1
+
+    def record_data_gap(self) -> None:
+        """Gate A.0.2: a MATERIAL feed outage - one long enough that
+        observations were certainly lost. Counted separately from parse
+        failures because it is a different failure: nothing failed to parse,
+        the data simply never arrived."""
+        with self._lock:
+            self.data_gaps += 1
 
     def record_duplicate(self) -> None:
         with self._lock:

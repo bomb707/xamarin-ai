@@ -67,6 +67,7 @@ import time
 from dataclasses import dataclass
 from typing import Callable
 
+from xamarinbot.realtime.attribution import Stream, StreamGapTracker
 from xamarinbot.realtime.raw_events import RawEvent, RawEventBuilder, Topic, ms_to_ns
 
 RTDS_WS_URL = "wss://ws-live-data.polymarket.com"
@@ -155,6 +156,7 @@ class RTDSClient:
         open_timeout_s: float = 15.0,
         stall_timeout_s: float = 30.0,
         on_parse_failure: Callable[[str, Exception], None] | None = None,
+        on_data_gap: Callable[[object], None] | None = None,
         on_reconnect: Callable[[int], None] | None = None,
         on_observation: Callable[[ReferenceObservation], None] | None = None,
     ):
@@ -182,6 +184,10 @@ class RTDSClient:
         self._on_parse_failure = on_parse_failure or (lambda raw, exc: None)
         self._on_reconnect = on_reconnect or (lambda gen: None)
         self._on_observation = on_observation or (lambda obs: None)
+        #: Gate A.0.2 item 1: RTDS outages as INTERVALS. A stall opens a gap
+        #: at the last observation actually received; the first valid BTC
+        #: observation after the reconnect closes it.
+        self.gaps = StreamGapTracker(Stream.RTDS, on_gap=on_data_gap)
 
         self._latest: dict[str, ReferenceObservation] = {}
         self._history: dict[str, list[ReferenceObservation]] = {t: [] for t in self._topics}
@@ -257,17 +263,25 @@ class RTDSClient:
                                 last_data = time.monotonic()
                             self.handle_message(raw)
                         if time.monotonic() - last_data > self._stall_timeout:
+                            silent_for = time.monotonic() - last_data
+                            # Gate A.0.2 item 1: open a real INTERVAL. The
+                            # outage began at the last observation actually
+                            # received, which is `silent_for` seconds ago -
+                            # not now, when the watchdog happened to notice.
+                            self.gaps.begin("stream_stalled")
                             self._emit(self._builder.build(
                                 Topic.RECORDER_CONTROL, "stream_stalled",
                                 {
                                     "stream": "rtds",
-                                    "silent_for_s": time.monotonic() - last_data,
+                                    "silent_for_s": silent_for,
                                     "stall_timeout_s": self._stall_timeout,
                                 },
                                 round_id=self.current_round_id,
                             ))
                             # Break out to the reconnect path rather than
-                            # sitting on a dead socket.
+                            # sitting on a dead socket. The gap stays OPEN
+                            # and is closed by the first valid BTC
+                            # observation on the new connection.
                             break
             except Exception as exc:
                 if self._stop.is_set():
@@ -349,6 +363,12 @@ class RTDSClient:
             self._on_parse_failure(json.dumps(m), exc)
             self._emit(ev)
             return ev
+
+        # Gate A.0.2 item 1: THIS is what ends an RTDS outage - a parsed,
+        # wanted BTC observation with a usable value. Not the reconnect
+        # (which only proves a socket opened), and not a PONG. Any open gap
+        # is closed at this observation's own receive timestamp.
+        self.gaps.note_data(ev.recv_wall_timestamp_ns)
 
         window = payload.get("window_s")
         obs = ReferenceObservation(

@@ -6,14 +6,19 @@ validity rather than collapsing them into `LabelStatus`.
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 from dataclasses import dataclass
 
 from xamarinbot.eligibility import Disqualifier, RoundEligibility, build, summarize
 from xamarinbot.realtime.attribution import (
+    FAILURE_EVENT_TYPES,
+    MATERIAL_GAP_NS,
     AttributionSummary,
     FailureAttribution,
     RoundWindow,
+    StreamGap,
+    attribute_gap,
 )
 from xamarinbot.realtime.label import RuleTextStatus, verify_rule_text
 from xamarinbot.realtime.raw_events import Topic
@@ -73,6 +78,88 @@ def round_windows(raw: RawEventStore) -> list[RoundWindow]:
     return out
 
 
+#: Which raw topics carry the DATA of each stream, for reconstructing a
+#: legacy outage's true interval from the observations around it.
+_STREAM_DATA_TOPICS = {
+    "rtds": [Topic.RTDS_BINANCE, Topic.RTDS_CHAINLINK,
+             Topic.RTDS_TWAP_30, Topic.RTDS_TWAP_60],
+    "clob": [Topic.CLOB_MARKET],
+    "clob_market": [Topic.CLOB_MARKET],
+}
+
+
+def reconstruct_gap_interval(
+    raw: RawEventStore, stream: str, at_ns: int
+) -> tuple[int, int]:
+    """The TRUE outage interval around a control event, from the data itself.
+
+    Gate A.0.2 item 1 requires the interval to be the actual missing-
+    observation period. Captures written before A.0.2 recorded only the
+    instant the watchdog fired, which is neither end of the outage: the
+    watchdog waits 30 seconds of silence before firing, and the stream stays
+    dead through the reconnect afterwards.
+
+    Both ends are recoverable from the raw log, because the log records
+    exactly what did and did not arrive: the last data event on that stream
+    before the control event, and the first one after it. That is a
+    measurement, not an estimate - which is what makes legacy captures
+    revalidatable rather than merely re-judged.
+    """
+    topics = _STREAM_DATA_TOPICS.get(stream, list(_STREAM_DATA_TOPICS["rtds"]))
+    before = raw.last_recv_before(topics, at_ns)
+    after = raw.first_recv_after(topics, at_ns)
+    return (before if before is not None else at_ns,
+            after if after is not None else at_ns)
+
+
+def structured_failure_events(raw: RawEventStore) -> list[FailureAttribution]:
+    """Every data-quality failure in a capture, as structured attributions.
+
+    Gate A.0.2 item 3: ONE reader for all of them. Preflight previously
+    looked only for `parse_failure`, so `stream_stalled` - the event the
+    watchdog exists to produce - was outside the eligibility gate entirely.
+    A 37-second RTDS blackout could be fully recorded and still leave every
+    overlapping round `data_valid=True`.
+
+    Three shapes are handled:
+
+    * `data_gap` (A.0.2): already carries a measured interval and a verdict.
+    * `parse_failure` (A.0.1): a point event about one frame.
+    * `stream_stalled` / `reconnect` (legacy): no attribution at all, so the
+      interval is reconstructed from the surrounding data and the affected
+      rounds are recomputed. Outages shorter than one publication interval
+      are dropped - a reconnect that resubscribes in milliseconds lost
+      nothing, and treating it as damage would make the signal noise.
+    """
+    windows = round_windows(raw)
+    out: list[FailureAttribution] = []
+    for e in raw.events(topics=[Topic.RECORDER_CONTROL]):
+        if e.event_type not in FAILURE_EVENT_TYPES:
+            continue
+        payload = e.payload
+        if e.event_type in ("data_gap", "parse_failure"):
+            out.append(FailureAttribution.from_payload(payload, e.event_type))
+            continue
+
+        # Legacy stall/reconnect: reconstruct rather than discard.
+        stream = payload.get("stream") or ("clob" if e.event_type == "reconnect" else "rtds")
+        at_ns = e.recv_wall_timestamp_ns
+        start_ns, end_ns = reconstruct_gap_interval(raw, str(stream), at_ns)
+        if end_ns - start_ns <= MATERIAL_GAP_NS:
+            continue
+        gap = StreamGap(
+            stream="rtds" if str(stream).startswith("rtds") else "clob",
+            failure_kind=e.event_type,
+            last_data_ns=start_ns,
+            detected_ns=at_ns,
+            recovered_ns=end_ns,
+        )
+        out.append(dataclasses.replace(
+            attribute_gap(gap, windows), source_event_type=e.event_type,
+        ))
+    return out
+
+
 def attribution_summary(raw: RawEventStore) -> AttributionSummary:
     """How this capture's parse failures map onto its rounds.
 
@@ -82,11 +169,7 @@ def attribution_summary(raw: RawEventStore) -> AttributionSummary:
     exceeds its records has failures nobody can place, and per-round
     attribution is then not available at all.
     """
-    attributions = []
-    for e in raw.events(topics=[Topic.RECORDER_CONTROL]):
-        if e.event_type != "parse_failure":
-            continue
-        attributions.append(FailureAttribution.from_payload(e.payload))
+    attributions = structured_failure_events(raw)
 
     # `RecorderMetrics.parse_failures` is a MONOTONIC session-wide counter,
     # snapshotted into each round's result as that round finalizes. Every
@@ -95,7 +178,7 @@ def attribution_summary(raw: RawEventStore) -> AttributionSummary:
     # (measured: the eight rounds of a real batch report `events_received`
     # 1640670, 1640672, 1640674, ... - the same counter at eight instants).
     # The session total is the LAST snapshot, i.e. the maximum.
-    session_total = 0
+    session_parse, session_gaps = 0, 0
     for res in raw.round_results():
         blob = res.get("metrics_json")
         if not blob:
@@ -105,12 +188,22 @@ def attribution_summary(raw: RawEventStore) -> AttributionSummary:
         except json.JSONDecodeError:
             continue
         m = metrics.get("session_metrics") or metrics
-        session_total = max(session_total, int(m.get("parse_failures") or 0))
+        session_parse = max(session_parse, int(m.get("parse_failures") or 0))
+        session_gaps = max(session_gaps, int(m.get("data_gaps") or 0))
+
+    # Compare like with like. A capture with three uncounted parse failures
+    # and five well-attributed gaps is NOT fully attributed, however many
+    # records it has in total.
+    recorded_parse = sum(1 for a in attributions if a.source_event_type == "parse_failure")
+    recorded_gaps = sum(1 for a in attributions if a.source_event_type == "data_gap")
+    unrecorded = (max(0, session_parse - recorded_parse)
+                  + max(0, session_gaps - recorded_gaps))
 
     return AttributionSummary(
         attributions=tuple(attributions),
-        session_failure_count=session_total,
+        session_failure_count=session_parse + session_gaps,
         all_round_ids=tuple(raw.round_ids()),
+        unrecorded_count=unrecorded,
     )
 
 

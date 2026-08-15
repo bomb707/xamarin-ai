@@ -73,19 +73,26 @@ def build_gate_a_dataset(
     *,
     out_store: EventStore | None = None,
     grid: tuple[float, ...] | None = None,
-    eligibility: dict[str, RoundEligibility] | None = None,
 ) -> GateADataset:
     """Raw capture in, training examples out, eligibility enforced throughout.
 
-    `eligibility` may be supplied when it has already been computed (the
-    projection pass is expensive and the continuous-capture index caches
-    it); it is still ENFORCED rather than trusted as a filter - an
-    ineligible round passed in here is excluded, not accepted.
+    Gate A.0.2 item 4: there is deliberately NO `eligibility=` parameter.
+
+    A.0.1 accepted a caller-supplied map "as a cache", enforcing it rather
+    than trusting it as a filter - but that distinction does not survive
+    contact with a caller who simply constructs
+    `RoundEligibility(training_eligible=True)`. A plain dict is an
+    assertion, not evidence, and an invariant that any caller can assert
+    their way past is not an invariant. Eligibility is therefore always
+    derived HERE, from the raw capture, by the same code the preflight runs.
+
+    The cost is real - `evaluate_capture` projects every round for item 3's
+    verification, about nine seconds each - and it is the price of the
+    guarantee. Callers who want the verdicts without the dataset should call
+    `evaluate_capture(raw)` directly and read them; what they cannot do is
+    hand a verdict back in and have it believed.
     """
-    records = (
-        list(eligibility.values()) if eligibility is not None else evaluate_capture(raw)
-    )
-    by_round = {r.round_id: r for r in records}
+    by_round = {r.round_id: r for r in evaluate_capture(raw)}
 
     store = out_store or EventStore(":memory:", provenance=DataProvenance.REAL_REPLAY)
     included: list[str] = []

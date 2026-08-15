@@ -18,6 +18,7 @@ to prove which code produced a capture at all (item 6).
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 import types
 
@@ -43,6 +44,7 @@ from xamarinbot.realtime.attribution import (
 from xamarinbot.realtime.identity import (
     LEGACY_RECORDER,
     POST_A0_1_RECORDER,
+    POST_A0_2_RECORDER,
     RECORDER_SCHEMA_VERSION,
     RecorderIdentity,
     legacy_identity,
@@ -197,10 +199,19 @@ def test_the_required_window_includes_the_pre_round_lookback():
 # ============ item 1 / test 2: unattributed cannot look clean ============
 
 def _summary(attributions, session_count, rounds=("round-A", "round-B", "round-C")):
+    """Mirror `preflight.attribution_summary`'s arithmetic on hand-built
+    records: unrecorded failures are counted PER KIND, so gap records cannot
+    account for parse failures (Gate A.0.2 item 3)."""
+    records = tuple(
+        dataclasses.replace(a, source_event_type=a.source_event_type or "parse_failure")
+        for a in attributions
+    )
+    recorded_parse = sum(1 for a in records if a.source_event_type == "parse_failure")
     return AttributionSummary(
-        attributions=tuple(attributions),
+        attributions=records,
         session_failure_count=session_count,
         all_round_ids=tuple(rounds),
+        unrecorded_count=max(0, session_count - recorded_parse),
     )
 
 
@@ -591,7 +602,7 @@ def test_the_recorder_identity_carries_the_loaded_git_sha():
     identity = RecorderIdentity.capture()
     assert identity.recorder_code_sha, "a git checkout must yield a SHA"
     assert len(identity.recorder_code_sha) == 40
-    assert identity.recorder_generation == POST_A0_1_RECORDER
+    assert identity.recorder_generation == POST_A0_2_RECORDER
     assert identity.recorder_schema_version == RECORDER_SCHEMA_VERSION
 
 
@@ -632,7 +643,7 @@ def test_a_capture_round_trips_its_recorder_identity(tmp_path):
     assert back.recorder_code_sha == identity.recorder_code_sha
     assert back.process_pid == identity.process_pid
     assert back.process_started_at == pytest.approx(identity.process_started_at)
-    assert back.recorder_generation == POST_A0_1_RECORDER
+    assert back.recorder_generation == POST_A0_2_RECORDER
     raw.close()
 
 
@@ -658,7 +669,7 @@ def test_legacy_and_post_fix_rounds_are_labelled_in_eligibility(tmp_path):
     ).recorder_generation == LEGACY_RECORDER
     assert evaluate_round(
         fixed, ROUND, verify_projection_run=False
-    ).recorder_generation == POST_A0_1_RECORDER
+    ).recorder_generation == POST_A0_2_RECORDER
 
 
 def test_legacy_identity_is_explicit_rather_than_none():
@@ -687,7 +698,7 @@ def test_index_rows_carry_the_recorder_code_sha(tmp_path, monkeypatch):
     row = raw_index_row(mod, db, tmp_path, monkeypatch)
     assert row["recorder_code_sha"] == identity.recorder_code_sha
     assert row["recorder_process_pid"] == identity.process_pid
-    assert row["recorder_generation"] == POST_A0_1_RECORDER
+    assert row["recorder_generation"] == POST_A0_2_RECORDER
     assert row["recorder_schema_version"] == RECORDER_SCHEMA_VERSION
 
 
