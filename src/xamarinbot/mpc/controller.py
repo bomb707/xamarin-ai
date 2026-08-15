@@ -17,6 +17,15 @@ correctly probability-weights the fill itself - this only affects the
 continuation estimate, not the immediate decision). The order book *depth*
 is NOT held fully fixed - see `_deplete_book` below; only holding depth
 fixed turned out to double-count consumed liquidity (see docs/PHASE_STATUS.md).
+
+Phase 12B Tranche 2.2 item 2: the hypothetical rollout tree (`_rollout`)
+has no exposure-transition model of its own - when real active exposure
+(pending takers, open makers) exists, `decide()` falls back to the plain
+risk-aware one-step decision entirely rather than exploring hypothetical
+future states without knowing how that exposure evolves. This keeps MPC
+EXPERIMENTAL/NON-PRODUCTION until real data validates whether the deeper
+rollout is worth a proper exposure-propagation model - see item 2's
+"prefer the simpler safe solution" instruction.
 """
 from __future__ import annotations
 
@@ -27,8 +36,10 @@ from xamarinbot.feeds.base import BookLevel, BookSnapshot
 from xamarinbot.mpc.config import MPCConfig
 from xamarinbot.mpc.scenario import TransitionModel
 from xamarinbot.mpc.types import MPCDecision
+from xamarinbot.optimizer.candidates import candidate_selection_score
 from xamarinbot.optimizer.controller import OneStepController
 from xamarinbot.optimizer.types import CandidateAction, OrderMode
+from xamarinbot.portfolio.exposure import RiskView
 from xamarinbot.portfolio.state import PortfolioState, Side
 from xamarinbot.regime.matrix import ActionPermissionMatrix, classify_seed_action
 from xamarinbot.regime.types import RegimeState
@@ -110,18 +121,34 @@ class MPCController:
         book_down: BookSnapshot | None,
         tick_size: float,
         is_fresh: bool,
+        risk_view: RiskView | None = None,
     ) -> MPCDecision:
+        """`risk_view` (Phase 12B Tranche 2.2 item 2) is forwarded into the
+        underlying one-step call for the IMMEDIATE action, exactly like
+        `OneStepController.decide` itself - the action MPC ultimately
+        returns must already be aggregate-risk-admissible, not merely
+        rejected by dispatch after winning selection here too. If real
+        active exposure is tracked in `risk_view` (pending takers or open
+        makers), the deeper rollout is skipped entirely and this risk-aware
+        one-step decision is returned directly (`used_fallback=True`) -
+        the hypothetical future states `_rollout` explores have no model
+        for how that exposure evolves, so exploring them without one would
+        silently ignore it exactly where it matters most."""
         start = time.monotonic()
         permitted = ActionPermissionMatrix.permitted_actions(classify_seed_action(regime_state))
-        base = self.one_step.decide(round_id, decision_ts, portfolio, q, permitted, book_up, book_down, tick_size, is_fresh)
+        base = self.one_step.decide(round_id, decision_ts, portfolio, q, permitted, book_up, book_down, tick_size, is_fresh, risk_view=risk_view)
 
         if self.cfg.horizon_steps <= 1:
             # Degenerate horizon (Phase 10 verification: "MPC action
             # equals one-step action in degenerate horizon") - no
             # continuation term, so total sequence value is just the
-            # candidate's own EV, same ranking Phase 8 already computed.
-            sequence_values = {c.action_id: c.delta_ev for c in base.candidates}
+            # candidate's own selection score, the same ranking Phase 8
+            # already computed.
+            sequence_values = {c.action_id: candidate_selection_score(c, self.one_step.cfg) for c in base.candidates}
             return MPCDecision(round_id, decision_ts, base.chosen, base.candidates, sequence_values, used_fallback=False, elapsed_ms=(time.monotonic() - start) * 1000.0)
+
+        if risk_view is not None and risk_view.combined_exposure.orders:
+            return MPCDecision(round_id, decision_ts, base.chosen, base.candidates, {}, used_fallback=True, elapsed_ms=(time.monotonic() - start) * 1000.0)
 
         deadline = start + self.cfg.time_budget_ms / 1000.0
         sequence_values: dict[str, float] = {}
@@ -141,7 +168,7 @@ class MPCController:
                         round_id, portfolio_after, next_state, q, book_up_after, book_down_after, tick_size, is_fresh,
                         self.cfg.horizon_steps - 1, deadline,
                     )
-                sequence_values[candidate.action_id] = candidate.delta_ev + continuation
+                sequence_values[candidate.action_id] = candidate_selection_score(candidate, self.one_step.cfg) + continuation
         except _DeadlineExceeded:
             # "Bound computation time; fall back to one-step controller if
             # deadline exceeded" - the plain Phase 8 decision, unmodified.
@@ -174,7 +201,7 @@ class MPCController:
 
         permitted = ActionPermissionMatrix.permitted_actions(classify_seed_action(regime_state))
         decision = self.one_step.decide(round_id, 0.0, portfolio, q, permitted, book_up, book_down, tick_size, is_fresh)
-        value = decision.chosen.delta_ev
+        value = candidate_selection_score(decision.chosen, self.one_step.cfg)
         if depth > 1:
             portfolio_after = _portfolio_after_candidate(portfolio, decision.chosen)
             book_up_after, book_down_after = _deplete_books_for_candidate(book_up, book_down, decision.chosen)

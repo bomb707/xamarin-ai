@@ -223,6 +223,68 @@ def test_risk_view_admits_rejects_on_spend_cap_breach():
 
 
 # --------------------------------------------------------------------------
+# Phase 12B Tranche 2.2 item 1: aggregate breach-recovery semantics - the
+# reviewer's exact counterexample (G_current=-50, g_min=-20, a hedge
+# improving to -25 must still be admissible even though -25 < -20, since
+# the aggregate envelope's own empty-fill subset would otherwise make
+# every recovery candidate permanently aggregate-invalid once breached).
+# --------------------------------------------------------------------------
+
+
+def test_risk_view_admits_recovery_candidate_when_it_does_not_worsen_the_aggregate_envelope():
+    confirmed = PortfolioState(U=0.0, D=50.0, C=50.0)  # G = min(0,50) - 50 = -50, already below g_min
+    g_min = -20.0
+    assert confirmed.G == -50.0
+
+    # Buying the underrepresented UP side (D=50 > U=0) raises min(U,D)
+    # once filled - worst_case_g's own "nothing new fills" subset still
+    # reproduces exactly worst_g_base=-50 (the pre-candidate G), so the
+    # candidate's inclusion can never make the aggregate envelope WORSE
+    # than -50, satisfying "does not worsen" even though the candidate's
+    # OWN if-filled G (-25) stays below g_min=-20.
+    hedge_candidate = ActiveOrderExposure(Side.UP, 50.0, 25.0)
+    only_hedge_fills = PortfolioState(U=50.0, D=50.0, C=75.0)
+    assert only_hedge_fills.G == -25.0  # sanity: the reviewer's own -50 -> -25 example
+
+    view = RiskView(confirmed)
+    assert view.admits(hedge_candidate, g_min, spend_cap=None, is_recovery_candidate=True)
+
+
+def test_risk_view_admits_rejects_recovery_candidate_that_would_worsen_the_aggregate_envelope():
+    confirmed = PortfolioState(C=50.0)  # G = -50
+    g_min = -20.0
+    # DOWN while U=D=0 doesn't raise min(U,D) at all (stays 0) but adds
+    # cost whenever it fills - genuinely worsens the worst case.
+    bad_candidate = ActiveOrderExposure(Side.DOWN, 10.0, 5.0)
+    view = RiskView(confirmed)
+    assert not view.admits(bad_candidate, g_min, spend_cap=None, is_recovery_candidate=True)
+
+
+def test_risk_view_admits_rejects_non_recovery_candidate_outright_while_aggregate_breached():
+    """"ALPHA remains prohibited while breached" applies at the aggregate
+    level too - is_recovery_candidate=False (an ALPHA-purpose candidate)
+    is rejected outright once worst_g_base < g_min, even for a candidate
+    that would itself improve G if it filled."""
+    confirmed = PortfolioState(U=0.0, D=50.0, C=50.0)  # G = -50, same as the "does not worsen" test above
+    g_min = -20.0
+    candidate = ActiveOrderExposure(Side.UP, 50.0, 25.0)  # the same genuinely-improving candidate as above
+    view = RiskView(confirmed)
+    assert not view.admits(candidate, g_min, spend_cap=None, is_recovery_candidate=False)
+
+
+def test_risk_view_admits_safe_mode_ordinary_g_min_floor_unaffected_by_recovery_flag():
+    """When NOT already breached (worst_g_base >= g_min), the ordinary
+    hard rule (worst_g_new >= g_min) still applies regardless of
+    is_recovery_candidate - the recovery relaxation only ever kicks in
+    once already below the floor."""
+    confirmed = PortfolioState()  # G = 0, safely above g_min
+    g_min = -20.0
+    candidate = ActiveOrderExposure(Side.UP, 1000.0, 500.0)  # would badly breach g_min if it fills
+    view = RiskView(confirmed)
+    assert not view.admits(candidate, g_min, spend_cap=None, is_recovery_candidate=True)
+
+
+# --------------------------------------------------------------------------
 # Phase 12B Tranche 2.1 item 2: aggregate position_limit enforcement -
 # previously only exposed via potential_up_position/potential_down_position
 # but never actually enforced inside admits().

@@ -753,6 +753,37 @@ reported to the user in earlier sessions:
   `V_cancel` no longer double-counts `edge_min` (moved to a proper
   `hold_eligible` threshold). Full detail (formulas, files, test list):
   `docs/PHASE_12B_AUDIT.md`'s Tranche 2.1 section.
+- **(Phase 12B Tranche 2.2 - final synthetic correctness closure)** Six
+  remaining gaps closed before synthetic strategy work stopped: the
+  aggregate `RiskView.admits()` g_min floor contradicted Tranche 2.1's
+  own breach-recovery allowance (every recovery candidate was
+  aggregate-invalid once already breached, since the worst-case
+  envelope's own empty-fill subset reproduces the pre-candidate G
+  exactly) - fixed with a two-mode envelope
+  (`is_recovery_candidate`/`is_recovery_purpose()`), matching
+  `_finalize`'s own `G_after > G_before` rule, and the identical
+  contradiction in `purpose_aware_max_execution_price`'s HEDGE/
+  BUFFER_BUILD price ceiling; `MPCController.decide()` now threads
+  `risk_view` into its immediate one-step call and shares one
+  `candidate_selection_score()` function with `OneStepController` (no
+  more silently duplicated/drifted objectives), falling back to the
+  plain risk-aware one-step decision whenever real active exposure
+  exists rather than exploring a hypothetical rollout tree with no model
+  for it; a new shared `TradingSession` (`execution/session.py`) now
+  owns confirmed portfolio state, taker/maker order lifecycle, and
+  RiskView-gated dispatch, with `ShadowRunner` fully migrated onto it
+  (previously the one execution engine still missing RiskView,
+  aggregate maker exposure, `OrderSupervisor`, and real open-order
+  tracking - makers resolved via an immediate Bernoulli draw instead);
+  BUFFER_BUILD's float-safety margin no longer discards a genuine
+  exact-exchange-minimum candidate; `tau=0` (a real "no time left") is
+  now distinguished from `tau=None` ("not supplied"), both in
+  `dynamic_maker_candidates` and `OneStepController.decide`'s own
+  signature; and the cancellation-hysteresis contract ("hysteresis
+  permits a slightly inferior HOLD, it does not make V_hold numerically
+  competitive with V_cancel") is now pinned down by an explicit test.
+  Full detail (formulas, files, test list): `docs/PHASE_12B_AUDIT.md`'s
+  Tranche 2.2 section.
 
 **Phase 7 demo limitation worth flagging (not a bug)**: `run_execution_simulator_demo.py`
 always reports 0 repriced orders. The synthetic generator emits book events

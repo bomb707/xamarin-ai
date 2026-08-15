@@ -406,6 +406,32 @@ def test_hysteresis_margin_prevents_thrashing_on_a_marginal_edge_dip():
     assert decision_with_margin.action is SupervisorActionType.HOLD
 
 
+def test_hysteresis_contract_intentionally_permits_a_raw_value_inferior_hold():
+    """Phase 12B Tranche 2.2 item 6: pins down the EXACT intended
+    contract, not just the observable outcome above. `hysteresis_margin`
+    is an incumbency bonus that widens `hold_eligible`'s THRESHOLD
+    (`effective_delta_ev >= edge_min - hysteresis_margin`) - it does not
+    make V_hold numerically competitive with V_cancel. So this scenario
+    must hold even though V_hold's own raw value (unweighted, no margin
+    baked into the value itself) is strictly LESS than V_cancel's -
+    hysteresis intentionally tolerates a "slightly inferior" HOLD within
+    the configured band, rather than only ever choosing HOLD when it
+    would win a raw value comparison anyway (which would make the margin
+    pointless)."""
+    cfg = SupervisorConfig(g_min=-1000.0, edge_min=0.0, min_tau_for_passive_s=0.0, min_action_interval_s=0.0, hysteresis_margin=1.0, cancel_cost=0.0)
+    tracked = _tracked(origin=STATE_A)
+    supervisor = OrderSupervisor(cfg)
+    supervisor.register(tracked)
+
+    current_delta_ev = -0.5
+    v_hold = value_hold(current_delta_ev, STATE_A, STATE_A, tau=200.0, cfg=cfg)
+    v_cancel = value_cancel(cfg)
+    assert v_hold < v_cancel, "sanity: V_hold's raw value is strictly worse than V_cancel's here"
+
+    decision = supervisor.review_order(tracked, now_ts=1.0, current_regime_state=STATE_A, current_delta_ev=current_delta_ev, current_g_after_if_fill=-1.0, tau=200.0, is_fresh=True)
+    assert decision.action is SupervisorActionType.HOLD, "hysteresis must still choose HOLD despite V_hold < V_cancel in raw value terms"
+
+
 def test_replace_wins_over_hold_only_once_the_new_tick_clears_the_churn_cost():
     """"Hold-vs-replace economic comparison": REPLACE must not win merely
     because a new tick exists - it has to beat V_hold (the order's

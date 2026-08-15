@@ -2494,3 +2494,146 @@ purpose-aware would be a materially larger change than requested here.
 Breach-recovery is enforced at the single-candidate `_finalize` layer,
 which is where every candidate is generated and where the
 purpose/before/after state is already available.
+
+**SUPERSEDED by Phase 12B Tranche 2.2 item 1** - the limitation above was
+itself a real contradiction (a strict `g_min` floor made every recovery
+candidate aggregate-invalid once already breached, since the envelope's
+own empty-fill subset reproduces the pre-candidate G exactly). `admits()`
+now takes an `is_recovery_candidate` flag and a two-mode envelope - see
+the Tranche 2.2 section below.
+
+# Tranche 2.2 — Implemented (final synthetic correctness closure)
+
+**Approved and implemented**, closing six remaining integration/math
+gaps before synthetic strategy work stops entirely and real-market-data
+collection begins. Full suite: 356 passed, 0 failed (up from 340 at the
+end of Tranche 2.1 - 16 new tests added across items 1-6's acceptance
+list).
+
+1. **Breach-recovery vs `RiskView.admits()` contradiction fixed**
+   (`portfolio/exposure.py`, `optimizer/candidates.py`): `admits()` now
+   computes `worst_g_base` (before the candidate) and `worst_g_new`
+   (with it) separately. SAFE mode (`worst_g_base >= g_min`): unchanged,
+   `worst_g_new >= g_min` required. RECOVERY mode (`worst_g_base <
+   g_min`): a new `is_recovery_candidate` flag (`is_recovery_purpose()`,
+   the same HEDGE/BUFFER_BUILD set `_finalize`'s own breach-recovery
+   check uses) - non-recovery (ALPHA) candidates rejected outright;
+   recovery candidates admitted iff `worst_g_new >= worst_g_base` (never
+   worsens the aggregate envelope), matching `_finalize`'s own `G_after >
+   G_before` rule. The exact reviewer counterexample (`G_current=-50,
+   g_min=-20`, a hedge improving to `-25`) is now admissible - proven
+   directly (`test_risk_view_admits_recovery_candidate_when_it_does_not_worsen_the_aggregate_envelope`)
+   and via a full integrated-controller test with a real `RiskView`
+   (`test_breach_recovery_candidate_survives_a_real_risk_view_and_beats_wait_when_partial`).
+   The SAME contradiction existed in `purpose_aware_max_execution_price`'s
+   HEDGE/BUFFER_BUILD price-ceiling formula (Tranche 2.1 item 4) -
+   `K_max` was always negative once breached, since it was computed
+   against the unreachable `g_min` too; fixed with the same `g_floor =
+   g_min if G_before >= g_min else G_before` substitution.
+2. **MPC risk/utility integration** (`mpc/controller.py`):
+   `MPCController.decide()` gained an optional `risk_view` parameter,
+   forwarded into the underlying `OneStepController.decide()` call for
+   the immediate action - the action MPC ultimately returns is already
+   aggregate-risk-admissible, not merely rejected by dispatch afterward.
+   A new `candidate_selection_score(candidate, cfg)` in
+   `optimizer/candidates.py` (`ΔEV + lambda_g*expected_delta_g -
+   selection_penalty`) is now the ONE function both
+   `OneStepController`'s own `argmax` and every value MPC computes from a
+   `CandidateAction` (`sequence_values`, `_rollout`'s per-level value) go
+   through - the prior draft's `sequence_value = candidate.delta_ev`
+   silently ignored `lambda_g`/`selection_penalty` entirely. Deeper
+   hypothetical rollouts (`horizon_steps > 1`) have no exposure-transition
+   model of their own; per the prompt's own "prefer the simpler safe
+   solution," `decide()` falls back to the plain risk-aware one-step
+   decision (`used_fallback=True`) whenever `risk_view` reports real
+   active exposure (pending takers or open makers), rather than exploring
+   hypothetical future states with no model for how that exposure
+   evolves. MPC remains labeled experimental/non-production in its own
+   module docstring until real data validates the deeper rollout.
+   `walkforward/ablations.py`'s MPC branch (#8) now also passes the same
+   shared `risk_view` used by every other dispatch path in that harness.
+3. **`TradingSession` - one shared execution/session component**
+   (new `src/xamarinbot/execution/session.py`): owns confirmed
+   `PortfolioState`, `TakerOrderQueue`, open maker orders (via
+   `OrderSupervisor`), `RiskView` construction, and every submit/cancel/
+   replace/expire operation - `risk_view()`, `resolve_ready_takers()`,
+   `review_open_orders()` (with an optional `on_decision` callback for
+   journaling), `dispatch()`. **`ShadowRunner` is fully migrated onto
+   it** - it previously had no `RiskView`, no aggregate maker exposure,
+   no `OrderSupervisor`, and resolved every maker candidate via an
+   immediate Bernoulli draw at submission instead of tracking it as a
+   genuinely open, reviewable, cancelable/replaceable order. Now it
+   constructs a `RiskView` every decision, passes it into
+   `OneStepController`, RiskView-admits every dispatch, tracks open
+   makers via `OrderSupervisor`, runs supervisor review on later
+   decision points, and only ever applies a taker fill at its own
+   resolved `matched_ts` - exactly the walk-forward supervisor-enabled
+   ablation arm's own execution stack. `scripts/run_order_supervisor_demo.py`
+   is migrated onto the same class. `walkforward/ablations.py`'s
+   `_run_controller_round` was **not** rewritten onto this specific class
+   in this pass (a materially larger, riskier restructure of a loop with
+   8 ablation-matrix-specific behavioral branches - supervisor-vs-not,
+   baseline-vs-controller, one-step-vs-MPC - all covered by 300+ existing
+   tests) but already shares every one of `TradingSession`'s own
+   underlying primitives (`ExecutionSimulator`, `TakerOrderQueue`,
+   `OrderSupervisor`, `RiskView`, `evaluate_replacement_plan`) - no
+   execution/risk logic is duplicated there, only loop/dispatch glue.
+4. **BUFFER_BUILD exact-minimum bug fixed**
+   (`optimizer/candidates.py::generate_buffer_build_candidates`): the
+   0.999 float-safety margin was applied to EVERY candidate quantity
+   uniformly, turning `raw_qty=taker_min_size=1.0` into `qty=0.999`,
+   which then failed its own `>= taker_min_size` check - silently
+   discarding the exact-exchange-minimum candidate whenever it was the
+   binding one. Quantities are now split into `exact_quantities`
+   (exchange minimum, interior small-quantity-grid points, depth points
+   strictly below the feasible ceiling - never margined) and
+   `boundary_quantities` (the parity/risk/spend ceiling itself - margined
+   by 0.999, as before). A candidate at exactly the exchange minimum
+   survives whenever its own `ΔG > 0`.
+5. **`tau=0` semantic ambiguity fixed** (`optimizer/candidates.py`,
+   `optimizer/controller.py`): `tau` is now `float | None` throughout the
+   dynamic-maker path - `None` means "not supplied / unknown" (inert, no
+   time constraint applied, matching every existing caller that never
+   passed it); a real `tau=0.0` now means "no remaining time at all" and
+   suppresses maker generation entirely, no longer silently conflated
+   with "unknown" by both defaulting to and special-casing `0.0`. TTL
+   computation reordered (volatility damping + 1.0 floor, THEN the `tau`
+   cap applied last) so `TTL <= tau` holds unconditionally whenever `tau`
+   is known, even in the case where the floor would otherwise push it
+   above a small positive `tau`.
+6. **Hysteresis contract pinned down explicitly**
+   (`tests/test_supervisor.py`): a new test computes `value_hold`/
+   `value_cancel` directly and asserts HOLD is still chosen even though
+   `V_hold`'s own raw value is strictly less than `V_cancel`'s - stating
+   the contract explicitly (hysteresis widens `hold_eligible`'s
+   threshold, tolerating a "slightly inferior" HOLD within the configured
+   band; it does not make `V_hold` numerically competitive with
+   `V_cancel`) rather than leaving the prior test's outcome-only
+   assertion to imply it accidentally.
+
+**Files changed:** `src/xamarinbot/portfolio/exposure.py`,
+`src/xamarinbot/optimizer/candidates.py`, `src/xamarinbot/mpc/
+controller.py`, `src/xamarinbot/optimizer/controller.py` (new
+`risk_view`/`tau: float | None` semantics already present from Tranche
+2.1, `is_recovery_candidate` wiring added here), new
+`src/xamarinbot/execution/session.py`, `src/xamarinbot/shadow/runner.py`
+(rewritten), `scripts/run_order_supervisor_demo.py` (rewritten),
+`src/xamarinbot/walkforward/ablations.py` (MPC `risk_view` wiring only),
+`tests/{test_exposure,test_optimizer,test_mpc,test_shadow,
+test_supervisor}.py`, this file, `docs/PHASE_STATUS.md`.
+
+**Remaining limitations**: `walkforward/ablations.py`'s
+`_run_controller_round` was not migrated onto `TradingSession` in this
+pass (see item 3 above - a scope-limiting decision, not an oversight).
+MPC's deeper rollout (`horizon_steps > 1`) still has no model for how
+active exposure evolves across hypothetical future states - it avoids
+the problem via the "fall back to one-step" rule rather than solving it;
+MPC stays experimental/non-production. No parameter introduced across
+this pass was fit or selected against this repository's synthetic PnL.
+
+Per the reviewer's explicit instruction, synthetic strategy development
+stops here. The next stage is a real market recorder and event-level
+shadow dataset against actual Polymarket BTC 5-minute markets, from which
+`q`, `rho`, `q_fill`, slippage, latency, and adverse-selection can
+finally be estimated from real data rather than further synthetic
+tuning.

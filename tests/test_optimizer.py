@@ -27,6 +27,7 @@ from xamarinbot.optimizer.candidates import (
 from xamarinbot.optimizer.config import OneStepConfig
 from xamarinbot.optimizer.controller import OneStepController
 from xamarinbot.optimizer.types import OrderMode
+from xamarinbot.portfolio.exposure import RiskView
 from xamarinbot.portfolio.math import OrderPurpose, delta_g_directional, directional_projected_g
 from xamarinbot.portfolio.state import FeeConfig, LiquidityRole, PortfolioState, Side
 from xamarinbot.regime.types import SeedAction
@@ -590,6 +591,22 @@ def test_buffer_build_candidate_quantities_are_all_individually_delta_g_positive
         assert delta_g > -1e-6
 
 
+def test_buffer_build_generates_a_valid_candidate_when_max_feasible_equals_exact_exchange_minimum():
+    """Phase 12B Tranche 2.2 item 4 regression: when the parity gap (x0)
+    itself equals exactly cfg.taker_min_size, the resulting max_feasible
+    quantity is exactly the exchange minimum - applying the 0.999 float-
+    safety margin uniformly to every candidate (the prior bug) turned
+    `raw_qty=taker_min_size=1.0` into `qty=0.999`, which then failed its
+    own >= taker_min_size check, silently discarding a genuinely
+    delta_g>0-feasible candidate at exactly the exchange minimum."""
+    portfolio = PortfolioState(U=0.0, D=1.0, C=0.0)  # x0 = D - U = 1.0 = taker_min_size exactly
+    cfg = OneStepConfig(g_min=-1_000_000.0, taker_min_size=1.0)
+    asks_up = (BookLevel(0.10, 500.0),)
+    candidates = generate_buffer_build_candidates("buffer_build", portfolio, asks_up, (), q=0.5, fee_config=FEE, cfg=cfg)
+    assert candidates, "a valid candidate must still exist at the exact exchange minimum when its ΔG is positive"
+    assert any(c.qty >= cfg.taker_min_size - 1e-6 for c in candidates), "the exact-minimum candidate must not be margined below the exchange minimum"
+
+
 # --------------------------------------------------------------------------
 # Phase 12B Tranche 2.1 item 4: purpose-aware execution price ceilings must
 # guarantee their repair target survives even at the worst allowed price
@@ -622,13 +639,23 @@ def test_hedge_price_ceiling_guarantees_g_min_survives_at_the_worst_allowed_pric
     assert g_after >= cfg.g_min - 1e-6, "even filling the full hedge quantity at the worst allowed price, G_min must survive"
 
 
-def test_hedge_candidate_never_uses_unconstrained_limit_price():
+def test_hedge_candidate_price_ceiling_is_derived_not_a_hardcoded_1_0():
+    """HEDGE only ever generates a candidate once already below the floor
+    (SS17's own precondition), so its price ceiling is computed in
+    breach-recovery mode (Tranche 2.2 item 1) - within the pre-parity
+    region, "must not worsen G" mathematically reduces to a $1.00/share
+    ceiling (buying the scarce side raises min(U,D) exactly 1-for-1
+    there), so a ceiling that computes out to 1.0 is not itself a bug.
+    What item 4 actually requires is that the ceiling comes from real
+    portfolio math, not a hardcoded bypass - proven here via spend_cap,
+    which must visibly tighten the derived ceiling below 1.0 when it's
+    the binding constraint, something a hardcoded 1.0 could never do."""
     portfolio = PortfolioState(U=190.0, D=0.0, C=100.0)  # Pi_U=90, Pi_D=-100 - a real hedge is needed
-    cfg = OneStepConfig(g_min=-10.0)
+    cfg = OneStepConfig(g_min=-10.0, spend_cap=150.0)
     hedge = generate_hedge_candidate("hedge", portfolio, (), (BookLevel(0.40, 500.0),), q=0.5, fee_config=FEE, cfg=cfg)
     assert hedge is not None
     assert hedge.max_execution_price is not None
-    assert hedge.max_execution_price < 1.0, "HEDGE must never submit at an effectively unconstrained limit_price=1.0"
+    assert hedge.max_execution_price < 1.0, "spend_cap must visibly bind the derived ceiling, proving it isn't a hardcoded 1.0"
 
 
 # --------------------------------------------------------------------------
@@ -681,6 +708,36 @@ def test_breach_recovery_hard_rule_unaffected_when_not_already_in_breach():
     assert "breach_recovery_no_improvement" not in candidate.violated_constraints  # not the breach-recovery path at all
 
 
+def test_breach_recovery_candidate_survives_a_real_risk_view_and_beats_wait_when_partial():
+    """Phase 12B Tranche 2.2 item 1's required integrated test (not just a
+    _finalize()-level unit test): confirmed G < g_min, a partial repair
+    that cannot fully restore g_min in one fill, and the controller
+    receiving a REAL RiskView (not None). The recovery candidate must
+    remain valid - not aggregate-rejected by the empty-fill-subset
+    contradiction item 1 fixes - and must beat WAIT once its risk
+    improvement is weighted enough to matter."""
+    portfolio = PortfolioState(U=0.0, D=50.0, C=50.0)  # G = -50
+    cfg = OneStepConfig(g_min=-20.0, enable_buffer_build=True, lambda_g=1.0, taker_qty_step=10.0)
+    controller = OneStepController(cfg, ExecutionConfig(), FEE)
+    book_up = BookSnapshot(Side.UP, bids=(), asks=(BookLevel(0.50, 500.0),), ts=0.0, recv_ts=0.0)
+    book_down = BookSnapshot(Side.DOWN, bids=(), asks=(), ts=0.0, recv_ts=0.0)
+    risk_view = RiskView(portfolio)  # a REAL RiskView, no other pending exposure
+
+    decision = controller.decide(
+        "r0", 10.0, portfolio, q=0.5, permitted_actions=frozenset({SeedAction.WAIT}),
+        book_up=book_up, book_down=book_down, tick_size=0.01, is_fresh=True, risk_view=risk_view,
+    )
+
+    buffer_candidates = [c for c in decision.candidates if c.purpose is OrderPurpose.BUFFER_BUILD]
+    assert buffer_candidates, "expected at least one BUFFER_BUILD candidate even while already below g_min"
+    best = max(buffer_candidates, key=lambda c: c.g_after)
+    assert best.g_after > portfolio.G, "sanity: the best repair candidate does improve G"
+    assert best.g_after < cfg.g_min, "sanity: it still doesn't fully restore g_min in one fill"
+    assert best.is_valid, "a partial repair improving G must not be aggregate-rejected by RiskView"
+    assert decision.chosen.mode is not OrderMode.WAIT, "the recovery candidate must beat WAIT once its G improvement is weighted enough"
+    assert decision.chosen.purpose is OrderPurpose.BUFFER_BUILD
+
+
 # --------------------------------------------------------------------------
 # Phase 12B Tranche 2.1 item 6: maker expected_delta_g is rho-weighted.
 # --------------------------------------------------------------------------
@@ -724,7 +781,7 @@ class _RejectAboveQty:
     def __init__(self, reject_above_qty: float):
         self.reject_above_qty = reject_above_qty
 
-    def admits(self, candidate, g_min, spend_cap, position_limit=None, exact_subset_cap=10):
+    def admits(self, candidate, g_min, spend_cap, position_limit=None, is_recovery_candidate=False, exact_subset_cap=10):
         return candidate.max_fill_qty <= self.reject_above_qty
 
 
@@ -891,6 +948,33 @@ def test_dynamic_maker_candidates_generates_nothing_when_remaining_time_below_mi
     portfolio = PortfolioState()
     specs = dynamic_maker_candidates(q=0.6, side=Side.UP, tau=1.0, sigma=0.0, portfolio=portfolio, best_bid=0.48, best_ask=0.50, tick_size=0.01, fee_config=FEE, cfg=cfg)
     assert specs == []
+
+
+def test_dynamic_maker_candidates_tau_none_unconstrained_but_tau_zero_suppresses():
+    """Phase 12B Tranche 2.2 item 5: `tau=None` ("not supplied / unknown")
+    must NOT suppress maker generation, but `tau=0.0` (a REAL, supplied
+    "no remaining time") must - the two were previously conflated by
+    defaulting `tau` to `0.0`, which made a genuine zero indistinguishable
+    from "the caller didn't pass anything."""
+    cfg = OneStepConfig(g_min=-1_000_000.0, min_maker_ttl_s=0.0)
+    portfolio = PortfolioState()
+
+    unconstrained = dynamic_maker_candidates(q=0.6, side=Side.UP, tau=None, sigma=0.0, portfolio=portfolio, best_bid=0.48, best_ask=0.50, tick_size=0.01, fee_config=FEE, cfg=cfg)
+    assert unconstrained, "tau=None (unknown) must not suppress maker candidate generation"
+
+    suppressed = dynamic_maker_candidates(q=0.6, side=Side.UP, tau=0.0, sigma=0.0, portfolio=portfolio, best_bid=0.48, best_ask=0.50, tick_size=0.01, fee_config=FEE, cfg=cfg)
+    assert suppressed == [], "tau=0.0 (a real, supplied zero remaining time) must suppress maker generation entirely"
+
+
+def test_dynamic_maker_candidates_ttl_le_tau_holds_even_when_the_floor_would_otherwise_exceed_it():
+    """"Always guarantee TTL<=tau" (item 5): even when the volatility-
+    damped TTL, floored at 1.0, would otherwise exceed a small positive
+    tau, the tau cap must be applied LAST so the guarantee always holds."""
+    cfg = OneStepConfig(g_min=-1_000_000.0, maker_horizon_s=1.0, min_maker_ttl_s=0.0)
+    portfolio = PortfolioState()
+    specs = dynamic_maker_candidates(q=0.6, side=Side.UP, tau=0.5, sigma=0.0, portfolio=portfolio, best_bid=0.48, best_ask=0.50, tick_size=0.01, fee_config=FEE, cfg=cfg)
+    assert specs
+    assert all(c.ttl_s <= 0.5 for c in specs), "TTL must never exceed tau, even when the 1.0 floor would otherwise push it above a smaller tau"
 
 
 def test_dynamic_maker_controller_wiring_is_off_by_default_and_matches_fixed_constants():

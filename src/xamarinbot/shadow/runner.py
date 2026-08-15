@@ -35,7 +35,7 @@ from xamarinbot.events.replay import ReplayClock
 from xamarinbot.events.store import EventStore
 from xamarinbot.events.types import EventType
 from xamarinbot.execution.config import ExecutionConfig
-from xamarinbot.execution.simulator import ExecutionSimulator, TakerOrderQueue
+from xamarinbot.execution.session import TradingSession
 from xamarinbot.features.config import FeatureConfig
 from xamarinbot.features.engine import compute
 from xamarinbot.features.types import FeatureVector
@@ -46,8 +46,8 @@ from xamarinbot.model.logistic import LogisticModel
 from xamarinbot.optimizer.candidates import wait_candidate
 from xamarinbot.optimizer.config import OneStepConfig
 from xamarinbot.optimizer.controller import OneStepController
-from xamarinbot.optimizer.types import CandidateAction, OrderMode
-from xamarinbot.portfolio.state import Fill, FeeConfig, LiquidityRole, PortfolioState, Side, apply_fill
+from xamarinbot.optimizer.types import CandidateAction
+from xamarinbot.portfolio.state import FeeConfig, Side
 from xamarinbot.regime.classifier import RegimeClassifier
 from xamarinbot.regime.matrix import ActionPermissionMatrix, classify_seed_action
 from xamarinbot.shadow.config import ShadowConfig
@@ -132,13 +132,17 @@ class ShadowRunner:
         revalidation_book_feed = MockBookFeed(revalidation_cursor)
         regime_clf = RegimeClassifier(round_id=self.round_id)
         one_step = OneStepController(self.one_step_cfg, self.exec_cfg, self.fee_config)
-        sim = ExecutionSimulator(self.round_id, self.fee_config, self.exec_cfg)
-        queue = TakerOrderQueue(sim)
-        portfolio = PortfolioState()
+        # Phase 12B Tranche 2.2 item 3: the same shared execution/session
+        # engine the supervisor-enabled walk-forward ablation arm uses -
+        # RiskView-gated dispatch, open makers tracked (never an immediate
+        # Bernoulli draw at submission), reviewed/canceled/replaced via
+        # OrderSupervisor on later decision points, taker fills only ever
+        # applied at their own resolved matched_ts. ShadowRunner is no
+        # longer a separately-maintained, simplified execution engine.
+        session = TradingSession(self.round_id, self.fee_config, self.exec_cfg, self.one_step_cfg)
         records: list[ShadowDecisionRecord] = []
         n_reconnects = 0
         n_missed = 0
-        order_seq = 0
         pending_reconnect_ack = False
 
         market_config = next(e.payload for e in events if e.event_type is EventType.MARKET_CONFIG)
@@ -152,9 +156,7 @@ class ShadowRunner:
         for decision_ts in clock.decision_points(heartbeat=self.cfg.heartbeat_s):
             live_cursor.advance_to(decision_ts)
 
-            for pending, taker_result in queue.resolve_ready(decision_ts, _book_at):
-                if taker_result.walk.filled_shares > 0:
-                    portfolio = apply_fill(portfolio, Fill(pending.side, taker_result.walk.avg_price, taker_result.walk.filled_shares, LiquidityRole.TAKER, taker_result.walk.total_fee))
+            session.resolve_ready_takers(decision_ts, _book_at)
 
             if self.fault.should_disconnect(decision_ts):
                 # Simulated outage: this decision point is skipped entirely
@@ -183,39 +185,26 @@ class ShadowRunner:
             q = self.model.predict_proba(vec) if (self.model is not None and vec is not None) else 0.5
             permitted = ActionPermissionMatrix.permitted_actions(classify_seed_action(snapshot.state))
 
-            decision = one_step.decide(self.round_id, decision_ts, portfolio, q, permitted, book_up, book_down, tick_size, True)
+            # Review every open maker order (cancel/replace/expire) against
+            # this decision point's fresh economics before generating a new
+            # candidate - the same ordering the supervisor-enabled ablation
+            # arm uses.
+            session.review_open_orders(decision_ts, snapshot.state, q, book_up, book_down, fv.tau, True, tick_size)
+
+            risk_view = session.risk_view()
+            decision = one_step.decide(self.round_id, decision_ts, session.portfolio, q, permitted, book_up, book_down, tick_size, True, risk_view=risk_view)
             elapsed_ms = (time.perf_counter() - t0) * 1000.0
             missed = elapsed_ms > self.cfg.decision_deadline_ms
-            chosen = decision.chosen if not missed else wait_candidate("wait", portfolio)
+            chosen = decision.chosen if not missed else wait_candidate("wait", session.portfolio)
             if missed:
                 n_missed += 1
 
             records.append(_record_for(self.round_id, decision_ts, chosen, elapsed_ms, missed, pending_reconnect_ack))
             pending_reconnect_ack = False
 
-            if chosen.mode is OrderMode.FAK and chosen.qty > 0 and not queue.has_pending:
-                # Phase 12B audit items 13/E/L, Tranche 1.2 items 1/2/5:
-                # real submit->(delay)->resolve lifecycle via the shared
-                # TakerOrderQueue, not a direct pre-evaluation-walk-to-Fill
-                # shortcut, and never resolved/mutated before matched_ts.
-                # `not queue.has_pending` is the conservative item 5
-                # admission gate: at most one PENDING_DELAY taker at a time.
-                order_seq += 1
-                asks = book_up.asks if chosen.side is Side.UP else book_down.asks
-                limit_price = chosen.max_execution_price if chosen.max_execution_price is not None else chosen.price
-                pending = queue.try_submit(f"{self.round_id}-o{order_seq}", chosen.side, chosen.qty, limit_price, asks, decision_ts)
-                if pending is not None and not pending.was_delayed:
-                    taker_result = sim.resolve_taker(pending)
-                    if taker_result.walk.filled_shares > 0:
-                        portfolio = apply_fill(portfolio, Fill(chosen.side, taker_result.walk.avg_price, taker_result.walk.filled_shares, LiquidityRole.TAKER, taker_result.walk.total_fee))
-            elif chosen.mode is OrderMode.POST_ONLY:
-                order_seq += 1
-                order_state = sim.submit_maker_order(f"{self.round_id}-o{order_seq}", chosen.side, chosen.qty, chosen.price, decision_ts)
-                draw = sim.draw_maker_fill(order_state, 0.0, 0.0, chosen.ttl_s or self.one_step_cfg.maker_horizon_s)
-                if draw.filled:
-                    portfolio = apply_fill(portfolio, Fill(chosen.side, chosen.price, chosen.qty, LiquidityRole.MAKER, 0.0))
+            session.dispatch(chosen, decision_ts, snapshot.state, q, book_up, book_down)
 
         return ShadowRoundResult(
-            round_id=self.round_id, records=tuple(records), final_portfolio=portfolio,
+            round_id=self.round_id, records=tuple(records), final_portfolio=session.portfolio,
             n_reconnects=n_reconnects, n_missed_deadlines=n_missed,
         )

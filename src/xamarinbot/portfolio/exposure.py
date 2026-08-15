@@ -251,7 +251,8 @@ class RiskView:
 
     def admits(
         self, candidate: ActiveOrderExposure, g_min: float, spend_cap: float | None,
-        position_limit: float | None = None, exact_subset_cap: int = DEFAULT_EXACT_SUBSET_CAP,
+        position_limit: float | None = None, is_recovery_candidate: bool = False,
+        exact_subset_cap: int = DEFAULT_EXACT_SUBSET_CAP,
     ) -> bool:
         """Would admitting `candidate` (as one more active order,
         alongside every order already tracked in this view) ever risk a
@@ -268,11 +269,41 @@ class RiskView:
         side's potential position can only ever grow as more orders on
         that side fill (no non-monotonic min() interaction), so "every
         order on this side fills" genuinely is the worst (and only
-        relevant) case for a position ceiling."""
+        relevant) case for a position ceiling.
+
+        `is_recovery_candidate` (Phase 12B Tranche 2.2 item 1) fixes a
+        real contradiction with `_finalize`'s breach-recovery semantics
+        (`optimizer/candidates.py`): the aggregate worst-case envelope's
+        own subset enumeration includes the empty-fill subset, so once
+        `worst_case_g` (BEFORE this candidate) is already below `g_min`,
+        `worst_g >= g_min` can never hold again no matter what the
+        candidate does - literally every recovery candidate would be
+        aggregate-rejected, contradicting `_finalize`'s explicit
+        allowance for a partial repair that improves G without fully
+        restoring it. Two modes, matching `_finalize` exactly:
+
+          - SAFE (worst_g_base >= g_min): preserve the ordinary hard
+            rule, worst_g_new >= g_min, for every candidate regardless
+            of purpose.
+          - RECOVERY (worst_g_base < g_min): a non-recovery candidate
+            (`is_recovery_candidate=False` - the caller's own ALPHA-vs-
+            HEDGE/BUFFER_BUILD purpose check) is rejected outright -
+            "ALPHA remains prohibited while breached" applies at the
+            aggregate level too, not just the single-candidate one. A
+            recovery candidate is admitted iff it does not WORSEN the
+            aggregate envelope: worst_g_new >= worst_g_base."""
         combined_orders = self.combined_exposure.orders + (candidate,)
-        worst_g = PendingExposure(orders=combined_orders).worst_case_g(self.confirmed_portfolio, exact_subset_cap)
-        if worst_g < g_min:
-            return False
+        worst_g_new = PendingExposure(orders=combined_orders).worst_case_g(self.confirmed_portfolio, exact_subset_cap)
+        worst_g_base = self.worst_case_g
+
+        if worst_g_base >= g_min:
+            if worst_g_new < g_min:
+                return False
+        else:
+            if not is_recovery_candidate:
+                return False
+            if worst_g_new < worst_g_base:
+                return False
         if spend_cap is not None:
             total_worst_spend = self.confirmed_portfolio.C + sum(o.max_cost for o in combined_orders)
             if total_worst_spend > spend_cap:

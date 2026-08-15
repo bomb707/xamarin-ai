@@ -12,9 +12,11 @@ from xamarinbot.feeds.base import BookLevel, BookSnapshot
 from xamarinbot.mpc.config import MPCConfig
 from xamarinbot.mpc.controller import MPCController, _deplete_book, _portfolio_after_candidate
 from xamarinbot.mpc.scenario import TransitionModel, build_transition_model
+from xamarinbot.optimizer.candidates import candidate_selection_score
 from xamarinbot.optimizer.config import OneStepConfig
 from xamarinbot.optimizer.controller import OneStepController
 from xamarinbot.optimizer.types import CandidateAction, OrderMode
+from xamarinbot.portfolio.exposure import ActiveOrderExposure, PendingExposure, RiskView
 from xamarinbot.portfolio.math import OrderPurpose
 from xamarinbot.portfolio.state import FeeConfig, PortfolioState, Side
 from xamarinbot.regime.matrix import ActionPermissionMatrix, classify_seed_action
@@ -270,3 +272,89 @@ def test_portfolio_after_down_fill_reconstructs_exact_state():
     assert math.isclose(result.U, expected.U)
     assert math.isclose(result.D, expected.D)
     assert math.isclose(result.C, expected.C)
+
+
+# --------------------------------------------------------------------------
+# Phase 12B Tranche 2.2 item 2: MPC risk/utility integration
+# --------------------------------------------------------------------------
+
+
+def test_mpc_immediate_decision_respects_risk_view():
+    """The action MPC ultimately returns must already be aggregate-risk-
+    admissible - risk_view is forwarded into the underlying one-step call
+    for the immediate action, not merely consulted at some later dispatch
+    step with nothing to fall back to."""
+    one_step = _one_step()
+    mpc = MPCController(MPCConfig(horizon_steps=1), TransitionModel(probabilities={}), one_step)
+    portfolio = PortfolioState()
+
+    unconstrained = mpc.decide("r0", 10.0, portfolio, 0.9, REGIME_A, BOOK_UP, BOOK_DOWN, 0.01, True)
+    assert unconstrained.chosen.mode is not OrderMode.WAIT, "sanity: without a risk_view, MPC picks a real trade"
+
+    # A RiskView that rejects every candidate must force MPC back to WAIT,
+    # exactly like OneStepController.decide's own pre-selection check.
+    class _RejectEverything:
+        def admits(self, candidate, g_min, spend_cap, position_limit=None, is_recovery_candidate=False, exact_subset_cap=10):
+            return False
+
+    constrained = mpc.decide("r0", 10.0, portfolio, 0.9, REGIME_A, BOOK_UP, BOOK_DOWN, 0.01, True, risk_view=_RejectEverything())
+    assert constrained.chosen.mode is OrderMode.WAIT, "a RiskView rejecting everything must force MPC's immediate decision to WAIT too"
+
+
+def test_mpc_sequence_value_uses_the_same_candidate_selection_score_as_one_step():
+    """Phase 12B Tranche 2.2 item 2: MPC's immediate sequence value must
+    not silently duplicate/diverge from OneStepController's own objective
+    - the prior draft used `sequence_value = candidate.delta_ev` alone,
+    ignoring lambda_g and selection_penalty entirely."""
+    cfg = OneStepConfig(g_min=-1000.0, edge_min=0.0, lambda_g=0.37)  # nonzero lambda_g so the two formulas provably differ if not shared
+    one_step = OneStepController(cfg, ExecutionConfig(), FEE)
+    mpc = MPCController(MPCConfig(horizon_steps=1), TransitionModel(probabilities={}), one_step)
+    portfolio = PortfolioState()
+
+    decision = mpc.decide("r0", 10.0, portfolio, 0.65, REGIME_A, BOOK_UP, BOOK_DOWN, 0.01, True)
+    assert decision.sequence_values
+    for c in decision.candidates:
+        if c.action_id in decision.sequence_values:
+            expected = candidate_selection_score(c, cfg)
+            assert math.isclose(decision.sequence_values[c.action_id], expected), f"{c.action_id}: {decision.sequence_values[c.action_id]} != {expected}"
+            if not math.isclose(c.expected_delta_g, 0.0):
+                assert not math.isclose(decision.sequence_values[c.action_id], c.delta_ev), "sanity: with nonzero lambda_g this must differ from plain delta_ev"
+
+
+def test_mpc_falls_back_to_risk_aware_one_step_when_real_active_exposure_exists():
+    """Phase 12B Tranche 2.2 item 2: rather than inventing a pending-order
+    exposure transition model for the hypothetical rollout tree, MPC
+    falls back entirely to the risk-aware one-step decision whenever
+    real active exposure (pending takers / open makers) is tracked in
+    risk_view - the deeper rollout has no model for how that exposure
+    evolves, so exploring it without one would silently ignore it."""
+    one_step = _one_step()
+    model = build_transition_model([RegimeTransition("r0", REGIME_A, REGIME_A, None, 1.0, 1.0)])
+    mpc = MPCController(MPCConfig(horizon_steps=3, time_budget_ms=5000.0), model, one_step)
+    portfolio = PortfolioState()
+
+    pending_order = ActiveOrderExposure(Side.UP, 50.0, 25.0)
+    risk_view = RiskView(portfolio, pending_taker_exposure=PendingExposure(orders=(pending_order,), potential_up_shares=50.0, max_committed_spend=25.0))
+    assert risk_view.combined_exposure.orders  # sanity: real active exposure is present
+
+    decision = mpc.decide("r0", 10.0, portfolio, 0.65, REGIME_A, BOOK_UP, BOOK_DOWN, 0.01, True, risk_view=risk_view)
+    assert decision.used_fallback, "MPC must fall back to the plain risk-aware one-step decision when real active exposure exists"
+
+    permitted = ActionPermissionMatrix.permitted_actions(classify_seed_action(REGIME_A))
+    base_decision = one_step.decide("r0", 10.0, portfolio, 0.65, permitted, BOOK_UP, BOOK_DOWN, 0.01, True, risk_view=risk_view)
+    assert decision.chosen.action_id == base_decision.chosen.action_id
+
+
+def test_mpc_does_not_fall_back_when_risk_view_has_no_active_exposure():
+    """Contrast case: a risk_view with zero pending/open orders (only
+    confirmed portfolio) must not trigger the active-exposure fallback -
+    the deeper rollout still runs normally."""
+    one_step = _one_step()
+    model = build_transition_model([RegimeTransition("r0", REGIME_A, REGIME_A, None, 1.0, 1.0)])
+    mpc = MPCController(MPCConfig(horizon_steps=3, time_budget_ms=5000.0), model, one_step)
+    portfolio = PortfolioState()
+    risk_view = RiskView(portfolio)  # no pending taker / open maker exposure at all
+
+    decision = mpc.decide("r0", 10.0, portfolio, 0.65, REGIME_A, BOOK_UP, BOOK_DOWN, 0.01, True, risk_view=risk_view)
+    assert not decision.used_fallback
+    assert decision.sequence_values

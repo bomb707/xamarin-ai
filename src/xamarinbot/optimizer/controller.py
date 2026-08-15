@@ -16,11 +16,13 @@ from xamarinbot.feeds.base import BookSnapshot
 from xamarinbot.optimizer.candidates import (
     MakerCandidateSpec,
     candidate_exposure,
+    candidate_selection_score,
     dynamic_maker_candidates,
     evaluate_maker_candidate,
     evaluate_taker_candidate,
     generate_buffer_build_candidates,
     generate_hedge_candidate,
+    is_recovery_purpose,
     maker_price_grid,
     taker_sizing_boundaries,
     wait_candidate,
@@ -83,16 +85,20 @@ class OneStepController:
         book_down: BookSnapshot | None,
         tick_size: float,
         is_fresh: bool,
-        tau: float = 0.0,
+        tau: float | None = None,
         sigma: float = 0.0,
         risk_view: RiskView | None = None,
     ) -> OneStepDecision:
-        """`tau`/`sigma` (Phase 12B Tranche 2D) are optional and default
-        to 0.0 - existing callers that don't pass them are unaffected,
-        since they're only consulted when `cfg.dynamic_maker=True`
-        (itself defaulting False). Callers that want dynamic maker
-        sizing should pass `tau=fv.tau, sigma=fv.realized_vol` from the
-        same `FeatureVector` already computed for `q`.
+        """`tau`/`sigma` (Phase 12B Tranche 2D) are optional - existing
+        callers that don't pass them are unaffected, since they're only
+        consulted when `cfg.dynamic_maker=True` (itself defaulting False).
+        Callers that want dynamic maker sizing should pass `tau=fv.tau,
+        sigma=fv.realized_vol` from the same `FeatureVector` already
+        computed for `q`. `tau` defaults to `None` (Phase 12B Tranche 2.2
+        item 5 - `None` means "not supplied," genuinely distinct from a
+        real `tau=0.0` "no remaining time," which now suppresses dynamic
+        maker generation entirely rather than being silently treated the
+        same as "unknown" - see `dynamic_maker_candidates`'s own docstring).
 
         `risk_view` (Phase 12B Tranche 2.1 items 2/3) is the caller's
         aggregate exposure (confirmed portfolio + pending takers + open
@@ -239,26 +245,26 @@ class OneStepController:
             for c in candidates:
                 if c.is_valid and c.mode is not OrderMode.WAIT:
                     exposure = candidate_exposure(c, self.fee_config)
-                    if exposure is not None and not risk_view.admits(exposure, self.cfg.g_min, self.cfg.spend_cap, self.cfg.position_limit):
+                    # Phase 12B Tranche 2.2 item 1: is_recovery_candidate
+                    # must be threaded through here too, or a HEDGE/
+                    # BUFFER_BUILD candidate _finalize already admitted as
+                    # a valid partial repair (G_before < g_min, G_after >
+                    # G_before) would be aggregate-rejected right back out
+                    # by RiskView's own g_min>=floor default - the exact
+                    # contradiction this item fixes.
+                    if exposure is not None and not risk_view.admits(
+                        exposure, self.cfg.g_min, self.cfg.spend_cap, self.cfg.position_limit,
+                        is_recovery_candidate=is_recovery_purpose(c.purpose),
+                    ):
                         c = replace(c, violated_constraints=c.violated_constraints + ("aggregate_risk",))
                 updated.append(c)
             candidates = updated
 
         valid = [c for c in candidates if c.is_valid]
-        # SS18: J = delta_ev + lambda_G*ExpectedDeltaG - selection_penalty
-        # (Phase 12B Tranche 2.1 item 6 correction). Earlier drafts used
-        # `c.g_after` here - the ABSOLUTE, if-filled worst-case G level,
-        # not a marginal quantity, and for makers specifically not even
-        # fill-probability-weighted (a maker's true expected risk
-        # contribution is `rho*delta_g`, not the full if-filled delta) -
-        # mixing that into an additive score with `delta_ev` (itself
-        # always a marginal quantity) was dimensionally/conceptually
-        # inconsistent. `c.expected_delta_g` is the corrected term: `ΔG`
-        # for a deterministic taker fill, `rho*ΔG` for a probabilistic
-        # maker fill, `0.0` for WAIT. lambda_g=0 (the default) reduces
-        # this to plain delta_ev ranking, identical to Phases 8-10.
-        # selection_penalty (Tranche 2C soft-regime mode) is 0.0 for every
-        # candidate unless cfg.soft_regime=True, so this is a no-op in the
-        # default/hard-gate configuration.
-        chosen = max(valid, key=lambda c: c.delta_ev + self.cfg.lambda_g * c.expected_delta_g - c.selection_penalty) if valid else wait
+        # SS18: J = delta_ev + lambda_G*ExpectedDeltaG - selection_penalty,
+        # via the single shared candidate_selection_score() (Phase 12B
+        # Tranche 2.1 item 6 correction, made reusable by MPCController too
+        # in Tranche 2.2 item 2 - see that function's own docstring for why
+        # this replaced c.g_after).
+        chosen = max(valid, key=lambda c: candidate_selection_score(c, self.cfg)) if valid else wait
         return OneStepDecision(round_id, decision_ts, chosen, tuple(candidates), skip_reason=None)

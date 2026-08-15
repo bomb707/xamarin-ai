@@ -38,7 +38,7 @@ from xamarinbot.model.logistic import LogisticModel
 from xamarinbot.mpc.config import MPCConfig
 from xamarinbot.mpc.controller import MPCController
 from xamarinbot.mpc.scenario import TransitionModel
-from xamarinbot.optimizer.candidates import candidate_exposure, evaluate_maker_candidate, evaluate_replacement_plan
+from xamarinbot.optimizer.candidates import candidate_exposure, evaluate_maker_candidate, evaluate_replacement_plan, is_recovery_purpose
 from xamarinbot.optimizer.config import OneStepConfig
 from xamarinbot.optimizer.controller import OneStepController
 from xamarinbot.optimizer.types import OrderMode
@@ -345,7 +345,7 @@ def _run_controller_round(
                         portfolio, pending_taker_exposure=queue.exposure,
                         open_maker_exposure=exposure_from_open_maker_orders(other_makers, fee_config),
                     )
-                    if replace_risk_view.admits(replacement.exposure, spec.one_step_cfg.g_min, spec.one_step_cfg.spend_cap, spec.one_step_cfg.position_limit):
+                    if replace_risk_view.admits(replacement.exposure, spec.one_step_cfg.g_min, spec.one_step_cfg.spend_cap, spec.one_step_cfg.position_limit, is_recovery_candidate=is_recovery_purpose(tracked.purpose)):
                         order_seq += 1
                         result = supervisor.apply_replace(decision, decision_ts, f"{round_id}-o{order_seq}", replacement.price, replacement.qty)
                         if result and result.new_order is not None:
@@ -372,7 +372,15 @@ def _run_controller_round(
 
         permitted = ActionPermissionMatrix.permitted_actions(classify_seed_action(snapshot.state))
         if mpc is not None:
-            mpc_decision = mpc.decide(round_id, decision_ts, portfolio, q, snapshot.state, book_up, book_down, tick_size, True)
+            # Phase 12B Tranche 2.2 item 2: risk_view threaded into MPC's
+            # immediate decision the same way it is into one-step's -
+            # MPC's own decide() forwards it into the underlying
+            # OneStepController call for the immediate action AND falls
+            # back to that risk-aware one-step decision entirely if real
+            # active exposure exists (see MPCController.decide's own
+            # docstring for why the deeper rollout doesn't get its own
+            # exposure-transition model).
+            mpc_decision = mpc.decide(round_id, decision_ts, portfolio, q, snapshot.state, book_up, book_down, tick_size, True, risk_view=risk_view)
             chosen = mpc_decision.chosen
         else:
             one_step_decision = one_step.decide(round_id, decision_ts, portfolio, q, permitted, book_up, book_down, tick_size, True, risk_view=risk_view)
@@ -399,7 +407,7 @@ def _run_controller_round(
             # admission gate: at most one PENDING_DELAY taker outstanding.
             limit_price = chosen.max_execution_price if chosen.max_execution_price is not None else chosen.price
             exposure = candidate_exposure(chosen, fee_config)
-            if exposure is not None and risk_view.admits(exposure, spec.one_step_cfg.g_min, spec.one_step_cfg.spend_cap, spec.one_step_cfg.position_limit):
+            if exposure is not None and risk_view.admits(exposure, spec.one_step_cfg.g_min, spec.one_step_cfg.spend_cap, spec.one_step_cfg.position_limit, is_recovery_candidate=is_recovery_purpose(chosen.purpose)):
                 n_attempts += 1
                 order_seq += 1
                 asks = book_up.asks if chosen.side is Side.UP else book_down.asks
@@ -418,7 +426,7 @@ def _run_controller_round(
             # g_min/spend_cap/position_limit (item 1's own counterexample),
             # which per-placement-time-only checks miss.
             exposure = candidate_exposure(chosen, fee_config)
-            if exposure is not None and risk_view.admits(exposure, spec.one_step_cfg.g_min, spec.one_step_cfg.spend_cap, spec.one_step_cfg.position_limit):
+            if exposure is not None and risk_view.admits(exposure, spec.one_step_cfg.g_min, spec.one_step_cfg.spend_cap, spec.one_step_cfg.position_limit, is_recovery_candidate=is_recovery_purpose(chosen.purpose)):
                 order_seq += 1
                 order_state = sim.submit_maker_order(f"{round_id}-o{order_seq}", chosen.side, chosen.qty, chosen.price, decision_ts)
                 supervisor.register(TrackedOrder(order_state, snapshot.state, chosen.purpose, q, q if chosen.side is Side.UP else 1 - q, chosen.g_after, chosen.delta_ev, chosen.ttl_s or spec.one_step_cfg.maker_horizon_s, decision_ts, decision_ts))

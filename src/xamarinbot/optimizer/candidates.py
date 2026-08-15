@@ -273,7 +273,18 @@ def purpose_aware_max_execution_price(
         return taker_max_execution_price(portfolio, side, x, q_effective, fee_config, cfg, tick_size)
 
     u, d, c = portfolio.U, portfolio.D, portfolio.C
-    k_max = directional_projected_g(u, d, c, side, x, 0.0) - cfg.g_min
+    g_before = portfolio.G
+    # Phase 12B Tranche 2.2 item 1: once already in aggregate breach
+    # (g_before < g_min), the ordinary g_min floor is unreachable by
+    # construction - K_max would be negative for every x that doesn't
+    # instantly restore g_min in one fill, the same empty-fill-subset-
+    # style contradiction item 1 fixes for RiskView.admits(). Matching
+    # _finalize's own breach-recovery relaxation, the effective floor
+    # becomes g_before itself (must not make G worse) rather than the
+    # unreachable g_min, so a genuine partial repair still gets a real,
+    # usable price ceiling instead of being priced out of existence.
+    g_floor = cfg.g_min if g_before >= cfg.g_min else g_before
+    k_max = directional_projected_g(u, d, c, side, x, 0.0) - g_floor
     if purpose is OrderPurpose.BUFFER_BUILD:
         k_max = min(k_max, delta_g_directional(u, d, side, x, 0.0))
     if cfg.spend_cap is not None:
@@ -414,7 +425,22 @@ def taker_sizing_boundaries(
 # Purposes exempt from the edge_min alpha-edge floor (Phase 12B Tranche
 # 2B): both are explicitly allowed negative standalone EV in exchange for
 # improving worst-case risk/settlement geometry - see _finalize's docstring.
+# The same set is exactly the "recovery-capable" purposes _finalize's
+# breach-recovery logic (Tranche 2.1 item 5) admits while G_before <
+# g_min - reused as RiskView.admits()'s is_recovery_candidate flag
+# (Tranche 2.2 item 1) via is_recovery_purpose() below.
 _EDGE_MIN_EXEMPT_PURPOSES = (OrderPurpose.HEDGE, OrderPurpose.BUFFER_BUILD)
+
+
+def is_recovery_purpose(purpose: OrderPurpose) -> bool:
+    """Whether `purpose` is a portfolio-repair type allowed to admit
+    partial breach-recovery (HEDGE/BUFFER_BUILD) rather than being
+    prohibited outright while already below g_min (ALPHA) - the single
+    source of truth every RiskView.admits() call site uses for its
+    `is_recovery_candidate` argument, so aggregate admission and
+    `_finalize`'s single-candidate breach-recovery check can never
+    silently diverge on which purposes qualify."""
+    return purpose in _EDGE_MIN_EXEMPT_PURPOSES
 
 
 def maker_price_grid(best_bid: float, best_ask: float, tick_size: float, offsets_ticks: tuple[int, ...]) -> list[tuple[float, int]]:
@@ -485,7 +511,7 @@ def _maker_feasible_quantity(
 
 
 def dynamic_maker_candidates(
-    q: float, side: Side, tau: float, sigma: float, portfolio: PortfolioState,
+    q: float, side: Side, tau: float | None, sigma: float, portfolio: PortfolioState,
     best_bid: float, best_ask: float, tick_size: float, fee_config: FeeConfig, cfg: OneStepConfig,
 ) -> list[MakerCandidateSpec]:
     """Derives maker (price, quantity, TTL) candidates from `(q, tau,
@@ -498,13 +524,23 @@ def dynamic_maker_candidates(
     `cfg.dynamic_maker` so the default (fixed) behavior is exactly Phases
     8-12B's.
 
-    TTL: damped by volatility (a stale quote is riskier in a fast market)
-    and capped by remaining round time (`tau`). Item 8: if `tau` is
-    positive but shorter than `cfg.min_maker_ttl_s` (the minimum sensible
-    passive-order lifetime), NO maker candidate is generated at all this
-    decision - the prior draft's `ttl = max(1.0, ttl)` silently clamped
-    the TTL back UP past the round's own remaining time instead, proposing
-    a resting order that could never legitimately live out its horizon.
+    `tau` (Phase 12B Tranche 2.2 item 5): `None` means "not supplied /
+    unknown" (no time constraint applied); `0` means "no remaining time at
+    all" - a real, meaningful value in a 5-minute market, previously
+    conflated with "not provided" by defaulting the parameter to `0.0`.
+    `tau <= 0` (a REAL, supplied zero-or-negative remaining time) always
+    suppresses maker generation entirely; `tau is None` never does.
+
+    TTL: damped by volatility (a stale quote is riskier in a fast market),
+    floored at 1.0, then capped by remaining round time (`tau`) LAST, so
+    `TTL <= tau` is guaranteed whenever `tau` is known even when the
+    volatility-damped value would otherwise floor above it. Item 8: if
+    `tau` is known and positive but shorter than `cfg.min_maker_ttl_s`
+    (the minimum sensible passive-order lifetime), NO maker candidate is
+    generated at all this decision - the prior draft's `ttl = max(1.0,
+    ttl)` alone could silently clamp the TTL back UP past the round's own
+    remaining time instead, proposing a resting order that could never
+    legitimately live out its horizon.
 
     Price offsets: widen with volatility - three offsets in calm
     conditions, growing with `sigma`, capped to avoid an unbounded grid.
@@ -521,14 +557,15 @@ def dynamic_maker_candidates(
     max feasible itself) lets the caller's own EV/fill-probability model
     (`evaluate_maker_candidate`) rank which quantity is actually worth it,
     rather than this function picking a single one."""
-    if tau > 0 and cfg.min_maker_ttl_s > 0 and tau < cfg.min_maker_ttl_s:
+    if tau is not None and tau <= 0:
+        return []
+    if tau is not None and cfg.min_maker_ttl_s > 0 and tau < cfg.min_maker_ttl_s:
         return []
 
     vol = max(0.0, sigma)
-    ttl = cfg.maker_horizon_s / (1.0 + vol)
-    if tau > 0:
+    ttl = max(1.0, cfg.maker_horizon_s / (1.0 + vol))
+    if tau is not None:
         ttl = min(ttl, tau)
-    ttl = max(1.0, ttl)
 
     n_offsets = min(8, 3 + round(vol * 4))
     offsets = tuple(range(n_offsets))
@@ -1004,32 +1041,53 @@ def generate_buffer_build_candidates(
     if max_feasible <= 0:
         return []
 
-    quantities: set[float] = set()
-    quantities.add(min(cfg.taker_min_size, max_feasible))  # exchange minimum
+    # Phase 12B Tranche 2.2 item 4: the 0.999 float-safety margin must
+    # apply ONLY to quantities anchored to a genuine upper boundary
+    # (parity/risk/spend), never to the exchange minimum, an interior
+    # small-quantity-grid point, or a depth point strictly below the
+    # feasible ceiling - margining every quantity uniformly (the prior
+    # draft's bug) turned `raw_qty=taker_min_size=1.0` into `qty=0.999`,
+    # which the very next check then rejected as below the exchange
+    # minimum, silently discarding the exact-minimum candidate even when
+    # it was individually delta_g>0-feasible.
+    exact_quantities: set[float] = set()
+    exact_quantities.add(min(cfg.taker_min_size, max_feasible))  # exchange minimum - never margined
     step = max(cfg.taker_qty_step, 1e-9)
     x = cfg.taker_min_size
-    for _ in range(cfg.taker_qty_grid_points):  # small-quantity grid
+    for _ in range(cfg.taker_qty_grid_points):  # small-quantity grid - interior points, exact
         if x >= max_feasible - 1e-9:
             break
-        quantities.add(x)
+        exact_quantities.add(x)
         x += step
-    for dp in depth_points:  # book-depth boundaries
-        quantities.add(min(dp, max_feasible))
-    if spend_capacity_qty is not None:  # spend boundary
-        quantities.add(min(spend_capacity_qty, max_feasible))
-    if risk_boundary_qty > 0:  # g_min risk boundary
-        quantities.add(min(risk_boundary_qty, max_feasible))
-    quantities.add(max_feasible)  # parity boundary itself
+    for dp in depth_points:  # book-depth boundaries - exact where strictly interior
+        capped = min(dp, max_feasible)
+        if capped < max_feasible - 1e-9:
+            exact_quantities.add(capped)
 
-    candidates: list[CandidateAction] = []
-    idx = 0
-    for raw_qty in sorted(quantities):
+    boundary_quantities: set[float] = {max_feasible}  # the parity (or spend-capped) boundary itself
+    if spend_capacity_qty is not None:
+        boundary_quantities.add(min(spend_capacity_qty, max_feasible))
+    if risk_boundary_qty > 0:
+        boundary_quantities.add(min(risk_boundary_qty, max_feasible))
+
+    quantities: set[float] = set()
+    for raw_qty in exact_quantities:
+        if raw_qty >= cfg.taker_min_size - 1e-9:
+            quantities.add(raw_qty)
+    for raw_qty in boundary_quantities:
         # Safety margin (matching generate_hedge_candidate's own
         # x_min*1.0001 pattern) - a quantity landing exactly on the
         # parity/risk/spend boundary can end up a few ULPs on the wrong
-        # side of it after chained floating-point arithmetic.
-        qty = raw_qty * 0.999
-        if qty < cfg.taker_min_size - 1e-9 or qty <= 0:
+        # side of it after chained floating-point arithmetic. Applied
+        # only here, never to an already-exact quantity above.
+        margined = raw_qty * 0.999
+        if margined >= cfg.taker_min_size - 1e-9:
+            quantities.add(margined)
+
+    candidates: list[CandidateAction] = []
+    idx = 0
+    for qty in sorted(quantities):
+        if qty <= 0:
             continue
         max_price = purpose_aware_max_execution_price(portfolio, side, qty, OrderPurpose.BUFFER_BUILD, fee_config, cfg, tick_size)
         if max_price is None or max_price <= 0:
@@ -1084,6 +1142,18 @@ def candidate_exposure(candidate: CandidateAction, fee_config: FeeConfig) -> Act
         fee = fee_config.fee_for(LiquidityRole.MAKER, candidate.qty, candidate.price)
         return ActiveOrderExposure(candidate.side, candidate.qty, candidate.qty * candidate.price + fee)
     return None
+
+
+def candidate_selection_score(candidate: CandidateAction, cfg: OneStepConfig) -> float:
+    """SS18: `J(a) = ΔEV(a) + lambda_G*E[ΔG(a)] - selectionPenalty(a)`
+    (Phase 12B Tranche 2.1 item 6, made the single reusable function every
+    ranking caller must use in Tranche 2.2 item 2) - `OneStepController`'s
+    own `argmax` and `MPCController`'s immediate sequence value must never
+    silently diverge on what "best" means. The prior MPC draft used
+    `sequence_value = candidate.delta_ev` alone, ignoring `lambda_g` and
+    `selection_penalty` entirely - a duplicated, drifted-from-one-step
+    objective this function closes."""
+    return candidate.delta_ev + cfg.lambda_g * candidate.expected_delta_g - candidate.selection_penalty
 
 
 def wait_candidate(action_id: str, portfolio: PortfolioState) -> CandidateAction:

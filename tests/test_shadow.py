@@ -130,7 +130,7 @@ def test_shadow_runner_delayed_resolution_uses_exchange_event_time_not_recv_ts()
     )
     already_submitted = {"flag": False}
 
-    def forced_decide(self, round_id, decision_ts, portfolio, q, permitted_actions, book_up, book_down, tick_size, is_fresh):
+    def forced_decide(self, round_id, decision_ts, portfolio, q, permitted_actions, book_up, book_down, tick_size, is_fresh, tau=None, sigma=0.0, risk_view=None):
         # Submit exactly one delayed taker order (at the first decision
         # point real feature data is available) so there is exactly one
         # fill to check the resolution price of - every later decision
@@ -300,7 +300,7 @@ def test_shadow_runner_resolves_delayed_taker_orders_via_matched_ts_not_submit_t
     store, results = eval_dataset
     delayed_exec_cfg = ExecutionConfig(taker_delay_ms=250.0)
 
-    def forced_decide(self, round_id, decision_ts, portfolio, q, permitted_actions, book_up, book_down, tick_size, is_fresh):
+    def forced_decide(self, round_id, decision_ts, portfolio, q, permitted_actions, book_up, book_down, tick_size, is_fresh, tau=None, sigma=0.0, risk_view=None):
         forced = CandidateAction(
             action_id="forced_taker_up", purpose=OrderPurpose.ALPHA, side=Side.UP, mode=OrderMode.FAK,
             price=0.99, qty=5.0, ttl_s=0.0, expected_fill=5.0, delta_ev=1.0, g_after=0.0,
@@ -326,6 +326,165 @@ def test_shadow_runner_resolves_delayed_taker_orders_via_matched_ts_not_submit_t
     for submit_ts, matched_ts, now_ts in calls:
         assert matched_ts > submit_ts
         assert now_ts >= matched_ts
+
+
+# --------------------------------------------------------------------------
+# Phase 12B Tranche 2.2 item 3: ShadowRunner is unified onto the same
+# shared TradingSession execution/session engine (RiskView-gated dispatch,
+# open makers tracked via OrderSupervisor, cancel/replace review) the
+# supervisor-enabled walk-forward ablation arm uses - no longer a
+# separately-maintained, simplified execution engine (no RiskView, no
+# aggregate maker exposure, instant Bernoulli-draw makers).
+# --------------------------------------------------------------------------
+
+
+def _forced_maker_then_wait_decide(forced_maker):
+    """Shared helper: a OneStepController.decide patch that returns
+    `forced_maker` exactly once, then WAIT forever after - isolating a
+    single maker order's lifecycle from the emergent (and often
+    WAIT-only) regime behavior on this synthetic dataset."""
+    from xamarinbot.optimizer.controller import OneStepDecision
+    from xamarinbot.optimizer.types import CandidateAction, OrderMode
+    from xamarinbot.portfolio.math import OrderPurpose
+
+    already_submitted = {"flag": False}
+
+    def forced_decide(self, round_id, decision_ts, portfolio, q, permitted_actions, book_up, book_down, tick_size, is_fresh, tau=None, sigma=0.0, risk_view=None):
+        if already_submitted["flag"]:
+            wait = CandidateAction(
+                action_id="wait", purpose=OrderPurpose.ALPHA, side=None, mode=OrderMode.WAIT, price=None,
+                qty=0.0, ttl_s=None, expected_fill=0.0, delta_ev=0.0, g_after=portfolio.G,
+                pi_u_after=portfolio.Pi_U, pi_d_after=portfolio.Pi_D, violated_constraints=(),
+            )
+            return OneStepDecision(round_id, decision_ts, wait, (wait,), skip_reason=None)
+        already_submitted["flag"] = True
+        return OneStepDecision(round_id, decision_ts, forced_maker, (forced_maker,), skip_reason=None)
+
+    return forced_decide
+
+
+def test_shadow_runner_maker_order_is_tracked_as_open_not_instant_filled(eval_dataset, feature_cfg, fee_config, exec_cfg, one_step_cfg, trained_model):
+    """A POST_ONLY decision must be registered as an OPEN order (tracked
+    by OrderSupervisor, reviewable/cancelable on later decision points)
+    rather than resolved via an immediate Bernoulli draw at submission
+    time - the exact gap ShadowRunner had before TradingSession
+    unification."""
+    from unittest.mock import patch
+
+    import xamarinbot.supervisor.supervisor as supervisor_mod
+    from xamarinbot.optimizer.controller import OneStepController
+    from xamarinbot.optimizer.types import CandidateAction, OrderMode
+    from xamarinbot.portfolio.math import OrderPurpose
+    from xamarinbot.portfolio.state import Side
+
+    store, results = eval_dataset
+    r = results[0]
+
+    forced_maker = CandidateAction(
+        action_id="forced_maker_up", purpose=OrderPurpose.ALPHA, side=Side.UP, mode=OrderMode.POST_ONLY,
+        price=0.40, qty=5.0, ttl_s=600.0, expected_fill=2.5, delta_ev=1.0, g_after=0.0,
+        pi_u_after=0.0, pi_d_after=0.0, violated_constraints=(),
+    )
+    forced_decide = _forced_maker_then_wait_decide(forced_maker)
+
+    calls = {"n": 0}
+    real_register = supervisor_mod.OrderSupervisor.register
+
+    def spy_register(self, tracked):
+        calls["n"] += 1
+        return real_register(self, tracked)
+
+    with patch.object(supervisor_mod.OrderSupervisor, "register", spy_register), \
+         patch.object(OneStepController, "decide", forced_decide):
+        runner = ShadowRunner(store, r.round_id, r.p0, feature_cfg, fee_config, exec_cfg, one_step_cfg, trained_model, COMBINED_LEAD_LAG, ShadowConfig())
+        runner.run()
+
+    assert calls["n"] > 0, "the maker candidate must be registered as an open order with OrderSupervisor, not instant-filled"
+
+
+def test_shadow_runner_reviews_open_maker_orders_for_cancel_replace(eval_dataset, feature_cfg, fee_config, exec_cfg, one_step_cfg, trained_model):
+    """Once a maker order is open, later decision points must actually
+    run it through OrderSupervisor.review_order (the cancel/replace/
+    hold policy) - not just leave it resting unexamined until TTL."""
+    from unittest.mock import patch
+
+    import xamarinbot.supervisor.supervisor as supervisor_mod
+    from xamarinbot.optimizer.controller import OneStepController
+    from xamarinbot.optimizer.types import CandidateAction, OrderMode
+    from xamarinbot.portfolio.math import OrderPurpose
+    from xamarinbot.portfolio.state import Side
+
+    store, results = eval_dataset
+    r = results[0]
+
+    # A long TTL so the order stays open across several decision points,
+    # giving review_order real chances to fire before expiry.
+    forced_maker = CandidateAction(
+        action_id="forced_maker_up", purpose=OrderPurpose.ALPHA, side=Side.UP, mode=OrderMode.POST_ONLY,
+        price=0.40, qty=5.0, ttl_s=10_000.0, expected_fill=2.5, delta_ev=1.0, g_after=0.0,
+        pi_u_after=0.0, pi_d_after=0.0, violated_constraints=(),
+    )
+    forced_decide = _forced_maker_then_wait_decide(forced_maker)
+
+    calls = {"n": 0}
+    real_review = supervisor_mod.OrderSupervisor.review_order
+
+    def spy_review(self, *a, **kw):
+        calls["n"] += 1
+        return real_review(self, *a, **kw)
+
+    with patch.object(supervisor_mod.OrderSupervisor, "review_order", spy_review), \
+         patch.object(OneStepController, "decide", forced_decide):
+        runner = ShadowRunner(store, r.round_id, r.p0, feature_cfg, fee_config, exec_cfg, one_step_cfg, trained_model, COMBINED_LEAD_LAG, ShadowConfig())
+        runner.run()
+
+    assert calls["n"] > 0, "an open maker order must actually be reviewed (cancel/replace/hold) on later decision points"
+
+
+def test_shadow_runner_dispatch_is_gated_by_aggregate_risk_view(eval_dataset, feature_cfg, fee_config, exec_cfg, one_step_cfg, trained_model):
+    """Every dispatch (taker or maker) must be checked against the
+    aggregate RiskView (confirmed + pending takers + open makers) before
+    it can mutate state - forcing RiskView.admits() to always return
+    False must suppress every registration/fill ShadowRunner would
+    otherwise make."""
+    from unittest.mock import patch
+
+    import xamarinbot.portfolio.exposure as exposure_mod
+    import xamarinbot.supervisor.supervisor as supervisor_mod
+    from xamarinbot.optimizer.controller import OneStepController
+    from xamarinbot.optimizer.types import CandidateAction, OrderMode
+    from xamarinbot.portfolio.math import OrderPurpose
+    from xamarinbot.portfolio.state import Side
+
+    store, results = eval_dataset
+    r = results[0]
+
+    forced_maker = CandidateAction(
+        action_id="forced_maker_up", purpose=OrderPurpose.ALPHA, side=Side.UP, mode=OrderMode.POST_ONLY,
+        price=0.40, qty=5.0, ttl_s=600.0, expected_fill=2.5, delta_ev=1.0, g_after=0.0,
+        pi_u_after=0.0, pi_d_after=0.0, violated_constraints=(),
+    )
+    forced_decide = _forced_maker_then_wait_decide(forced_maker)
+
+    def count_registrations(admits_return: bool) -> int:
+        calls = {"n": 0}
+        real_register = supervisor_mod.OrderSupervisor.register
+
+        def spy_register(self, tracked):
+            calls["n"] += 1
+            return real_register(self, tracked)
+
+        with patch.object(exposure_mod.RiskView, "admits", return_value=admits_return), \
+             patch.object(supervisor_mod.OrderSupervisor, "register", spy_register), \
+             patch.object(OneStepController, "decide", forced_decide):
+            runner = ShadowRunner(store, r.round_id, r.p0, feature_cfg, fee_config, exec_cfg, one_step_cfg, trained_model, COMBINED_LEAD_LAG, ShadowConfig())
+            runner.run()
+        return calls["n"]
+
+    n_admitted = count_registrations(True)
+    n_blocked = count_registrations(False)
+    assert n_admitted > 0, "expected at least one maker registration when admission is forced True"
+    assert n_blocked == 0, "RiskView.admits()==False must block every dispatch ShadowRunner makes"
 
 
 def test_shadow_runner_controller_deadline_missed_falls_back_to_wait(eval_dataset, feature_cfg, fee_config, exec_cfg, one_step_cfg, trained_model):
