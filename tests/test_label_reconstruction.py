@@ -11,6 +11,7 @@ import pytest
 
 from xamarinbot.realtime.label import (
     Outcome,
+    UnsupportedSettlementKind,
     reconstruct_basis,
     reconstruct_label,
     reported_outcome_from_gamma,
@@ -59,10 +60,18 @@ def test_declared_basis_follows_the_market_metadata():
 
 def test_binance_is_never_a_settlement_basis():
     """Item 5: "Do not use Binance or TWAP as a substitute settlement
-    source." Binance is not reachable as a basis under any configuration."""
+    source." Binance is not reachable as a basis under any configuration.
+
+    Gate A.0 item 8 strengthened this: an unrecognized kind, or a TWAP window
+    RTDS does not publish, now RAISES rather than resolving to some other
+    topic. Both outcomes satisfy the original claim, so the test accepts
+    either - what it must never see is Binance."""
     for kind in ("chainlink_twap", "chainlink_reference", "anything_else"):
         for w in (None, 30, 60):
-            assert topic_for_basis(kind, w) != TOPIC_BINANCE
+            try:
+                assert topic_for_basis(kind, w) != TOPIC_BINANCE
+            except UnsupportedSettlementKind:
+                pass
 
 
 # ------------------------------------------------------ the rule itself

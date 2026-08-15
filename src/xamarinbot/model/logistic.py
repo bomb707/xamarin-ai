@@ -34,13 +34,29 @@ class LogisticModel:
         return _sigmoid(z)
 
 
-def _fit_standardization(X: list[list[float]]) -> tuple[list[float], list[float]]:
-    n = len(X)
+def _fit_standardization(
+    X: list[list[float]], w: list[float] | None = None
+) -> tuple[list[float], list[float]]:
+    """Feature standardization, optionally WEIGHTED (Gate A.0 item 6).
+
+        mu_j     = sum_i w_i x_ij / sum_i w_i
+        sigma^2_j = sum_i w_i (x_ij - mu_j)^2 / sum_i w_i
+
+    Weighting matters here as much as in the fit itself: an unweighted mean
+    over rows lets a busy round's 80 decision points pull the centering twice
+    as far as a quiet round's 40, so the model would be standardized against
+    a distribution that over-represents high-event-rate market conditions.
+    """
     d = len(X[0])
-    means = [sum(row[j] for row in X) / n for j in range(d)]
+    if w is None:
+        w = [1.0] * len(X)
+    sw = sum(w)
+    if sw <= 0:
+        raise ValueError("total sample weight must be positive")
+    means = [sum(wi * row[j] for wi, row in zip(w, X)) / sw for j in range(d)]
     stds = []
     for j in range(d):
-        var = sum((row[j] - means[j]) ** 2 for row in X) / n
+        var = sum(wi * (row[j] - means[j]) ** 2 for wi, row in zip(w, X)) / sw
         stds.append(math.sqrt(var) if var > 1e-12 else 1.0)
     return means, stds
 
@@ -53,15 +69,37 @@ def fit_logistic_regression(
     l2: float = 1.0,
     lr: float = 0.3,
     n_iters: int = 500,
+    sample_weight: list[float] | None = None,
 ) -> LogisticModel:
     """Batch gradient descent on the L2-regularized log-loss. Features are
     standardized (fit on this call's X only - callers must pass the
-    training split, never validation/test, to avoid leakage)."""
+    training split, never validation/test, to avoid leakage).
+
+    `sample_weight` (Gate A.0 item 6) makes each ROUND contribute equal total
+    weight rather than each decision row. The target is one settlement
+    outcome per round while `q` is evaluated at many intra-round decision
+    times, so unweighted rows are pseudo-replicates: a round with twice as
+    many valid decision points would exert twice the influence on the fit
+    despite carrying exactly one independent observation of the outcome.
+
+    Weights enter both the gradient and the normalization, so the update is
+    a weighted mean rather than a plain one - scaling every weight by a
+    constant leaves the fit unchanged.
+    """
     if not X:
         raise ValueError("cannot fit a model on zero examples")
     n = len(X)
     d = len(X[0])
-    means, stds = _fit_standardization(X)
+    if sample_weight is None:
+        sample_weight = [1.0] * n
+    elif len(sample_weight) != n:
+        raise ValueError(
+            f"sample_weight has {len(sample_weight)} entries for {n} examples"
+        )
+    total_w = sum(sample_weight)
+    if total_w <= 0:
+        raise ValueError("total sample weight must be positive")
+    means, stds = _fit_standardization(X, sample_weight)
     Xs = [[(row[j] - means[j]) / stds[j] for j in range(d)] for row in X]
 
     weights = [0.0] * d
@@ -79,15 +117,17 @@ def fit_logistic_regression(
     for _ in range(n_iters):
         grad_w = [0.0] * d
         grad_b = 0.0
-        for xi, yi in zip(Xs, y):
+        for xi, yi, wi in zip(Xs, y, sample_weight):
             z = bias + sum(w * x for w, x in zip(weights, xi))
-            err = _sigmoid(z) - yi
+            err = wi * (_sigmoid(z) - yi)
             for j in range(d):
                 grad_w[j] += err * xi[j]
             grad_b += err
+        # Normalizing by TOTAL WEIGHT rather than row count keeps the step
+        # size independent of how the weights happen to be scaled.
         for j in range(d):
-            weights[j] = (weights[j] - lr * grad_w[j] / n) * shrink
-        bias -= lr * grad_b / n
+            weights[j] = (weights[j] - lr * grad_w[j] / total_w) * shrink
+        bias -= lr * grad_b / total_w
 
     return LogisticModel(
         feature_set_name=feature_set_name,

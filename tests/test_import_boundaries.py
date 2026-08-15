@@ -196,6 +196,7 @@ def test_synthetic_demo_scripts_are_unmistakable():
         "resolve_capture_labels.py",
         "run_real_replay_smoke.py",
         "write_capture_manifest.py",
+        "reindex_captures.py",
     }, f"scripts/ must hold only real-market entry points; found {sorted(top_level)}"
 
 

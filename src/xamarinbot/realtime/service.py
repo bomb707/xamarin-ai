@@ -142,8 +142,36 @@ class RealRecorderService:
     # ------------------------------------------------------------- hooks
 
     def _on_parse_failure(self, raw, exc) -> None:
+        """Count the failure AND persist when it happened.
+
+        Gate A.0 item 1 makes `data_valid` depend on parse failures, but the
+        recorder only ever incremented a session counter - so a single bad
+        frame disqualified every round in the batch, because nothing recorded
+        which round was live at the time. Writing a timestamped control event
+        lets eligibility attribute the failure to the round whose window
+        contains it, instead of condemning its seven neighbours.
+        """
         self.metrics.record_parse_failure()
         self._log(f"[parse-failure] {type(exc).__name__}: {exc}")
+        active = next(
+            (c.metadata.round_id for c in self.captures.values()
+             if c.lifecycle.state is RoundState.ACTIVE),
+            None,
+        )
+        try:
+            self.recorder.submit(self._clob_builder.build(
+                Topic.RECORDER_CONTROL, "parse_failure",
+                {
+                    "error_type": type(exc).__name__,
+                    "error": str(exc)[:400],
+                    "raw_excerpt": str(raw)[:200],
+                    "active_round_id": active,
+                },
+                round_id=active,
+            ))
+        except Exception:
+            # Recording the failure must never itself break the reader.
+            pass
 
     def _on_market_event(self, event: RawEvent) -> None:
         """Every CLOB event goes to the recorder AND to the maker
@@ -646,6 +674,14 @@ class RealRecorderService:
             reported_outcome=capture.reported_outcome,
             reported_source=capture.reported_source,
             tolerance_s=self.cfg.label_tolerance_s,
+            # Gate A.0 item 3: `reconstruct_label` has always accepted the
+            # market's own free text, but nothing passed it, so
+            # `rule_text_agrees` was permanently None and could never
+            # contribute to `LabelStatus`. A market whose structured
+            # `cryptoMarketConfig` contradicts its own published rules is
+            # exactly the round whose label should not be trusted.
+            resolution_source=m.resolution_source,
+            description=m.description,
         )
         self.recorder.submit(self._clob_builder.build(
             Topic.RECORDER_CONTROL, "label_reconstruction",
@@ -857,4 +893,10 @@ def _reconstruction_payload(rec: LabelReconstruction) -> dict:
         "declared_agrees": rec.declared_agrees,
         "reference_agrees": rec.reference_agrees,
         "bases_agree": rec.bases_agree,
+        # Gate A.0 items 2/3: the resolved status, including the rule-text
+        # cross-check, so the projection can refuse a non-CONFIRMED label
+        # without recomputing it.
+        "status": rec.status.value,
+        "rule_text_agrees": rec.rule_text_agrees,
+        "is_trainable_label": rec.is_trainable,
     }

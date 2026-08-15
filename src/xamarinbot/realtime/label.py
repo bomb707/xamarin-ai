@@ -124,19 +124,43 @@ def declared_basis_matches_rule_text(
     return False if other else None
 
 
-#: Which RTDS topic supplies the settlement reference for a given basis.
+#: The only settlement rules this system can reconstruct. Gate A.0 item 8:
+#: an unknown value must raise rather than silently becoming the plain
+#: Chainlink reference.
+SUPPORTED_SETTLEMENT_KINDS = frozenset({"chainlink_twap", "chainlink_reference"})
+
+
+class UnsupportedSettlementKind(ValueError):
+    """Raised for a settlement rule this system does not know how to
+    reconstruct (Gate A.0 item 8)."""
+
+
 def topic_for_basis(settlement_kind: str, twap_window_s: int | None) -> str:
     """The RTDS topic carrying the settlement reference series.
 
     `chainlink_twap` with window 60 -> `crypto_prices_twap_sixty`
     `chainlink_twap` with window 30 -> `crypto_prices_twap_thirty`
-    anything else                   -> `crypto_prices_chainlink`
+    `chainlink_reference`           -> `crypto_prices_chainlink`
+
+    Anything else RAISES. The previous `return TOPIC_CHAINLINK` fall-through
+    meant `"twap"`, `"foo"` or a malformed value silently selected the plain
+    reference series as label truth - the same failure as guessing a missing
+    rule, only quieter, because the round would still produce a confident
+    label from the wrong price series.
     """
+    if settlement_kind not in SUPPORTED_SETTLEMENT_KINDS:
+        raise UnsupportedSettlementKind(
+            f"unsupported settlement_kind {settlement_kind!r}; known values are "
+            f"{sorted(SUPPORTED_SETTLEMENT_KINDS)}"
+        )
     if settlement_kind == "chainlink_twap":
         if twap_window_s == 30:
             return TOPIC_TWAP_30
         if twap_window_s == 60:
             return TOPIC_TWAP_60
+        raise UnsupportedSettlementKind(
+            f"chainlink_twap declares window {twap_window_s}s; RTDS publishes only 30 and 60"
+        )
     return TOPIC_CHAINLINK
 
 

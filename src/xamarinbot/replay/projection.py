@@ -63,6 +63,14 @@ from xamarinbot.realtime.raw_events import RawEvent, Topic
 from xamarinbot.realtime.raw_store import RawEventStore
 from xamarinbot.rounds import RoundLabel
 
+#: How much reference history each round carries into its projection.
+#: 600s comfortably exceeds the largest feature window (the 300s round plus
+#: the 60s TWAP warm-up) with margin, matching the recorder's own 420s
+#: PRE_ROUND lead.
+REFERENCE_LOOKBACK_S = 600.0
+#: Reference observations after the close, needed for the end boundary.
+REFERENCE_TAIL_S = 120.0
+
 #: Reserved payload key holding the raw-event provenance block. Chosen with a
 #: leading underscore so it cannot collide with a market field, and filtered
 #: out by `replay/feeds.py::market_config_from_payload`.
@@ -79,6 +87,13 @@ _SETTLEMENT_TOPIC = {
 }
 _REFERENCE_TOPIC = Topic.RTDS_CHAINLINK
 
+#: The only settlement rules this system knows how to reconstruct. Gate A.0
+#: item 8: an unrecognized value must RAISE, not fall through to plain
+#: Chainlink reference. Silently treating `"twap"` or a malformed string as
+#: the reference series would pick the wrong price series for the label -
+#: the same class of error as guessing a missing rule, just harder to see.
+SUPPORTED_SETTLEMENT_KINDS = frozenset({"chainlink_twap", "chainlink_reference"})
+
 
 class ProjectionError(RuntimeError):
     """Raised instead of inventing a value the capture does not contain."""
@@ -86,6 +101,13 @@ class ProjectionError(RuntimeError):
 
 def settlement_topic_for(settlement_kind: str, twap_window_s: int | None) -> Topic:
     """The raw topic this market declares as its settlement reference."""
+    if settlement_kind not in SUPPORTED_SETTLEMENT_KINDS:
+        raise ProjectionError(
+            f"unsupported settlement_kind {settlement_kind!r}; known values are "
+            f"{sorted(SUPPORTED_SETTLEMENT_KINDS)}. Refusing to fall back to the plain "
+            "Chainlink reference - that would silently choose the wrong price series "
+            "as label truth."
+        )
     if settlement_kind == "chainlink_twap":
         topic = _SETTLEMENT_TOPIC.get((settlement_kind, int(twap_window_s or 0)))
         if topic is None:
@@ -190,6 +212,45 @@ _RESOLUTION_EVENT_TYPES = (
 )
 
 
+def _label_status_for(raw: RawEventStore, round_id: str) -> str | None:
+    """The `LabelStatus` the recorder computed for this round, if it recorded
+    one. Read from the last `label_reconstruction*` control event so the
+    rule-text cross-check (Gate A.0 item 3) participates here too."""
+    status = None
+    for e in raw.events(round_id=round_id, topics=[Topic.RECORDER_CONTROL]):
+        if e.event_type in ("label_reconstruction", "label_reconstruction_resolved"):
+            payload = e.payload
+            status = payload.get("status") or status
+    return status
+
+
+def reference_events(raw: RawEventStore, topic: Topic) -> list[RawEvent]:
+    """Every observation on a reference topic, across the WHOLE capture.
+
+    Reference feeds (Chainlink, TWAP-30/60, Binance) are GLOBAL: one BTC
+    price series, not a per-market one. The recorder tags each observation
+    with a single `round_id` - whichever round was ACTIVE when it arrived -
+    because a raw row has one round column, but that tag is an attribution
+    convenience, not a scope.
+
+    Filtering by it here would be a real error, and a quiet one. In a
+    multi-round batch only the FIRST round is tagged with the pre-round
+    lookback; rounds 2..N receive observations only inside their own active
+    window. Measured on a captured 8-round batch: round 1 carried 782
+    TWAP-60 observations spanning -531s to -2s, while round 3's earliest
+    tagged observation was +0.0s and its latest was -2s relative to its own
+    close. Selecting by `round_id` would therefore leave almost every round
+    with no reference observation at or before its open (no `p0`) and none
+    at or after its close (no end reference) - and the projection would
+    correctly refuse to label rounds whose data is in fact present, just
+    filed under a neighbour.
+
+    Boundary selection is by TIMESTAMP, which is what the physical question
+    ("what had the oracle observed by the round boundary?") actually asks.
+    """
+    return raw.events(topics=[topic])
+
+
 def _resolution_observed_at(raw: RawEventStore, round_id: str) -> float | None:
     """When this system actually learned the venue's outcome, in seconds.
 
@@ -206,6 +267,14 @@ def _resolution_observed_at(raw: RawEventStore, round_id: str) -> float | None:
         if e.event_type in _RESOLUTION_EVENT_TYPES
     ]
     return min(candidates) if candidates else None
+
+
+def _in_window(events: list, lo: float, hi: float) -> list:
+    """Reference observations whose SOURCE timestamp falls in [lo, hi]."""
+    return [
+        e for e in events
+        if e.source_timestamp_ns is not None and lo <= e.source_timestamp_ns / 1e9 <= hi
+    ]
 
 
 def _levels(raw: list) -> list[list[float]]:
@@ -303,7 +372,7 @@ def project_round(
         result.skipped[reason] = result.skipped.get(reason, 0) + 1
 
     # ---------------------------------------------------- settlement basis
-    twap_events = raw.events(round_id=round_id, topics=[twap_topic])
+    twap_events = reference_events(raw, twap_topic)
     if not twap_events:
         raise ProjectionError(
             f"{round_id}: no {twap_topic.value} observations captured, so the market's "
@@ -453,7 +522,11 @@ def project_round(
         })
 
     # --------------------------------------------------------------- TWAP
-    for e in twap_events:
+    # Trimmed to this round's own causal window: enough lookback for the
+    # largest feature window plus the settle tail, not the whole batch.
+    window_lo = start_ts - REFERENCE_LOOKBACK_S
+    window_hi = end_ts + REFERENCE_TAIL_S
+    for e in _in_window(twap_events, window_lo, window_hi):
         t = _times(e)
         if t is None:
             skip("twap_without_source_timestamp")
@@ -469,13 +542,13 @@ def project_round(
         })
 
     # --------------------------------------------------------------- SPOT
-    spot_events = raw.events(round_id=round_id, topics=[spot_topic])
+    spot_events = reference_events(raw, spot_topic)
     if not spot_events:
         result.warnings.append(
             f"no {spot_topic.value} observations captured; every decision point will "
             "report MISSING_SPOT"
         )
-    for e in spot_events:
+    for e in _in_window(spot_events, window_lo, window_hi):
         t = _times(e)
         if t is None:
             skip("spot_without_source_timestamp")
@@ -586,15 +659,54 @@ def project_round(
     # causal event stream, and carries the moment it was actually observed.
     result.label_observed_at = _resolution_observed_at(raw, round_id)
     for res in raw.round_results():
-        if res.get("round_id") != round_id or not res.get("reported_outcome"):
+        if res.get("round_id") != round_id:
             continue
         from xamarinbot.portfolio.state import Side
+
+        # Gate A.0 item 2. This used to emit a label whenever
+        # `reported_outcome` was present, so a round with
+        #     reported=UP, reconstructed=None, status=UNRESOLVED
+        # still produced `RoundLabel(outcome=UP)` - a supervised target
+        # taken purely on the venue's word, with our independent
+        # reconstruction having failed or disagreed. The whole point of
+        # reconstructing the settlement rule ourselves is to be able to
+        # refuse in exactly that case.
+        #
+        # A supervised target is now emitted ONLY when the independent
+        # reconstruction is CONFIRMED, and the value used is the
+        # RECONSTRUCTED outcome (verified equal to the venue's), not the
+        # venue's outcome copied over.
+        reported = res.get("reported_outcome")
+        reconstructed = res.get("reconstructed_outcome")
+        agrees = res.get("label_agreement")
+        status = _label_status_for(raw, round_id)
+
+        if reported is None:
+            result.warnings.append("no venue outcome recorded; no supervised label emitted")
+            continue
+        if reconstructed is None:
+            result.warnings.append(
+                "settlement label could not be independently reconstructed; no supervised "
+                "label emitted (the venue's word alone is not a verified target)"
+            )
+            continue
+        if agrees != 1 or reconstructed != reported:
+            result.warnings.append(
+                f"reconstruction ({reconstructed}) disagrees with the venue ({reported}); "
+                "LABEL_AMBIGUOUS, no supervised label emitted"
+            )
+            continue
+        if status is not None and status != "CONFIRMED":
+            result.warnings.append(
+                f"label status is {status}; no supervised label emitted"
+            )
+            continue
 
         result.label = RoundLabel(
             round_id=round_id,
             p0=result.p0,
             final_reference=res.get("end_reference_value") or float("nan"),
-            outcome=Side.UP if res["reported_outcome"] == "UP" else Side.DOWN,
+            outcome=Side.UP if reconstructed == "UP" else Side.DOWN,
             provenance=DataProvenance.REAL_REPLAY,
         )
         if result.label_observed_at is not None and result.label_observed_at <= end_ts:

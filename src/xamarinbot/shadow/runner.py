@@ -305,7 +305,27 @@ class ShadowRunner:
         # Round-opening constraints, used for the session's own fee/delay
         # reconciliation. Those two are market-level and do not change
         # intra-round; only the tick does.
-        constraints = constraints_at(events)
+        #
+        # Gate A.0 item 9: built from the EARLIEST MARKET_CONFIG only, never
+        # `constraints_at(events)` over the whole round. That helper selects
+        # the LATEST visible config, so handing it the full future event set
+        # let a mid-round tick update be selected before replay had begun.
+        # Fee and delay are the only values consumed from this object and
+        # neither changes intra-round, so no decision was actually altered -
+        # but an initializer that can see the future is not an invariant, it
+        # is a bug waiting for its second consumer.
+        opening_configs = [e for e in events if e.event_type is EventType.MARKET_CONFIG]
+        if not opening_configs:
+            raise LookupError(
+                f"{self.round_id}: no MARKET_CONFIG recorded; the round's market "
+                "parameters were never captured"
+            )
+        earliest_config = min(opening_configs, key=lambda e: (e.event_time, e.sequence))
+        constraints = MarketConstraints.from_market_config(
+            market_config_from_payload(earliest_config.payload),
+            provenance=self.store.provenance,
+            source=f"round-opening MARKET_CONFIG ({self.store.provenance.value})",
+        )
 
         # Phase 12C.2 item 1: derive executable fee and taker delay from that
         # round's own MarketConstraints, so the simulation cannot run with a

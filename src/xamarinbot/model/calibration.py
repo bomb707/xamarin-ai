@@ -37,15 +37,25 @@ class IsotonicCalibrator:
         return self.ys[idx]
 
 
-def fit_isotonic(q_raw: list[float], y: list[int]) -> IsotonicCalibrator:
+def fit_isotonic(
+    q_raw: list[float], y: list[int], sample_weight: list[float] | None = None
+) -> IsotonicCalibrator:
+    """PAVA isotonic regression, optionally weighted (Gate A.0 item 6).
+
+    PAVA already carries a per-block weight for the pooling arithmetic, so
+    honouring sample weights is a matter of seeding each block with its own
+    weight instead of 1.0.
+    """
     if not q_raw:
         raise ValueError("cannot calibrate on zero examples")
+    if sample_weight is None:
+        sample_weight = [1.0] * len(q_raw)
     order = sorted(range(len(q_raw)), key=lambda i: q_raw[i])
     # PAVA: each block is [x_start, mean_y, weight]; merge back-to-front
     # whenever adjacent block means violate monotonicity.
     blocks: list[list[float]] = []
     for i in order:
-        blocks.append([q_raw[i], float(y[i]), 1.0])
+        blocks.append([q_raw[i], float(y[i]), float(sample_weight[i])])
         while len(blocks) > 1 and blocks[-2][1] > blocks[-1][1]:
             x2, y2, w2 = blocks.pop()
             x1, y1, w1 = blocks.pop()
@@ -63,11 +73,19 @@ class PlattCalibrator:
         return self.model.predict_proba([_logit(q_raw)])
 
 
-def fit_platt(q_raw: list[float], y: list[int]) -> PlattCalibrator:
+def fit_platt(
+    q_raw: list[float], y: list[int], sample_weight: list[float] | None = None
+) -> PlattCalibrator:
+    """Gate A.0 item 6: calibration is round-balanced for the same reason the
+    fit is. A calibration slice dominated by one busy round would be
+    calibrated to that round's conditions."""
     if not q_raw:
         raise ValueError("cannot calibrate on zero examples")
     X = [[_logit(q)] for q in q_raw]
-    model = fit_logistic_regression(X, y, feature_set_name="platt", column_names=("logit_q",), l2=0.0, lr=0.3, n_iters=300)
+    model = fit_logistic_regression(
+        X, y, feature_set_name="platt", column_names=("logit_q",),
+        l2=0.0, lr=0.3, n_iters=300, sample_weight=sample_weight,
+    )
     return PlattCalibrator(model=model)
 
 

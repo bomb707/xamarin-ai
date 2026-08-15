@@ -54,6 +54,8 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
 from xamarinbot.realtime.lifecycle import LifecycleConfig  # noqa: E402
+from xamarinbot.eligibility import summarize  # noqa: E402
+from xamarinbot.realtime.preflight import evaluate_round  # noqa: E402
 from xamarinbot.realtime.raw_store import RawEventStore  # noqa: E402
 from xamarinbot.realtime.service import RealRecorderService, ServiceConfig  # noqa: E402
 
@@ -77,8 +79,15 @@ def utc(ts: float | None = None) -> str:
 
 def append_index(db: Path, captures) -> int:
     """One JSONL line per finalized round. This is the progress ledger; it is
-    small, append-only, and readable without touching a capture."""
+    small, append-only, and readable without touching a capture.
+
+    Gate A.0 item 1: each record now carries the full eligibility breakdown
+    (`label_valid`, `data_training_grade`, `projection_valid`,
+    `training_eligible`, `data_disqualifiers`) rather than just a label
+    status, so nothing downstream has to re-derive "trainable" from a proxy.
+    """
     CAPTURE_DIR.mkdir(parents=True, exist_ok=True)
+    store = RawEventStore(str(db))
     n = 0
     with INDEX.open("a") as fh:
         for cap in captures:
@@ -104,10 +113,13 @@ def append_index(db: Path, captures) -> int:
                 ),
                 "label_status": rec.status.value if rec is not None else None,
                 "declared_agrees": rec.declared_agrees if rec is not None else None,
+                "rule_text_agrees": rec.rule_text_agrees if rec is not None else None,
                 "notes": cap.notes,
                 "indexed_at": time.time(),
+                **evaluate_round(store, m.round_id).as_index_fields(),
             }) + "\n")
             n += 1
+    store.close()
     return n
 
 
@@ -118,7 +130,13 @@ def read_index() -> list[dict]:
 
 
 def print_status() -> int:
-    """Progress toward Gate A, computed only from the index."""
+    """Progress toward Gate A, computed only from the index.
+
+    Gate A.0 item 1: the five counts are reported SEPARATELY. The previous
+    version equated `LabelStatus.CONFIRMED` with "trainable", which
+    over-counted the usable dataset - a CONFIRMED label sitting on a round
+    whose book went out of sync with the venue is not a trainable round.
+    """
     rows = read_index()
     print("=" * 78)
     print("CONTINUOUS CAPTURE STATUS")
@@ -128,41 +146,56 @@ def print_status() -> int:
         print(f"  index: {INDEX} (absent)")
         return 0
 
-    labelled = [r for r in rows if r["reconstructed_outcome"]]
-    confirmed = [r for r in rows if r.get("label_status") == "CONFIRMED"]
-    ambiguous = [r for r in rows if r.get("label_status") == "LABEL_AMBIGUOUS"]
-    unresolved = [r for r in rows if r.get("label_status") in (None, "UNRESOLVED")]
-    agreed = [r for r in rows if r.get("declared_agrees") is True]
-    comparable = [r for r in rows if r.get("declared_agrees") is not None]
+    legacy = [r for r in rows if "training_eligible" not in r]
+    if legacy:
+        print(f"  ! {len(legacy)} record(s) predate the Gate A.0 eligibility fields.")
+        print("    Run: python scripts/reindex_captures.py")
+        print()
 
+    def count(key: str) -> int:
+        return sum(1 for r in rows if r.get(key) is True)
+
+    eligible = [r for r in rows if r.get("training_eligible") is True]
     span_start = min(r["start_ts"] for r in rows)
     span_end = max(r["end_ts"] for r in rows)
     dbs = sorted({r["db"] for r in rows})
     disk = sum((_REPO_ROOT / d).stat().st_size for d in dbs if (_REPO_ROOT / d).exists())
 
-    print(f"  rounds captured        {len(rows)}")
-    print(f"  labelled               {len(labelled)}")
-    print(f"  CONFIRMED (trainable)  {len(confirmed)}")
-    print(f"  LABEL_AMBIGUOUS        {len(ambiguous)}  (excluded from training)")
-    print(f"  unresolved             {len(unresolved)}")
-    if comparable:
-        print(f"  label agreement        {len(agreed)}/{len(comparable)} "
-              f"({len(agreed) / len(comparable):.1%})")
+    print(f"  captured                     {len(rows)}")
+    print(f"  label CONFIRMED (valid)      {count('label_valid')}")
+    print(f"  data-quality clean           {count('data_training_grade')}")
+    print(f"  projection valid             {count('projection_valid')}")
+    print(f"  FINAL training eligible      {len(eligible)}")
+    print()
+
+    reasons: dict[str, int] = {}
+    for r in rows:
+        for d in r.get("disqualifiers", []) or []:
+            reasons[d] = reasons.get(d, 0) + 1
+    if reasons:
+        print("  DISQUALIFICATION REASONS BY CATEGORY")
+        for reason, n in sorted(reasons.items(), key=lambda kv: -kv[1]):
+            print(f"    {reason:<40} {n:>5}")
+        print()
+
     print(f"  chronological span     {utc(span_start)} -> {utc(span_end)} "
           f"({(span_end - span_start) / 3600:.1f}h)")
     print(f"  capture files          {len(dbs)}  ({disk / 1e9:.1f} GB)")
     print(f"  index                  {INDEX.relative_to(_REPO_ROOT)}")
 
-    # Rounds are 5 minutes apart, so chronological independence is a property
-    # of the market, not of the sampling - but a train/calibrate/test split
-    # still needs enough rounds in each slice to say anything.
     print()
     print("  GATE A READINESS (chronological TRAIN -> CALIBRATE -> FREEZE -> TEST)")
     for target in (100, 200, 500):
-        have = len(confirmed)
+        have = len(eligible)
         bar = "#" * min(30, int(30 * have / target))
-        print(f"    {target:>4} trainable rounds  [{bar:<30}] {have}/{target}"
+        print(f"    {target:>4} training-eligible rounds  [{bar:<30}] {have}/{target}"
               f"{'  READY' if have >= target else ''}")
+    print()
+    print("  NOTE: consecutive five-minute rounds are NOT automatically")
+    print("  independent - they are non-overlapping, which is a weaker property.")
+    print("  BTC volatility and book depth persist across round boundaries, so")
+    print("  Gate A must use block bootstrap and report effective sample size")
+    print("  rather than treating each round as an IID observation.")
     print()
     print("  No q model may be fitted from this data until the approval gate.")
     print("=" * 78)
