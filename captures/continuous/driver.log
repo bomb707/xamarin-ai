@@ -85,3 +85,16 @@ CONTINUOUS REAL BTC 5-MINUTE CAPTURE
 [continuous] batch 1 done in 54.8 min: 8 rounds (6 labelled), 1.84 GB -> btc5m_20260815T212143Z.db; 8 rounds accumulated
 
 [continuous] batch 2 starting at 20260815T221632Z
+==============================================================================
+CONTINUOUS REAL BTC 5-MINUTE CAPTURE
+  RECORDER ONLY - no orders, no credentials, no private key.
+  code sha     7a8494eb6ed38f1d839640236901acf6208bfd4b
+  pid          2757481   started 20260815T222301Z
+  python       3.12.3   recorder schema v3
+  batch size   8 rounds
+  output       captures/continuous/btc5m_<utc>.db
+  index        captures/continuous/INDEX.jsonl
+  until        interrupted
+==============================================================================
+
+[continuous] batch 1 starting at 20260815T222301Z
