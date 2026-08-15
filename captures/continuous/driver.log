@@ -1,0 +1,22 @@
+==============================================================================
+CONTINUOUS REAL BTC 5-MINUTE CAPTURE
+  RECORDER ONLY - no orders, no credentials, no private key.
+  batch size   8 rounds
+  output       captures/continuous/btc5m_<utc>.db
+  index        captures/continuous/INDEX.jsonl
+  until        interrupted
+==============================================================================
+
+[continuous] batch 1 starting at 20260815T140108Z
+[continuous] batch 1 done in 54.4 min: 8 rounds (7 labelled), 1.66 GB -> btc5m_20260815T140108Z.db; 8 rounds accumulated
+
+[continuous] batch 2 starting at 20260815T145535Z
+[continuous] batch 2 done in 55.7 min: 8 rounds (8 labelled), 1.48 GB -> btc5m_20260815T145535Z.db; 16 rounds accumulated
+
+[continuous] batch 3 starting at 20260815T155116Z
+[continuous] batch 3 done in 54.0 min: 8 rounds (8 labelled), 1.61 GB -> btc5m_20260815T155116Z.db; 24 rounds accumulated
+
+[continuous] batch 4 starting at 20260815T164515Z
+[continuous] batch 4 done in 53.3 min: 8 rounds (8 labelled), 1.86 GB -> btc5m_20260815T164515Z.db; 32 rounds accumulated
+
+[continuous] batch 5 starting at 20260815T173835Z

@@ -39,7 +39,7 @@ from xamarinbot.execution.session import TradingSession
 from xamarinbot.features.config import FeatureConfig
 from xamarinbot.features.engine import compute
 from xamarinbot.features.types import FeatureVector
-from xamarinbot.market.constraints import MarketConstraints
+from xamarinbot.market.constraints import MarketConstraints, reconcile_execution_state
 from xamarinbot.replay.feeds import ReplayBookFeed, ReplayCursor, market_config_from_payload
 from xamarinbot.model.features import FeatureSet, design_vector
 from xamarinbot.model.calibrated import CalibratedModel
@@ -264,7 +264,6 @@ class ShadowRunner:
         revalidation_cursor = ReplayCursor(self.store, self.round_id, preloaded=events)
         revalidation_book_feed = ReplayBookFeed(revalidation_cursor)
         regime_clf = RegimeClassifier(round_id=self.round_id)
-        one_step = OneStepController(self.one_step_cfg, self.exec_cfg, self.fee_config)
         # Phase 12B Tranche 2.2 item 3: the same shared execution/session
         # engine the supervisor-enabled walk-forward ablation arm uses -
         # RiskView-gated dispatch, open makers tracked (never an immediate
@@ -277,16 +276,46 @@ class ShadowRunner:
         # size, minimum order size in SHARES, fee rate and taker delay - not
         # from a static strategy config. On a REAL_REPLAY store these are the
         # values the venue reported for that market.
-        market_config = market_config_from_payload(
-            next(e.payload for e in events if e.event_type is EventType.MARKET_CONFIG)
-        )
-        constraints = MarketConstraints.from_market_config(
-            market_config,
-            provenance=self.store.provenance,
-            source=f"replayed MARKET_CONFIG ({self.store.provenance.value})",
-        )
+        def constraints_at(causal: list) -> MarketConstraints:
+            """The market's constraints as of this decision point.
 
-        session = TradingSession(self.round_id, self.fee_config, self.exec_cfg, self.one_step_cfg, constraints)
+            Phase 12C.2 item 2: tick size is CAUSAL and DYNAMIC. The verified
+            capture contains a real `tick_size_change` (0.01 -> 0.001 at
+            t=+280.2s), projected as a later MARKET_CONFIG update, so a single
+            immutable tick read once at round start would have priced every
+            late-round candidate on a grid the venue had already replaced.
+
+            `causal` is the recv_ts-gated event list, so this is
+            `latestRecordedTickVisibleByDecisionTime` - a tick change that has
+            not yet arrived cannot apply, and no future tick leaks backward.
+            """
+            configs = [e for e in causal if e.event_type is EventType.MARKET_CONFIG]
+            if not configs:
+                raise LookupError(
+                    f"{self.round_id}: no MARKET_CONFIG visible yet; the round's market "
+                    "parameters were never recorded"
+                )
+            latest = max(configs, key=lambda e: (e.event_time, e.sequence))
+            return MarketConstraints.from_market_config(
+                market_config_from_payload(latest.payload),
+                provenance=self.store.provenance,
+                source=f"replayed MARKET_CONFIG ({self.store.provenance.value})",
+            )
+
+        # Round-opening constraints, used for the session's own fee/delay
+        # reconciliation. Those two are market-level and do not change
+        # intra-round; only the tick does.
+        constraints = constraints_at(events)
+
+        # Phase 12C.2 item 1: derive executable fee and taker delay from that
+        # round's own MarketConstraints, so the simulation cannot run with a
+        # fee or delay the market never reported.
+        fee_config, exec_cfg = reconcile_execution_state(
+            constraints, self.fee_config, self.exec_cfg
+        )
+        one_step = OneStepController(self.one_step_cfg, exec_cfg, fee_config)
+
+        session = TradingSession(self.round_id, fee_config, exec_cfg, self.one_step_cfg, constraints)
         records: list[ShadowDecisionRecord] = []
         n_reconnects = 0
         n_missed = 0
@@ -443,6 +472,12 @@ class ShadowRunner:
                 q = self.model.predict_proba(vec)
             permitted = ActionPermissionMatrix.permitted_actions(classify_seed_action(snapshot.state))
             last_q, last_tau = q, fv.tau
+            # Phase 12C.2 item 2: re-read the tick from whatever MARKET_CONFIG
+            # has actually arrived by now. Candidate generation, price
+            # rounding, maker replacement and the hard execution-price limits
+            # all read it from here.
+            decision_constraints = constraints_at(causal_events)
+            session.constraints = decision_constraints
 
             # Review every open maker order (cancel/replace/expire) against
             # this decision point's fresh economics before generating a new
@@ -485,7 +520,7 @@ class ShadowRunner:
             # values were sitting on `fv`.
             decision = one_step.decide(
                 self.round_id, decision_ts, session.portfolio, q, permitted,
-                book_up, book_down, constraints, is_fresh,
+                book_up, book_down, decision_constraints, is_fresh,
                 tau=fv.tau, sigma=fv.realized_vol, risk_view=risk_view,
             )
             elapsed_ms = (time.perf_counter() - t0) * 1000.0

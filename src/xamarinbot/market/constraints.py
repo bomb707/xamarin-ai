@@ -118,13 +118,28 @@ class MarketConstraints:
         config: MarketConfig,
         *,
         condition_id: str | None = None,
-        settlement_kind: str = "chainlink_twap",
         provenance: DataProvenance = DataProvenance.SYNTHETIC_TEST,
         source: str = "market_config",
         captured_at: float | None = None,
     ) -> "MarketConstraints":
         """Build from a Phase-1 `MarketConfig`, which is what both the real
-        adapter and a replayed MARKET_CONFIG event produce."""
+        adapter and a replayed MARKET_CONFIG event produce.
+
+        Phase 12C.2 item 4 removed the `settlement_kind="chainlink_twap"`
+        default this used to carry. A default is a guess, and a guessed
+        settlement rule silently decides which reference series counts as
+        truth for the label - the single most consequential parameter in the
+        round. It now comes from `MarketConfig.settlement_kind`, which the
+        projection populates from the recorder's persisted metadata or fails
+        closed.
+        """
+        settlement_kind = config.settlement_kind
+        if not settlement_kind:
+            raise MarketConstraintError(
+                f"{config.market_id}: no settlement rule recorded; refusing to guess "
+                "one. A market whose settlement basis was never captured cannot be "
+                "labelled or replayed."
+            )
         return cls(
             condition_id=condition_id or config.market_id,
             up_token_id=config.up_token_id,
@@ -176,3 +191,75 @@ class MarketConstraints:
             source="for_testing",
             provenance=DataProvenance.SYNTHETIC_TEST,
         )
+
+
+class ExecutionStateConflict(ValueError):
+    """Raised when a caller supplies executable financial state that
+    contradicts what the market reported (Phase 12C.2 item 1)."""
+
+
+def reconcile_execution_state(
+    constraints: MarketConstraints,
+    fee_config: FeeConfig | None = None,
+    exec_cfg: "ExecutionConfig | None" = None,
+) -> "tuple[FeeConfig, ExecutionConfig]":
+    """Return the authoritative `(FeeConfig, ExecutionConfig)` for a round.
+
+    Phase 12C.2 item 1. `ShadowRunner`, `OneStepController` and
+    `TradingSession` each accepted a `FeeConfig` and an `ExecutionConfig`
+    independently of the round's `MarketConstraints`, which meant the system
+    could run with
+
+        Fee_simulation   != Fee_market
+        Delay_simulation != Delay_market
+
+    and nothing would notice. Both are financial state: the fee rate enters
+    every EV, every all-in cost cap and every fill; the taker delay decides
+    which book a delayed order is matched against. Two copies of either is
+    one copy too many.
+
+    The fix ELIMINATES the duplicate rather than asserting the copies agree:
+    on REAL_LIVE / REAL_REPLAY the market's own values are returned, so
+    `FeeUsed = FeeReportedByMarket` and `TakerDelayUsed = DelayReportedByMarket`
+    hold by construction. A caller that supplied a *different* value is not
+    silently overridden - that would hide a real disagreement - it raises.
+
+    On SYNTHETIC_TEST the caller's values win, because the whole point of a
+    generated round is to be able to vary them.
+    """
+    from xamarinbot.execution.config import ExecutionConfig
+
+    market_fee = constraints.fee_configuration
+    market_delay = constraints.taker_delay_ms
+
+    if not constraints.provenance.is_real:
+        return (
+            fee_config if fee_config is not None else market_fee,
+            exec_cfg if exec_cfg is not None else ExecutionConfig(taker_delay_ms=market_delay),
+        )
+
+    if fee_config is not None and fee_config.crypto_fee_rate != market_fee.crypto_fee_rate:
+        raise ExecutionStateConflict(
+            f"supplied FeeConfig(crypto_fee_rate={fee_config.crypto_fee_rate}) contradicts "
+            f"the market's reported fee rate {market_fee.crypto_fee_rate} for "
+            f"{constraints.condition_id}. On {constraints.provenance.value} data the "
+            "market is the single source of truth for executable fees - pass None, or "
+            "pass the market's own value."
+        )
+    if exec_cfg is not None and exec_cfg.taker_delay_ms != market_delay:
+        raise ExecutionStateConflict(
+            f"supplied ExecutionConfig(taker_delay_ms={exec_cfg.taker_delay_ms}) "
+            f"contradicts the market's reported taker delay {market_delay}ms for "
+            f"{constraints.condition_id}. On {constraints.provenance.value} data the "
+            "market is the single source of truth for the taker delay."
+        )
+
+    # Derived, not merely checked: the returned objects ARE the market's.
+    # The maker fill-model parameters are simulation knobs rather than market
+    # facts, so a caller's ExecutionConfig keeps those.
+    resolved_exec = (
+        ExecutionConfig(taker_delay_ms=market_delay, maker=exec_cfg.maker)
+        if exec_cfg is not None
+        else ExecutionConfig(taker_delay_ms=market_delay)
+    )
+    return market_fee, resolved_exec

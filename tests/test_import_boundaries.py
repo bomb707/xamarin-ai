@@ -26,13 +26,22 @@ SRC = REPO_ROOT / "src" / "xamarinbot"
 #: shipped inside `src/xamarinbot/` may import any of them.
 FORBIDDEN_PREFIXES = ("xamarinbot.synthetic", "devtools", "tests")
 
-#: Real-market entry points. These run against the live venue or a real
-#: capture, so they are held to the same standard as the library.
-REAL_SCRIPTS = (
-    "scripts/run_market_discovery.py",
-    "scripts/run_real_recorder.py",
-    "scripts/resolve_capture_labels.py",
-)
+def real_scripts() -> list[pathlib.Path]:
+    """Every TOP-LEVEL script in `scripts/`, discovered automatically.
+
+    Phase 12C.2 item 5: this was a hand-maintained tuple that had already
+    fallen behind - `run_real_replay_smoke.py` and `write_capture_manifest.py`
+    were added in 12C.1 and silently escaped the guard. A manually curated
+    allowlist of things to check is exactly the wrong shape: the failure mode
+    is forgetting to add one, and forgetting produces silence.
+
+    `scripts/dev_synthetic/**` is excluded by construction - those are the
+    synthetic demos, and importing the generator is their whole purpose.
+    """
+    return sorted(
+        p for p in (REPO_ROOT / "scripts").glob("*.py")
+        if "__pycache__" not in p.parts
+    )
 
 #: Deleted in Phase 12C.1 item 7 as duplicate/superseded real-market sources,
 #: or deprecated pending Phase 13. Re-introducing an import of any of these
@@ -105,14 +114,23 @@ def test_no_shipped_module_imports_fabricated_data_machinery():
 
 
 def test_real_market_scripts_import_no_fabricated_data():
+    scripts = real_scripts()
+    assert scripts, "scripts/ must contain at least one real-market entry point"
     offenders = []
-    for rel in REAL_SCRIPTS:
-        path = REPO_ROOT / rel
-        assert path.exists(), f"{rel} is a real-market entry point and must exist"
+    for path in scripts:
         for module in imported_modules(path):
             if violates(module, FORBIDDEN_PREFIXES):
-                offenders.append(f"{rel} imports {module}")
+                offenders.append(f"{path.relative_to(REPO_ROOT)} imports {module}")
     assert not offenders, "real-market scripts must never import synthetic data:\n  " + "\n  ".join(offenders)
+
+
+def test_the_guard_covers_every_top_level_script():
+    """The discovery itself is asserted, so a new top-level script cannot be
+    added without the guard picking it up."""
+    discovered = {p.name for p in real_scripts()}
+    on_disk = {p.name for p in (REPO_ROOT / "scripts").glob("*.py")}
+    assert discovered == on_disk
+    assert not any((REPO_ROOT / "scripts" / "dev_synthetic" / n).exists() for n in discovered)
 
 
 def test_no_module_anywhere_references_a_mock_adapter():
@@ -133,7 +151,7 @@ def test_no_module_anywhere_references_a_mock_adapter():
 
 def test_retired_and_deprecated_adapters_have_no_importers():
     """Item 7: one canonical live-market implementation."""
-    searched = python_files(SRC) + [REPO_ROOT / r for r in REAL_SCRIPTS]
+    searched = python_files(SRC) + real_scripts()
     offenders = []
     for path in searched:
         for module in imported_modules(path):
@@ -174,13 +192,14 @@ def test_synthetic_demo_scripts_are_unmistakable():
     assert top_level == {
         "run_market_discovery.py",
         "run_real_recorder.py",
+        "run_continuous_capture.py",
         "resolve_capture_labels.py",
         "run_real_replay_smoke.py",
         "write_capture_manifest.py",
     }, f"scripts/ must hold only real-market entry points; found {sorted(top_level)}"
 
 
-@pytest.mark.parametrize("rel", REAL_SCRIPTS)
+@pytest.mark.parametrize("rel", [str(p.relative_to(REPO_ROOT)) for p in real_scripts()])
 def test_real_scripts_place_no_orders(rel):
     """Item 14 / 18: no real orders are sent from any real entry point."""
     text = (REPO_ROOT / rel).read_text().lower()

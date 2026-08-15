@@ -369,11 +369,11 @@ def test_order_survives_tick_size_change_event_without_error():
     store = EventStore(":memory:")
     store.append(EventType.MARKET_CONFIG, "r1", recv_ts=0.0, source_ts=0.0, payload=dict(
         market_id="r1", up_token_id="U", down_token_id="D", start_ts=0.0, end_ts=300.0,
-        tick_size=0.01, min_order_size=1.0, fee_rate=0.07, taker_delay_ms=0.0, twap_window_seconds=30,
+        tick_size=0.01, min_order_size=1.0, fee_rate=0.07, taker_delay_ms=0.0, twap_window_seconds=30, settlement_kind="chainlink_twap",
     ))
     store.append(EventType.MARKET_CONFIG, "r1", recv_ts=100.0, source_ts=100.0, payload=dict(
         market_id="r1", up_token_id="U", down_token_id="D", start_ts=0.0, end_ts=300.0,
-        tick_size=0.001, min_order_size=1.0, fee_rate=0.07, taker_delay_ms=0.0, twap_window_seconds=30,
+        tick_size=0.001, min_order_size=1.0, fee_rate=0.07, taker_delay_ms=0.0, twap_window_seconds=30, settlement_kind="chainlink_twap",
     ))
     configs = [e.payload["tick_size"] for e in store.all_events("r1") if e.event_type is EventType.MARKET_CONFIG]
     assert configs == [0.01, 0.001]

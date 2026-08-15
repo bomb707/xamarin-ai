@@ -83,6 +83,28 @@ def main() -> int:
     print(f"  settlement basis   {result.settlement_topic} (from the market's own metadata)")
     print(f"  p0                 {result.p0!r}  (real observation at/before the open)")
 
+    print("\nCAUSAL TICK-SIZE TIMELINE (item 2)")
+    print("-" * 78)
+    for ts, tick in result.tick_timeline:
+        rel = ts - result.start_ts
+        print(f"  t={rel:+9.1f}s   tick = {tick}")
+    if len(result.tick_timeline) == 1:
+        print("  (this round's tick never changed)")
+
+    print("\nLABEL TIMING (item 3)")
+    print("-" * 78)
+    if result.label is None:
+        print("  no venue outcome recorded for this round")
+    else:
+        lag = (result.label_observed_at or 0) - result.end_ts
+        print(f"  outcome            {result.label.outcome.value} "
+              f"(provenance {result.label.provenance.value})")
+        print(f"  round closed at    {result.end_ts:.3f}")
+        print(f"  outcome observed   {result.label_observed_at:.3f}  "
+              f"({lag:+.1f}s after the close)")
+        print("  the label rides the RoundLabel path, NOT the causal event stream,")
+        print("  so it cannot be seen by the feature engine before it was known.")
+
     print("\nRAW EVENTS DELIBERATELY NOT PROJECTED")
     print("-" * 78)
     if result.skipped:
@@ -101,10 +123,10 @@ def main() -> int:
         provenance=DataProvenance.REAL_REPLAY,
         source="projected MARKET_CONFIG",
     )
-    print("\nEXECUTABLE MARKET CONSTRAINTS (read from the market, not guessed)")
+    print("\nEXECUTABLE MARKET CONSTRAINTS AT ROUND OPEN (read from the market)")
     print("-" * 78)
     print(f"  min_order_shares   {constraints.min_order_shares}   (SHARES, not USDC notional)")
-    print(f"  tick_size          {constraints.tick_size}")
+    print(f"  tick_size          {constraints.tick_size}   (at open; see the causal timeline above)")
     print(f"  fee rate           {constraints.fee_configuration.crypto_fee_rate}")
     print(f"  taker delay        {constraints.taker_delay_ms} ms")
     print(f"  settlement         {constraints.settlement_kind} / {constraints.twap_window_s}s")

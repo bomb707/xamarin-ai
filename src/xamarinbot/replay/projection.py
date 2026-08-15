@@ -61,6 +61,7 @@ from xamarinbot.events.types import EventType
 from xamarinbot.provenance import DataProvenance
 from xamarinbot.realtime.raw_events import RawEvent, Topic
 from xamarinbot.realtime.raw_store import RawEventStore
+from xamarinbot.rounds import RoundLabel
 
 #: Reserved payload key holding the raw-event provenance block. Chosen with a
 #: leading underscore so it cannot collide with a market field, and filtered
@@ -111,6 +112,16 @@ class ProjectionResult:
     #: information about the capture, not an error.
     skipped: dict[str, int] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
+    #: Phase 12C.2 item 3: the supervised target, kept OFF the causal event
+    #: stream. "causal market events -> FeatureEngine, eventual RoundLabel ->
+    #: supervised target". None when the round has no venue outcome yet.
+    label: "RoundLabel | None" = None
+    #: When the venue's outcome was actually observed, seconds. Strictly
+    #: later than `end_ts` in every real capture.
+    label_observed_at: float | None = None
+    #: Tick sizes in force over the round, oldest first, as
+    #: `(source_ts, tick)` - the causal record item 2 requires.
+    tick_timeline: list[tuple[float, float]] = field(default_factory=list)
 
     @property
     def total_projected(self) -> int:
@@ -128,6 +139,14 @@ class ProjectionResult:
             "skipped": dict(self.skipped),
             "total_projected": self.total_projected,
             "warnings": list(self.warnings),
+            "label": None if self.label is None else {
+                "outcome": self.label.outcome.value,
+                "p0": self.label.p0,
+                "final_reference": self.label.final_reference,
+                "provenance": self.label.provenance.value,
+            },
+            "label_observed_at": self.label_observed_at,
+            "tick_timeline": [list(t) for t in self.tick_timeline],
         }
 
 
@@ -159,6 +178,36 @@ def _times(e: RawEvent) -> tuple[float, float] | None:
     return (e.source_timestamp_ns / 1e9, e.recv_wall_timestamp_ns / 1e9)
 
 
+#: Raw event types that record the moment the venue's resolution was
+#: actually OBSERVED. `market_metadata_resolution` is written by the
+#: post-capture resolution sweep; `label_reconstruction_resolved` by the
+#: reconciliation that follows it.
+_RESOLUTION_EVENT_TYPES = (
+    "market_metadata_resolution",
+    "clob_market_info_resolution",
+    "label_reconstruction_resolved",
+    "market_resolved_final",
+)
+
+
+def _resolution_observed_at(raw: RawEventStore, round_id: str) -> float | None:
+    """When this system actually learned the venue's outcome, in seconds.
+
+    Phase 12C.2 item 3: a label must never become causally visible merely
+    because the five-minute clock ended. In the verified capture the round
+    closed at t=0+300s but the outcome was not observed until t=+391.6s.
+    Returns None when the capture contains no resolution observation at all -
+    in which case there is no honest timestamp and nothing is emitted.
+    """
+    candidates = [
+        e.recv_wall_timestamp_ns / 1e9
+        for e in raw.events(round_id=round_id,
+                            topics=[Topic.MARKET_METADATA, Topic.RECORDER_CONTROL])
+        if e.event_type in _RESOLUTION_EVENT_TYPES
+    ]
+    return min(candidates) if candidates else None
+
+
 def _levels(raw: list) -> list[list[float]]:
     """`[{"price": "0.44", "size": "100"}, ...]` -> `[[0.44, 100.0], ...]`,
     the shape `features/engine.py` and `replay/feeds.py` both expect."""
@@ -187,7 +236,7 @@ def project_round(
     out: EventStore,
     *,
     spot_topic: Topic = SPOT_TOPIC,
-    include_settlement: bool = True,
+    include_settlement: bool = False,
 ) -> ProjectionResult:
     """Project one captured round into `out`.
 
@@ -214,7 +263,19 @@ def project_round(
 
     start_ts = row["start_ts_ns"] / 1e9
     end_ts = row["end_ts_ns"] / 1e9
-    settlement_kind = row.get("settlement_kind") or "chainlink_reference"
+    # Phase 12C.2 item 4: fail closed. This used to read
+    # `row.get("settlement_kind") or "chainlink_reference"`, so a round whose
+    # settlement rule was never captured would silently be projected against
+    # the plain reference series - quietly choosing which price series counts
+    # as truth for the label, which is the most consequential parameter in
+    # the round. A missing rule now invalidates the projection.
+    settlement_kind = row.get("settlement_kind")
+    if not settlement_kind:
+        raise ProjectionError(
+            f"{round_id}: no settlement rule recorded in the round metadata. "
+            "Refusing to guess one - a round whose settlement basis is unknown "
+            "cannot be labelled or replayed."
+        )
     twap_window_s = row.get("twap_window_s")
     twap_topic = settlement_topic_for(settlement_kind, twap_window_s)
 
@@ -229,6 +290,12 @@ def project_round(
     batch: list[tuple] = []
 
     def emit(event_type: EventType, source_ts: float, recv_ts: float, payload: dict) -> None:
+        batch.append((event_type, round_id, recv_ts, source_ts, payload))
+        result.counts[event_type.value] = result.counts.get(event_type.value, 0) + 1
+
+    def emit_raw(event_type: EventType, source_ts: float | None, recv_ts: float, payload: dict) -> None:
+        """Same as `emit`, but allows `source_ts=None` for an observation that
+        genuinely has no external source timestamp (item 3)."""
         batch.append((event_type, round_id, recv_ts, source_ts, payload))
         result.counts[event_type.value] = result.counts.get(event_type.value, 0) + 1
 
@@ -281,12 +348,29 @@ def project_round(
             f"{round_id}: market declares no TWAP window; refusing to assume one"
         )
 
-    earliest = min(
-        (t[0] for e in raw.events(round_id=round_id) if (t := _times(e)) is not None),
-        default=start_ts,
-    )
-    config_ts = min(earliest, start_ts) - 1e-6
-    emit(EventType.MARKET_CONFIG, config_ts, config_ts, {
+    # Phase 12C.2 item 3: the MARKET_CONFIG event's visibility timestamp is
+    # the moment the recorder ACTUALLY received the market metadata, not a
+    # fabricated `min(earliest, start_ts) - 1e-6`. That expression existed
+    # only to force the config to sort first; inventing a source timestamp to
+    # win a sort is exactly the kind of small fiction this phase removes.
+    #
+    # The REST metadata carries no external source timestamp, so
+    # `source_ts = None` is the honest value - `Event.event_time` then falls
+    # back to `recv_ts`, which is genuinely when this system learned it. In
+    # the verified capture that is 473.5s before the round opens, so the
+    # config is causally visible at every decision point on its own merits.
+    metadata_events = [
+        e for e in raw.events(round_id=round_id, topics=[Topic.MARKET_METADATA])
+        if e.event_type == "market_metadata_discovered"
+    ]
+    if not metadata_events:
+        raise ProjectionError(
+            f"{round_id}: no market_metadata_discovered event recorded, so there is no "
+            "real timestamp at which this system learned the market's parameters. "
+            "Refusing to fabricate one."
+        )
+    config_recv_ts = metadata_events[0].recv_wall_timestamp_ns / 1e9
+    emit_raw(EventType.MARKET_CONFIG, None, config_recv_ts, {
         "market_id": round_id,
         "up_token_id": row["up_token_id"],
         "down_token_id": row["down_token_id"],
@@ -297,14 +381,76 @@ def project_round(
         "fee_rate": float(fee_rate),
         "taker_delay_ms": float(row.get("taker_delay_ms") or 0.0),
         "twap_window_seconds": int(twap_window_s),
+        # Phase 12C.2 item 4: the settlement rule is a first-class market
+        # parameter, carried Raw metadata -> MARKET_CONFIG ->
+        # MarketConstraints -> ShadowRunner, so no layer re-derives or
+        # defaults it.
+        "settlement_kind": settlement_kind,
         PROVENANCE_KEY: {
-            "source": "recorder rounds table",
+            "source": "recorder rounds table + market_metadata_discovered",
             "condition_id": row.get("condition_id"),
-            "settlement_kind": settlement_kind,
             "resolution_source": row.get("resolution_source"),
+            "raw_event_id": [metadata_events[0].session_id,
+                             metadata_events[0].recorder_sequence],
             "provenance": DataProvenance.REAL_REPLAY.value,
         },
     })
+
+    # ------------------------------------------- causal tick-size updates
+    # Phase 12C.2 item 2. `tick_size_change` used to be counted as
+    # "no_normalized_event_for" and dropped, leaving one immutable tick for
+    # the whole replay. The verified capture contains a real change from 0.01
+    # to 0.001 at t=+280.2s, so every late-round candidate would have been
+    # priced, rounded and limit-capped on a grid the venue had already
+    # replaced.
+    #
+    # Each change is projected as a later MARKET_CONFIG carrying the new tick
+    # and every other constraint unchanged, so `ShadowRunner` can simply read
+    # "the latest MARKET_CONFIG visible by decision time". The event keeps its
+    # own source/receive timestamps, so it becomes visible exactly when it
+    # genuinely arrived and no future tick leaks backward.
+    #
+    # A tick change is a MARKET-level fact that the venue announces once per
+    # affected token; deduplicating on (source_ts, new_tick) avoids emitting
+    # one redundant config per token for the same change.
+    seen_ticks: set[tuple[int, float]] = set()
+    current_tick = float(row["tick_size"])
+    for e in raw.events(round_id=round_id, topics=[Topic.CLOB_MARKET]):
+        if e.event_type != "tick_size_change":
+            continue
+        t = _times(e)
+        new_tick = e.payload.get("new_tick_size") or e.payload.get("tick_size")
+        if t is None or new_tick is None:
+            skip("tick_size_change_without_timestamp_or_value")
+            continue
+        if float(new_tick) == current_tick:
+            # The venue announces a change once per affected token, and the
+            # two announcements can carry slightly different millisecond
+            # timestamps. Re-emitting a config for a tick that did not
+            # actually change would add noise to the causal record without
+            # adding information.
+            skip("tick_size_change_repeat_same_value")
+            continue
+        seen_ticks.add((e.source_timestamp_ns, float(new_tick)))
+        current_tick = float(new_tick)
+        emit(EventType.MARKET_CONFIG, t[0], t[1], {
+            "market_id": round_id,
+            "up_token_id": row["up_token_id"],
+            "down_token_id": row["down_token_id"],
+            "start_ts": start_ts,
+            "end_ts": end_ts,
+            "tick_size": current_tick,
+            "min_order_size": float(row["min_order_size"]),
+            "fee_rate": float(fee_rate),
+            "taker_delay_ms": float(row.get("taker_delay_ms") or 0.0),
+            "twap_window_seconds": int(twap_window_s),
+            "settlement_kind": settlement_kind,
+            PROVENANCE_KEY: dict(
+                _provenance_block(e),
+                source="clob tick_size_change",
+                old_tick_size=e.payload.get("old_tick_size"),
+            ),
+        })
 
     # --------------------------------------------------------------- TWAP
     for e in twap_events:
@@ -380,19 +526,43 @@ def project_round(
                 "book_hash": payload.get("hash"),
                 PROVENANCE_KEY: _provenance_block(e),
             })
+        elif e.event_type == "tick_size_change":
+            # Handled by its own pass below (Phase 12C.2 item 2), which emits
+            # a MARKET_CONFIG update. Not a skip.
+            continue
         else:
-            # last_trade_price / best_bid_ask / tick_size_change / control
-            # events have no normalized counterpart the feature engine reads.
-            # They stay in the raw log rather than being forced into a shape
-            # that would misrepresent them.
+            # last_trade_price / best_bid_ask / control events have no
+            # normalized counterpart the feature engine reads. They stay in
+            # the raw log rather than being forced into a shape that would
+            # misrepresent them.
             skip(f"no_normalized_event_for:{e.event_type}")
 
     # --------------------------------------------------------- SETTLEMENT
+    # Phase 12C.2 item 3. This used to emit
+    # `SETTLEMENT(source_ts=end_ts, recv_ts=end_ts)`, which made the venue's
+    # outcome causally visible the instant the five-minute clock ran out. In
+    # the verified capture the outcome was not learned until t=+391.6s - so
+    # that stamp handed the feature/controller stream 92 seconds of
+    # foreknowledge of the answer.
+    #
+    # It is now OFF by default: the supervised target belongs on the
+    # `RoundLabel` path (`result.label`), not in the causal event stream that
+    # feeds the feature engine. When a caller does want it in the store, its
+    # visibility timestamp is the moment the resolution was actually
+    # observed.
     if include_settlement:
+        resolution_recv = _resolution_observed_at(raw, round_id)
+        if resolution_recv is None:
+            result.warnings.append(
+                "settlement requested but no resolution-observation event was recorded; "
+                "omitting SETTLEMENT rather than stamping it at the round end"
+            )
         for res in raw.round_results():
             if res.get("round_id") != round_id or not res.get("reported_outcome"):
                 continue
-            emit(EventType.SETTLEMENT, end_ts, end_ts, {
+            if resolution_recv is None:
+                continue
+            emit_raw(EventType.SETTLEMENT, None, resolution_recv, {
                 "outcome": res["reported_outcome"],
                 "final_reference": res.get("end_reference_value"),
                 "p0": result.p0,
@@ -401,9 +571,37 @@ def project_round(
                     "reconstructed_outcome": res.get("reconstructed_outcome"),
                     "reconstruction_basis": res.get("reconstruction_basis"),
                     "label_agreement": res.get("label_agreement"),
+                    "observed_at": resolution_recv,
                     "provenance": DataProvenance.REAL_REPLAY.value,
                 },
             })
+
+    # Phase 12C.2 item 2: the causal tick record, oldest first.
+    result.tick_timeline = sorted(
+        {(config_recv_ts, float(row["tick_size"]))}
+        | {(ts / 1e9, tick) for ts, tick in seen_ticks}
+    )
+
+    # Phase 12C.2 item 3: the supervised target travels here, NOT in the
+    # causal event stream, and carries the moment it was actually observed.
+    result.label_observed_at = _resolution_observed_at(raw, round_id)
+    for res in raw.round_results():
+        if res.get("round_id") != round_id or not res.get("reported_outcome"):
+            continue
+        from xamarinbot.portfolio.state import Side
+
+        result.label = RoundLabel(
+            round_id=round_id,
+            p0=result.p0,
+            final_reference=res.get("end_reference_value") or float("nan"),
+            outcome=Side.UP if res["reported_outcome"] == "UP" else Side.DOWN,
+            provenance=DataProvenance.REAL_REPLAY,
+        )
+        if result.label_observed_at is not None and result.label_observed_at <= end_ts:
+            result.warnings.append(
+                f"resolution observed at {result.label_observed_at} which is not after "
+                f"the round end {end_ts}; treat this round's label timing as suspect"
+            )
 
     out.append_many(batch)
     return result

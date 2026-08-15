@@ -125,6 +125,7 @@ def market_config_from_metadata(meta: RealMarketMetadata) -> MarketConfig:
         fee_rate=meta.fees.effective_rate,
         taker_delay_ms=meta.taker_delay_ms,
         twap_window_seconds=meta.twap_window_s,
+        settlement_kind=meta.settlement_kind,
     )
 
 

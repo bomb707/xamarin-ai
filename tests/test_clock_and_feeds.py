@@ -60,12 +60,12 @@ def _round_id_store_with_config_changes() -> tuple[EventStore, str]:
     store.append(
         EventType.MARKET_CONFIG, round_id, recv_ts=0.0, source_ts=0.0,
         payload=dict(market_id=round_id, up_token_id="U", down_token_id="D", start_ts=0.0, end_ts=300.0,
-                     tick_size=0.01, min_order_size=1.0, fee_rate=0.07, taker_delay_ms=0.0, twap_window_seconds=30),
+                     tick_size=0.01, min_order_size=1.0, fee_rate=0.07, taker_delay_ms=0.0, twap_window_seconds=30, settlement_kind="chainlink_twap"),
     )
     store.append(
         EventType.MARKET_CONFIG, round_id, recv_ts=120.0, source_ts=120.0,
         payload=dict(market_id=round_id, up_token_id="U", down_token_id="D", start_ts=0.0, end_ts=300.0,
-                     tick_size=0.001, min_order_size=1.0, fee_rate=0.07, taker_delay_ms=0.0, twap_window_seconds=30),
+                     tick_size=0.001, min_order_size=1.0, fee_rate=0.07, taker_delay_ms=0.0, twap_window_seconds=30, settlement_kind="chainlink_twap"),
     )
     return store, round_id
 

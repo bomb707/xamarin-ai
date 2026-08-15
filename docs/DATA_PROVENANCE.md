@@ -1,4 +1,4 @@
-# Data Provenance & Runtime Market Constraints (Phase 12C.1)
+# Data Provenance & Runtime Market Constraints (Phase 12C.1 + 12C.2)
 
 Two invariants, made structurally true rather than conventionally observed:
 
@@ -89,8 +89,10 @@ No back-compat aliases were kept — they would defeat the guard below.
 - nothing under `src/xamarinbot/**` imports `xamarinbot.synthetic`,
   `devtools*`, or `tests*`
 - no shipped module references any `Mock*` name
-- the three real-market scripts import no fabricated data and reference no
-  order-placing symbol
+- every top-level `scripts/*.py` — **auto-discovered**, not a hand-maintained
+  list (12C.2 item 5; the old tuple had already fallen behind by two scripts)
+  — imports no fabricated data and references no order-placing symbol,
+  excluding `scripts/dev_synthetic/**` by construction
 - the retired adapters have no importers and their files are gone
 - every `scripts/dev_synthetic/*.py` is named `run_synthetic_*`, and
   `scripts/` holds only real-market entry points
@@ -117,7 +119,7 @@ RawEventStore_real  ->  NormalizedEventStore_real  ->  FeatureEngine
 | `SPOT` | Binance BTCUSDT (leading signal) |
 | `BOOK_SNAPSHOT` | `clob_market:book` + REST bootstrap/resync snapshots |
 | `BOOK_DELTA` | each `clob_market:price_change` element |
-| `SETTLEMENT` | the venue's resolved outcome, when captured |
+| `SETTLEMENT` | **off by default** — the label rides `RoundLabel` instead (12C.2 item 3) |
 
 **Nothing is ever synthesized.** Not a TWAP, spot, book observation, `p0`,
 or timestamp. `p0` is the settlement-basis observation at or **before** the
@@ -139,10 +141,71 @@ they ride in a reserved `_provenance` payload block together with the raw
 event's identity, its `condition_id`/`token_id`/side, the reconnect
 generation, and a SHA-256 of the original wire bytes.
 
+**No timestamp is ever invented** (12C.2 item 3). `MARKET_CONFIG` is stamped
+with the moment the recorder actually received the REST metadata, with
+`source_ts = None` because that payload genuinely has no external source
+timestamp — it is *not* back-dated to sort before the round. In the verified
+capture that is 473.5s before the open, so it is causally visible on its own
+merits.
+
+### The tick is causal (12C.2 item 2)
+
+`tick_size_change` is projected as a later `MARKET_CONFIG` carrying the new
+tick and every other constraint unchanged, so
+
+    tick(t) = latestRecordedTickVisibleByDecisionTime
+
+`ShadowRunner` re-reads it at every decision from the recv_ts-gated event
+list, and candidate generation, price rounding, maker replacement and the
+hard execution-price caps all use that value. The canonical capture contains
+a real change from **0.01 to 0.001 at t=+280.2s**, so a single immutable tick
+would have priced the last 20 seconds of the round on a grid the venue had
+already replaced. A repeat announcement of the same tick (the venue announces
+once per token) is not re-emitted.
+
+### The label is not a market event (12C.2 item 3)
+
+`SETTLEMENT` is **off by default**. It used to be stamped
+`source_ts = recv_ts = end_ts`, which made the outcome causally visible the
+instant the five-minute clock ran out — in the verified capture the outcome
+was not observed until **t=+91.6s after the close**, so that stamp handed the
+feature stream a minute and a half of foreknowledge.
+
+    causal market events  -> FeatureEngine
+    eventual RoundLabel   -> supervised target
+
+The target now rides `ProjectionResult.label` (a `RoundLabel`), with
+`label_observed_at` recording when it was genuinely known. If a caller does
+put `SETTLEMENT` in the store, its visibility timestamp is that real
+observation time, and it is omitted entirely when no resolution observation
+was recorded.
+
 `EventStore.append_many()` exists because one real round is ~180,000
 normalized events and `append()` commits per call.
 
 ---
+
+## 4b. Executable financial state has one source (12C.2 item 1)
+
+`ShadowRunner`, `OneStepController` and `TradingSession` each used to accept a
+`FeeConfig` and an `ExecutionConfig` independently of the round's
+`MarketConstraints`, so the system could run with
+
+    Fee_simulation   != Fee_market
+    Delay_simulation != Delay_market
+
+and nothing would notice. Both are financial state — the fee enters every EV,
+every all-in cost cap and every fill; the taker delay decides which book a
+delayed order matches against.
+
+`reconcile_execution_state(constraints, fee_config, exec_cfg)` **eliminates
+the duplicate** rather than asserting the copies agree: on `REAL_*` it returns
+the market's own values, so `FeeUsed = FeeReportedByMarket` and
+`TakerDelayUsed = DelayReportedByMarket` hold by construction. A caller that
+supplied a *different* value raises `ExecutionStateConflict` rather than being
+silently overridden. Maker fill-model parameters are simulation knobs, not
+market facts, so a caller keeps those. On `SYNTHETIC_TEST` the caller's values
+win — varying them is the point of a generated round.
 
 ## 5. Runtime market constraints (items 11–14)
 
@@ -228,6 +291,13 @@ Neither plain-Chainlink nor TWAP-60 is hardcoded anywhere. The projection
 and the label reconstructor both read the round's **persisted**
 `settlement_kind` / `twap_window_s`.
 
+There is **no fallback** anywhere: `row.get("settlement_kind") or
+"chainlink_reference"` and the implicit `settlement_kind="chainlink_twap"`
+default on `MarketConstraints.from_market_config` are both gone (12C.2
+item 4). `settlement_kind` is now a required `MarketConfig` field travelling
+Raw metadata → `MARKET_CONFIG` → `MarketConstraints` → `ShadowRunner`; a round
+whose settlement basis was never recorded fails the projection closed.
+
 `realtime/label.py` adds `LabelStatus{CONFIRMED, LABEL_AMBIGUOUS,
 UNRESOLVED}`. A round is **`LABEL_AMBIGUOUS`** — and excluded from training —
 when the declared basis reconstructs a different outcome from the one the
@@ -264,6 +334,10 @@ reported `NOT_TRAINING_GRADE - unlabellable rounds`.
 # real market, read-only
 python scripts/run_market_discovery.py --rounds 2
 python scripts/run_real_recorder.py --rounds 1 --db captures/run.db
+
+# continuous accumulation for the profitability phase
+python scripts/run_continuous_capture.py --rounds 8      # runs until stopped
+python scripts/run_continuous_capture.py --status        # progress, captures nothing
 python scripts/resolve_capture_labels.py captures/run.db
 python scripts/write_capture_manifest.py
 

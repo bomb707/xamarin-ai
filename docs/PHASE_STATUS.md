@@ -236,6 +236,19 @@ reaches 0.990 and the outcome is effectively decided, so `clob_mid` is
 genuinely undefined there. Missing real data correctly stays missing rather
 than being interpolated.
 
+### Phase 12C.2 - final real-replay correctness closure
+
+Four fabrications removed. Each produced a plausible replay that was quietly
+wrong in a way no aggregate metric would have exposed.
+
+| # | Was | Now |
+|---|---|---|
+| 1 | `ShadowRunner`/`OneStepController`/`TradingSession` took `FeeConfig`/`ExecutionConfig` independently of the market, so `Fee_sim != Fee_market` and `Delay_sim != Delay_market` were both possible | `reconcile_execution_state()` DERIVES both from the round's `MarketConstraints` on REAL data; a contradicting caller value raises `ExecutionStateConflict` |
+| 2 | one immutable tick for the whole replay; `tick_size_change` was dropped as "no normalized event" | projected as a later `MARKET_CONFIG`; `tick(t) = latestRecordedTickVisibleByDecisionTime`, re-read per decision. **The canonical capture really does change 0.01 -> 0.001 at t=+280.2s** |
+| 3 | `config_ts = min(earliest, start_ts) - 1e-6`; `SETTLEMENT(source_ts=end_ts, recv_ts=end_ts)` | MARKET_CONFIG uses the real `market_metadata_discovered` recv time with `source_ts=None`; SETTLEMENT is off by default and the label rides `RoundLabel`. **The outcome was learned +91.6s after the close** - that stamp was 92s of foreknowledge |
+| 4 | `row.get("settlement_kind") or "chainlink_reference"`, and an implicit `settlement_kind="chainlink_twap"` default | required `MarketConfig` field, fail-closed end to end |
+| 5 | hand-maintained `REAL_SCRIPTS` tuple, already two scripts stale | auto-discovers every top-level `scripts/*.py` |
+
 ## Not yet implemented (future work)
 
 | Phase | What it needs |

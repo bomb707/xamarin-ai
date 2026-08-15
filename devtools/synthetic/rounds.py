@@ -63,6 +63,7 @@ def populate_synthetic_round(
     vol_bp_per_tick: float = 5.0,
     bias_bp_per_tick: float = 0.0,
     twap_window_seconds: int = 30,
+    settlement_kind: str = "chainlink_twap",
     tick_size: float = 0.01,
     min_order_size: float = 1.0,
     fee_rate: float = 0.07,
@@ -97,6 +98,10 @@ def populate_synthetic_round(
             fee_rate=fee_rate,
             taker_delay_ms=0.0,
             twap_window_seconds=twap_window_seconds,
+            # Phase 12C.2 item 4: settlement_kind is a required market
+            # parameter with no default. The generator models a
+            # TWAP-settled market, so it says so explicitly.
+            settlement_kind=settlement_kind,
         ),
     )
 

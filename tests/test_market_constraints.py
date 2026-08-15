@@ -72,7 +72,7 @@ def test_built_from_the_market_s_own_config():
     cfg = MarketConfig(
         market_id="btc-updown-5m-1786777800", up_token_id="U", down_token_id="D",
         start_ts=1786777800.0, end_ts=1786778100.0, tick_size=0.01,
-        min_order_size=5.0, fee_rate=0.07, taker_delay_ms=0.0, twap_window_seconds=60,
+        min_order_size=5.0, fee_rate=0.07, taker_delay_ms=0.0, twap_window_seconds=60, settlement_kind="chainlink_twap",
     )
     c = MarketConstraints.from_market_config(
         cfg, provenance=DataProvenance.REAL_REPLAY, source="projected MARKET_CONFIG"

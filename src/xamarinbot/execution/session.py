@@ -36,7 +36,7 @@ from dataclasses import dataclass, field
 
 from xamarinbot.execution.config import ExecutionConfig
 from xamarinbot.execution.simulator import ExecutionSimulator, TakerOrderQueue
-from xamarinbot.market.constraints import MarketConstraints
+from xamarinbot.market.constraints import MarketConstraints, reconcile_execution_state
 from xamarinbot.optimizer.candidates import (
     candidate_exposure,
     evaluate_maker_candidate,
@@ -92,6 +92,16 @@ class TradingSession:
     _order_seq: int = field(default=0, init=False)
 
     def __post_init__(self) -> None:
+        # Phase 12C.2 item 1: the market is the single source of truth for
+        # executable fees and taker delay. On REAL_* data these are DERIVED
+        # from `constraints` rather than taken from whatever the caller
+        # happened to pass, so `FeeUsed = FeeReportedByMarket` and
+        # `TakerDelayUsed = DelayReportedByMarket` hold by construction; a
+        # caller that supplied a contradicting value raises instead of being
+        # silently overridden.
+        self.fee_config, self.exec_cfg = reconcile_execution_state(
+            self.constraints, self.fee_config, self.exec_cfg
+        )
         self.sim = ExecutionSimulator(self.round_id, self.fee_config, self.exec_cfg)
         self.queue = TakerOrderQueue(self.sim)
         sup_cfg = self.supervisor_cfg or SupervisorConfig(g_min=self.cfg.g_min, edge_min=self.cfg.edge_min)

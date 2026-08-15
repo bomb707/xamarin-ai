@@ -35,6 +35,13 @@ class MarketConfig:
     fee_rate: float
     taker_delay_ms: float  # 0 if the market has no taker delay
     twap_window_seconds: int  # 30 or 60, per market configuration [P6]
+    #: How this market settles, as the market itself declares it:
+    #: "chainlink_twap" or "chainlink_reference". Phase 12C.2 item 4 made
+    #: this a REQUIRED field with no default - a settlement rule that was
+    #: never recorded must fail the projection closed, not be guessed. It
+    #: travels Raw round metadata -> MARKET_CONFIG -> MarketConstraints ->
+    #: ShadowRunner so no layer has to re-derive it.
+    settlement_kind: str
 
 
 @dataclass(frozen=True)

@@ -35,8 +35,18 @@ UP = "up-token"
 DOWN = "down-token"
 
 
+#: When the recorder actually learned this market's parameters. In the real
+#: verified capture this is 473.5s BEFORE the round opens, and it is what
+#: MARKET_CONFIG's visibility timestamp must be (Phase 12C.2 item 3).
+METADATA_RECV_NS = START_NS - 470_000_000_000
+#: When the venue's outcome was actually observed - 92s AFTER the round
+#: closed in the real capture.
+RESOLUTION_RECV_NS = END_NS + 92_000_000_000
+
+
 def make_capture(tmp_path, *, twap_window=60, settlement="chainlink_twap",
-                 with_spot=True, twap_covers_open=True, n=8, data_topic=None):
+                 with_spot=True, twap_covers_open=True, n=8, data_topic=None,
+                 with_metadata=True, tick_change_at=None, with_resolution=True):
     raw = RawEventStore(str(tmp_path / "raw.db"))
     raw.upsert_round({
         "round_id": ROUND, "session_id": "s", "condition_id": "0xcond",
@@ -52,6 +62,25 @@ def make_capture(tmp_path, *, twap_window=60, settlement="chainlink_twap",
 
     b = RawEventBuilder(session_id="s")
     events = []
+
+    # The REST metadata observation: no external source timestamp, a real
+    # receive timestamp. This is what MARKET_CONFIG's visibility must come
+    # from.
+    if with_metadata:
+        events.append(b.build(
+            Topic.MARKET_METADATA, "market_metadata_discovered",
+            {"gamma": {"conditionId": "0xcond"}, "clob": {}, "warnings": []},
+            round_id=ROUND, condition_id="0xcond",
+            source_timestamp_ns=None,
+        ))
+        events[-1] = _at_recv(events[-1], METADATA_RECV_NS)
+    if with_resolution:
+        events.append(b.build(
+            Topic.MARKET_METADATA, "market_metadata_resolution",
+            {"closed": True, "outcomes": '["Up", "Down"]', "outcomePrices": '["1", "0"]'},
+            round_id=ROUND, condition_id="0xcond", source_timestamp_ns=None,
+        ))
+        events[-1] = _at_recv(events[-1], RESOLUTION_RECV_NS)
     # `data_topic` lets a test put reference data on a DIFFERENT stream from
     # the one the market declares, which is how "the capture has data, but
     # not the declared basis" is exercised.
@@ -113,13 +142,57 @@ def make_capture(tmp_path, *, twap_window=60, settlement="chainlink_twap",
             source_timestamp_ns=src_ns,
         ))
 
-    raw.write_batch(events)
+    # A real tick_size_change, announced once per token exactly as the venue
+    # does it.
+    if tick_change_at is not None:
+        at_ns = START_NS + int(tick_change_at * 1e9)
+        for token, side in ((UP, "UP"), (DOWN, "DOWN")):
+            events.append(b.build(
+                Topic.CLOB_MARKET, "tick_size_change",
+                {"asset_id": token, "market": "0xcond",
+                 "timestamp": str(at_ns // 1_000_000),
+                 "old_tick_size": "0.01", "new_tick_size": "0.001"},
+                round_id=ROUND, token_id=token, normalized_side=side,
+                source_timestamp_ns=at_ns,
+            ))
+
+    raw.write_batch(_realistic_recv(events))
     raw.upsert_round_result({
         "round_id": ROUND, "reported_outcome": "UP", "reconstructed_outcome": "UP",
         "reconstruction_basis": "declared:crypto_prices_twap_sixty",
         "label_agreement": 1, "end_reference_value": 63005.0,
     })
     return raw
+
+
+#: Measured source->recv p50 in the real captures was ~13.5ms. The builder
+#: stamps the wall clock at construction, which for a fixture would put every
+#: receive time at "now" - decades of apparent latency, and enough to make a
+#: recv_ts-gated consumer (ShadowRunner) see nothing at all. Fixtures
+#: therefore stamp a realistic wire latency.
+WIRE_LATENCY_NS = 15_000_000
+
+
+def _at_recv(event, recv_ns: int):
+    """Override an event's receive timestamp (the builder stamps 'now')."""
+    import dataclasses
+
+    return dataclasses.replace(event, recv_wall_timestamp_ns=recv_ns)
+
+
+def _realistic_recv(events: list) -> list:
+    """Give every event a receive timestamp just after its source timestamp,
+    leaving events that already have an explicit one alone."""
+    import dataclasses
+
+    out = []
+    for e in events:
+        if e.source_timestamp_ns is not None:
+            e = dataclasses.replace(
+                e, recv_wall_timestamp_ns=e.source_timestamp_ns + WIRE_LATENCY_NS
+            )
+        out.append(e)
+    return out
 
 
 def new_out(tmp_path, provenance=DataProvenance.REAL_REPLAY) -> EventStore:
@@ -137,7 +210,7 @@ def test_projection_writes_the_normalized_event_vocabulary(tmp_path):
     assert res.counts["SPOT"] == 8
     assert res.counts["BOOK_SNAPSHOT"] == 2      # one per token
     assert res.counts["BOOK_DELTA"] == 2 * 7
-    assert res.counts["SETTLEMENT"] == 1
+    assert "SETTLEMENT" not in res.counts, "the label must stay off the causal stream"
 
 
 def test_a_synthetic_destination_store_is_refused(tmp_path):
