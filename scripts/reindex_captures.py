@@ -28,14 +28,22 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
 from xamarinbot.eligibility import summarize  # noqa: E402
-from xamarinbot.realtime.preflight import evaluate_round, label_fields  # noqa: E402
+from xamarinbot.realtime.preflight import (  # noqa: E402
+    attribution_summary,
+    evaluate_round,
+    label_fields,
+)
 from xamarinbot.realtime.raw_store import RawEventStore  # noqa: E402
 
 CAPTURE_DIR = _REPO_ROOT / "captures" / "continuous"
 INDEX = CAPTURE_DIR / "INDEX.jsonl"
 
 
-def rebuild(dbs: list[Path], include_in_flight: bool = False) -> tuple[list[dict], int]:
+def rebuild(
+    dbs: list[Path],
+    include_in_flight: bool = False,
+    verify_projection: bool = True,
+) -> tuple[list[dict], int]:
     """Rebuild index rows, plus a count of rounds deliberately left out.
 
     A round that has not reached FINALIZED is still being captured - the
@@ -51,6 +59,10 @@ def rebuild(dbs: list[Path], include_in_flight: bool = False) -> tuple[list[dict
     in_flight = 0
     for db in dbs:
         store = RawEventStore(str(db))
+        identity = store.recorder_identity()
+        # One attribution pass per capture file (item 1) - the verdict is a
+        # property of the whole session, not of each round independently.
+        summary = attribution_summary(store)
         try:
             for round_id in store.round_ids():
                 meta = store.get_round(round_id) or {}
@@ -58,8 +70,17 @@ def rebuild(dbs: list[Path], include_in_flight: bool = False) -> tuple[list[dict
                     in_flight += 1
                     continue
                 labels = label_fields(store, round_id)
-                elig = evaluate_round(store, round_id)
+                elig = evaluate_round(
+                    store, round_id,
+                    verify_projection_run=verify_projection,
+                    attribution=summary,
+                )
                 rows.append({
+                    "recorder_code_sha": identity.recorder_code_sha,
+                    "recorder_code_dirty": identity.recorder_code_dirty,
+                    "recorder_process_pid": identity.process_pid,
+                    "recorder_process_started_at": identity.process_started_at,
+                    "recorder_schema_version": identity.recorder_schema_version,
                     "round_id": round_id,
                     "condition_id": meta.get("condition_id"),
                     "start_ts": (meta.get("start_ts_ns") or 0) / 1e9,
@@ -93,6 +114,10 @@ def main() -> int:
     ap.add_argument("--dir", default=str(CAPTURE_DIR))
     ap.add_argument("--include-in-flight", action="store_true",
                     help="also index rounds the running batch has not finalized yet")
+    ap.add_argument("--no-verify-projection", action="store_true",
+                    help="skip item 3's real projection (fast, DIAGNOSTIC ONLY - "
+                         "every round is then marked projection_verified=false and "
+                         "no round is training-eligible)")
     args = ap.parse_args()
 
     capture_dir = Path(args.dir)
@@ -102,22 +127,19 @@ def main() -> int:
         return 1
 
     print(f"[reindex] rebuilding from {len(dbs)} capture file(s)")
-    rows, in_flight = rebuild(dbs, include_in_flight=args.include_in_flight)
+    rows, in_flight = rebuild(
+        dbs,
+        include_in_flight=args.include_in_flight,
+        verify_projection=not args.no_verify_projection,
+    )
     if in_flight:
         print(f"[reindex] {in_flight} round(s) still in flight (not FINALIZED) - "
               "left out; the next run picks them up")
 
     records = [evaluate_round_from_row(r) for r in rows]
+    report_groups(rows, records)
+    report_attribution(dbs)
     counts = summarize(records)
-    print(f"  captured                     {counts['captured']}")
-    print(f"  label CONFIRMED (valid)      {counts['label_valid']}")
-    print(f"  data-quality clean           {counts['data_training_grade']}")
-    print(f"  projection valid             {counts['projection_valid']}")
-    print(f"  FINAL training eligible      {counts['training_eligible']}")
-    if counts["disqualifiers_by_reason"]:
-        print("  disqualification reasons by category:")
-        for reason, n in counts["disqualifiers_by_reason"].items():
-            print(f"    {reason:<40} {n:>5}")
 
     if args.dry_run:
         print("[reindex] --dry-run: index not written")
@@ -135,6 +157,66 @@ def main() -> int:
     return 0
 
 
+def report_groups(rows: list[dict], records: list) -> None:
+    """Item 7: LEGACY_RECORDER and POST_A0_1_RECORDER reported SEPARATELY.
+
+    Pooling them would let a pre-fix round's verdict - computed by code that
+    guessed at parse-failure attribution and never checked rule text - stand
+    beside a post-fix one as if the two carried the same evidence.
+    """
+    by_generation: dict[str, list] = {}
+    for row, rec in zip(rows, records):
+        by_generation.setdefault(row.get("recorder_generation") or "UNKNOWN", []).append(rec)
+
+    for generation in sorted(by_generation):
+        group = by_generation[generation]
+        c = summarize(group)
+        print()
+        print(f"  {generation}   ({len(group)} finalized round(s))")
+        print(f"    finalized rounds           {c['captured']}")
+        print(f"    label valid                {c['label_valid']}")
+        print(f"    rule-text VERIFIED_TRUE    {c['rule_text_verified']}")
+        print(f"    data-quality valid         {c['data_training_grade']}")
+        print(f"    projection preconditions   {c['projection_preconditions_valid']}")
+        print(f"    ACTUAL projection valid    {c['projection_valid']}")
+        print(f"    FINAL training eligible    {c['training_eligible']}")
+        if c["rule_text_by_status"]:
+            print("    rule-text status breakdown:")
+            for status, n in c["rule_text_by_status"].items():
+                print(f"      {status:<38} {n:>5}")
+        if c["disqualifiers_by_reason"]:
+            print("    exclusions by category:")
+            for reason, n in c["disqualifiers_by_reason"].items():
+                print(f"      {reason:<38} {n:>5}")
+
+
+def report_attribution(dbs: list[Path]) -> None:
+    """Item 7: parse failures broken down by HOW they were attributed."""
+    totals: dict[str, int] = {}
+    complete, incomplete = [], []
+    for db in dbs:
+        store = RawEventStore(str(db))
+        try:
+            summary = attribution_summary(store)
+        finally:
+            store.close()
+        for status, n in summary.by_status().items():
+            if n:
+                totals[status] = totals.get(status, 0) + n
+        (complete if summary.is_complete else incomplete).append(db.name)
+
+    print()
+    print("  PARSE-FAILURE ATTRIBUTION")
+    if not totals:
+        print("    (no parse failures in any capture)")
+    for status, n in sorted(totals.items()):
+        print(f"    {status:<40} {n:>5}")
+    print(f"    captures with COMPLETE attribution     {len(complete):>5}")
+    print(f"    captures on session-wide fallback      {len(incomplete):>5}")
+    for name in incomplete:
+        print(f"      ! {name}")
+
+
 def evaluate_round_from_row(row: dict):
     """Rebuild a `RoundEligibility` from an index row, so the summary uses
     exactly the values that were written rather than recomputing them."""
@@ -146,6 +228,11 @@ def evaluate_round_from_row(row: dict):
         data_valid=bool(row.get("data_training_grade")),
         projection_valid=bool(row.get("projection_valid")),
         disqualifiers=tuple(Disqualifier(d) for d in row.get("disqualifiers", [])),
+        projection_preconditions_valid=bool(row.get("projection_preconditions_valid")),
+        projection_error=row.get("projection_error"),
+        projection_verified=bool(row.get("projection_verified")),
+        rule_text_status=row.get("rule_text_status"),
+        recorder_generation=row.get("recorder_generation"),
     )
 
 

@@ -55,7 +55,11 @@ sys.path.insert(0, str(_REPO_ROOT / "src"))
 
 from xamarinbot.realtime.lifecycle import LifecycleConfig  # noqa: E402
 from xamarinbot.eligibility import summarize  # noqa: E402
-from xamarinbot.realtime.preflight import evaluate_round  # noqa: E402
+from xamarinbot.realtime.identity import RecorderIdentity  # noqa: E402
+from xamarinbot.realtime.preflight import (  # noqa: E402
+    attribution_summary,
+    evaluate_round,
+)
 from xamarinbot.realtime.raw_store import RawEventStore  # noqa: E402
 from xamarinbot.realtime.service import RealRecorderService, ServiceConfig  # noqa: E402
 
@@ -88,6 +92,10 @@ def append_index(db: Path, captures) -> int:
     """
     CAPTURE_DIR.mkdir(parents=True, exist_ok=True)
     store = RawEventStore(str(db))
+    identity = store.recorder_identity()
+    # Item 1: one attribution pass for the whole batch. Its completeness is a
+    # property of the session, so it cannot be decided round by round.
+    summary = attribution_summary(store)
     n = 0
     with INDEX.open("a") as fh:
         for cap in captures:
@@ -116,7 +124,13 @@ def append_index(db: Path, captures) -> int:
                 "rule_text_agrees": rec.rule_text_agrees if rec is not None else None,
                 "notes": cap.notes,
                 "indexed_at": time.time(),
-                **evaluate_round(store, m.round_id).as_index_fields(),
+                # Item 6: every row proves which code produced it.
+                "recorder_code_sha": identity.recorder_code_sha,
+                "recorder_code_dirty": identity.recorder_code_dirty,
+                "recorder_process_pid": identity.process_pid,
+                "recorder_process_started_at": identity.process_started_at,
+                "recorder_schema_version": identity.recorder_schema_version,
+                **evaluate_round(store, m.round_id, attribution=summary).as_index_fields(),
             }) + "\n")
             n += 1
     store.close()
@@ -163,9 +177,33 @@ def print_status() -> int:
 
     print(f"  captured                     {len(rows)}")
     print(f"  label CONFIRMED (valid)      {count('label_valid')}")
+    print(f"  rule-text VERIFIED_TRUE      "
+          f"{sum(1 for r in rows if r.get('rule_text_status') == 'VERIFIED_TRUE')}")
     print(f"  data-quality clean           {count('data_training_grade')}")
-    print(f"  projection valid             {count('projection_valid')}")
+    print(f"  projection preconditions ok  {count('projection_preconditions_valid')}")
+    print(f"  ACTUAL projection valid      "
+          f"{sum(1 for r in rows if r.get('projection_valid') and r.get('projection_verified'))}")
     print(f"  FINAL training eligible      {len(eligible)}")
+    print()
+
+    # Item 6/7: never pool recorder generations in one number.
+    generations: dict[str, int] = {}
+    for r in rows:
+        generations[r.get("recorder_generation") or "UNKNOWN"] = (
+            generations.get(r.get("recorder_generation") or "UNKNOWN", 0) + 1
+        )
+    print("  BY RECORDER GENERATION")
+    for gen, n in sorted(generations.items()):
+        gen_eligible = sum(
+            1 for r in rows
+            if (r.get("recorder_generation") or "UNKNOWN") == gen
+            and r.get("training_eligible") is True
+        )
+        shas = sorted({r.get("recorder_code_sha") for r in rows
+                       if (r.get("recorder_generation") or "UNKNOWN") == gen
+                       and r.get("recorder_code_sha")})
+        sha_note = f"  sha {', '.join(s[:12] for s in shas)}" if shas else "  sha unknown"
+        print(f"    {gen:<24} {n:>4} rounds, {gen_eligible} eligible{sha_note}")
     print()
 
     reasons: dict[str, int] = {}
@@ -202,7 +240,26 @@ def print_status() -> int:
     return 0
 
 
-def run_batch(rounds: int, sweep_s: float, log) -> tuple[Path | None, list]:
+def write_batch_manifest(db: Path, identity: RecorderIdentity, batch: int) -> Path:
+    """Item 6: a committed, human-readable record of which code wrote a batch.
+
+    The capture's `session_meta` table is the authoritative copy; this is the
+    one you can read without opening a multi-gigabyte SQLite file, and the
+    one that survives if the `.db` is archived elsewhere (they are
+    gitignored; manifests are not).
+    """
+    manifest = db.with_suffix(".manifest.json")
+    manifest.write_text(json.dumps({
+        "capture_db": db.name,
+        "batch": batch,
+        "written_at": time.time(),
+        **identity.as_dict(),
+    }, indent=2) + "\n")
+    return manifest
+
+
+def run_batch(rounds: int, sweep_s: float, log,
+              identity: RecorderIdentity, batch: int) -> tuple[Path | None, list]:
     CAPTURE_DIR.mkdir(parents=True, exist_ok=True)
     db = CAPTURE_DIR / f"btc5m_{utc()}.db"
     cfg = ServiceConfig(
@@ -211,11 +268,12 @@ def run_batch(rounds: int, sweep_s: float, log) -> tuple[Path | None, list]:
         resolution_sweep_s=sweep_s,
     )
     store = RawEventStore(str(db))
-    service = RealRecorderService(store, cfg, log=log)
+    service = RealRecorderService(store, cfg, log=log, identity=identity)
     try:
         captures = service.run()
     finally:
         store.close()
+    write_batch_manifest(db, identity, batch)
     return db, captures
 
 
@@ -241,9 +299,19 @@ def main() -> int:
     deadline = time.time() + args.hours * 3600 if args.hours else None
     log = (lambda *a: None) if args.quiet else print
 
+    # Item 6: snapshot the identity ONCE, at process start. That is the code
+    # this process actually loaded; HEAD moving later does not change it, and
+    # a capture must never claim provenance it does not have.
+    identity = RecorderIdentity.capture(_REPO_ROOT)
+
     print("=" * 78)
     print("CONTINUOUS REAL BTC 5-MINUTE CAPTURE")
     print("  RECORDER ONLY - no orders, no credentials, no private key.")
+    print(f"  code sha     {identity.recorder_code_sha}"
+          f"{'  (DIRTY WORKING TREE)' if identity.recorder_code_dirty else ''}")
+    print(f"  pid          {identity.process_pid}   started {utc(identity.process_started_at)}")
+    print(f"  python       {identity.python_version}   "
+          f"recorder schema v{identity.recorder_schema_version}")
     print(f"  batch size   {args.rounds} rounds")
     print(f"  output       {CAPTURE_DIR.relative_to(_REPO_ROOT)}/btc5m_<utc>.db")
     print(f"  index        {INDEX.relative_to(_REPO_ROOT)}")
@@ -257,7 +325,7 @@ def main() -> int:
         started = time.time()
         print(f"\n[continuous] batch {batch} starting at {utc()}", flush=True)
         try:
-            db, captures = run_batch(args.rounds, args.sweep, log)
+            db, captures = run_batch(args.rounds, args.sweep, log, identity, batch)
         except Exception:
             # A batch failure must not end the accumulation. Record it and
             # move on - an hour of missed capture is recoverable, a stopped

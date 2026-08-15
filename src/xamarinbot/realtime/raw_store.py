@@ -76,6 +76,21 @@ CREATE TABLE IF NOT EXISTS rounds (
     raw_metadata_json  TEXT
 );
 
+-- Gate A.0.1 item 6: which code produced this capture. One row per
+-- recorder session. Absent for every capture written before Gate A.0.1,
+-- which is exactly how a LEGACY_RECORDER capture is identified.
+CREATE TABLE IF NOT EXISTS session_meta (
+    session_id              TEXT PRIMARY KEY,
+    recorder_code_sha       TEXT,
+    recorder_code_dirty     INTEGER,
+    process_pid             INTEGER,
+    process_started_at      REAL,
+    python_version          TEXT,
+    recorder_schema_version INTEGER,
+    recorder_generation     TEXT,
+    host                    TEXT
+);
+
 -- Round-level capture outcome: reconstructed vs reported label, metrics,
 -- and the training-grade verdict for that round's interval.
 CREATE TABLE IF NOT EXISTS round_results (
@@ -275,6 +290,42 @@ class RawEventStore:
                 [row.get(k) for k in keys],
             )
             self._conn.commit()
+
+    def upsert_session_meta(self, session_id: str, identity) -> None:
+        """Stamp the recorder's identity into the capture (item 6)."""
+        row = dict(identity.as_dict(), session_id=session_id)
+        row["recorder_code_dirty"] = int(bool(row.get("recorder_code_dirty")))
+        keys = [
+            "session_id", "recorder_code_sha", "recorder_code_dirty", "process_pid",
+            "process_started_at", "python_version", "recorder_schema_version",
+            "recorder_generation", "host",
+        ]
+        with self._lock:
+            self._conn.execute(
+                f"INSERT OR REPLACE INTO session_meta ({','.join(keys)}) "
+                f"VALUES ({','.join('?' * len(keys))})",
+                [row.get(k) for k in keys],
+            )
+            self._conn.commit()
+
+    def session_meta(self) -> list[dict]:
+        with self._lock:
+            cur = self._conn.execute("SELECT * FROM session_meta ORDER BY session_id")
+            names = [d[0] for d in cur.description]
+            rows = cur.fetchall()
+        return [dict(zip(names, r)) for r in rows]
+
+    def recorder_identity(self):
+        """The identity of the session that wrote this capture.
+
+        A capture with no `session_meta` row is a LEGACY_RECORDER capture -
+        reported as such rather than pooled with post-fix data, and never
+        deleted.
+        """
+        from xamarinbot.realtime.identity import RecorderIdentity, legacy_identity
+
+        rows = self.session_meta()
+        return RecorderIdentity.from_dict(rows[0]) if rows else legacy_identity()
 
     def round_results(self) -> list[dict]:
         with self._lock:

@@ -75,14 +75,28 @@ def ljung_box_q(xs: list[float], lags: int = 10) -> tuple[float, int]:
     return q, len(acf)
 
 
-def effective_sample_size(xs: list[float], max_lag: int = 10) -> float:
-    """n_eff = n / (1 + 2 * sum_k r_k), truncated at the first non-positive
-    r_k (Geyer's initial-positive-sequence rule).
+def autocovariance(xs: list[float], max_lag: int) -> list[float]:
+    """Biased sample autocovariances gamma_k for k = 0..max_lag."""
+    n = len(xs)
+    mu = mean(xs)
+    out = []
+    for k in range(0, min(max_lag, n - 1) + 1):
+        out.append(sum((xs[i] - mu) * (xs[i + k] - mu) for i in range(n - k)) / n)
+    return out
 
-    With positive serial correlation `n_eff < n`: the series carries fewer
-    independent observations than it has rows. Clamped to [1, n] because a
-    negative or explosive denominator on a short noisy series is an artifact
-    of the estimator, not a real gain in information.
+
+def positive_run_autocorrelation_ess(xs: list[float], max_lag: int = 10) -> float:
+    """n_eff = n / (1 + 2 * sum_k r_k), summing the INITIAL POSITIVE RUN of
+    ordinary autocorrelations.
+
+    This is the simpler, more optimistic estimator: it stops at the first
+    negative r_k, so a series whose autocorrelation alternates in sign (a
+    real possibility for round-level PnL, where a large win is often
+    followed by mean reversion) truncates after one lag and reports almost
+    no penalty.
+
+    Kept as a named diagnostic, NOT as `effective_sample_size` - Gate A.0.1
+    item 5: it was previously published under Geyer's name, which it is not.
     """
     n = len(xs)
     if n < 2:
@@ -93,6 +107,59 @@ def effective_sample_size(xs: list[float], max_lag: int = 10) -> float:
             break
         total += r
     return max(1.0, min(float(n), n / (1.0 + 2.0 * total)))
+
+
+def effective_sample_size(xs: list[float], max_lag: int | None = None) -> float:
+    """Geyer's initial-positive-sequence effective sample size.
+
+    Geyer's rule pairs ADJACENT lags before testing for positivity:
+
+        Gamma_m = gamma_(2m) + gamma_(2m+1),      m = 0, 1, 2, ...
+
+    and truncates at the first non-positive `Gamma_m`. The pairing is the
+    substance of the method, not a detail: for a reversible chain the paired
+    sums are provably positive and decreasing, so the truncation point is a
+    property of the process rather than of estimator noise at a single lag.
+    Summing raw `r_k` and stopping at the first negative one - what this
+    function used to do under Geyer's name - throws that away and stops too
+    early on any series with alternating-sign autocorrelation, overstating
+    how much independent evidence the series carries.
+
+    The variance of the mean is then
+
+        sigma^2 = -gamma_0 + 2 * sum_{m<=M} Gamma_m
+        n_eff   = n * gamma_0 / sigma^2
+
+    Clamped to [1, n]: a negative or explosive denominator on a short noisy
+    series is an artifact of the estimator, not a real gain in information.
+    """
+    n = len(xs)
+    if n < 2:
+        return float(n)
+    lag_cap = (n - 1) if max_lag is None else min(max_lag, n - 1)
+    gamma = autocovariance(xs, lag_cap)
+    if not gamma or gamma[0] <= 1e-15:
+        return float(n)
+
+    sigma2 = -gamma[0]
+    prev = None
+    m = 0
+    while 2 * m + 1 < len(gamma):
+        pair = gamma[2 * m] + gamma[2 * m + 1]
+        if pair <= 0:
+            break
+        # Geyer's initial MONOTONE sequence refinement: the paired sums are
+        # theoretically non-increasing, so enforcing that suppresses
+        # estimator noise in the tail rather than letting it accumulate.
+        if prev is not None and pair > prev:
+            pair = prev
+        sigma2 += 2.0 * pair
+        prev = pair
+        m += 1
+
+    if sigma2 <= 1e-15:
+        return float(n)
+    return max(1.0, min(float(n), n * gamma[0] / sigma2))
 
 
 @dataclass(frozen=True)
@@ -175,7 +242,11 @@ class BlockSensitivity:
     point: float
     autocorr: list[float] = field(default_factory=list)
     ljung_box: tuple[float, int] = (0.0, 0)
+    #: Geyer initial-positive-sequence ESS - the headline number.
     n_eff: float = 0.0
+    #: The simpler initial-positive-RUN estimator, reported alongside so the
+    #: two are visibly different rather than one masquerading as the other.
+    n_eff_positive_run: float = 0.0
     by_block: dict[int, BootstrapResult] = field(default_factory=dict)
     suggested_block_rounds: int = 1
 
@@ -188,6 +259,8 @@ class BlockSensitivity:
             "ljung_box_q": self.ljung_box[0],
             "ljung_box_df": self.ljung_box[1],
             "effective_sample_size": self.n_eff,
+            "effective_sample_size_estimator": "geyer_initial_positive_sequence",
+            "positive_run_autocorrelation_ess": self.n_eff_positive_run,
             "suggested_block_rounds": self.suggested_block_rounds,
             "blocks": {
                 f"{b * ROUND_MINUTES}min": r.as_dict() for b, r in sorted(self.by_block.items())
@@ -229,6 +302,7 @@ def analyze_series(
         autocorr=autocorrelation(xs, 10),
         ljung_box=ljung_box_q(xs, min(10, max(1, len(xs) // 2))),
         n_eff=effective_sample_size(xs),
+        n_eff_positive_run=positive_run_autocorrelation_ess(xs),
         suggested_block_rounds=suggest_block_rounds(xs),
     )
     for minutes in block_minutes:

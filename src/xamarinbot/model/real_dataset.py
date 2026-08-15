@@ -127,23 +127,67 @@ def visible_events(events: list, decision_ts: float) -> list:
     return [e for e in events if e.recv_ts <= decision_ts]
 
 
+class TrainingEligibilityError(RuntimeError):
+    """A round that is not Gate-A eligible was offered to the REAL training
+    builder (Gate A.0.1 item 4)."""
+
+
 def build_real_examples(
     store: EventStore,
     labels: list[RoundLabel],
     feature_cfg: FeatureConfig,
     feature_set: FeatureSet,
     *,
+    eligibility: "dict | None" = None,
     grid: tuple[float, ...] | None = None,
     allow_synthetic: bool = False,
 ) -> RealDatasetResult:
     """Build a round-balanced, receive-time-causal dataset from a projected
     real capture.
 
-    `labels` must already be verified targets - `ProjectionResult.label` only
-    emits one when the independent reconstruction is CONFIRMED (item 2), so a
-    round with an unverified outcome never reaches here.
+    Gate A.0.1 item 4 - eligibility is enforced HERE, not by the caller.
+    `ProjectionResult.label` only emits a target when the independent
+    reconstruction is CONFIRMED, so an unverified OUTCOME cannot reach this
+    function. But a verified outcome says nothing about the round's market
+    data: a CONFIRMED label sitting on a book that drifted from the venue
+    produced a perfectly well-formed `RoundLabel`, and a caller who forgot
+    to filter would have trained on it.
+
+    So for REAL provenance an `eligibility` map is REQUIRED, and every round
+    in `labels` must be `training_eligible` in it. Omitting it raises rather
+    than defaulting to "no filtering" - the failure mode this closes is
+    precisely a caller who did not think about filtering at all. Callers
+    should normally not construct the map themselves: `model/gate_a.py`
+    builds the whole path from a raw capture.
     """
     require_real(store.provenance, "real training dataset", allow_synthetic=allow_synthetic)
+    if store.provenance.is_real:
+        if eligibility is None:
+            raise TrainingEligibilityError(
+                "REAL training data requires a per-round eligibility map; refusing to "
+                "build a dataset with no eligibility gate. Use "
+                "xamarinbot.model.gate_a.build_gate_a_dataset(), which derives it from "
+                "the capture."
+            )
+        offered = [l.round_id for l in labels]
+        missing = [r for r in offered if r not in eligibility]
+        if missing:
+            raise TrainingEligibilityError(
+                f"no eligibility verdict for round(s) {missing}; an unknown round "
+                "cannot be assumed clean"
+            )
+        ineligible = [
+            (r, eligibility[r]) for r in offered
+            if not getattr(eligibility[r], "training_eligible", False)
+        ]
+        if ineligible:
+            detail = "; ".join(
+                f"{r} ({', '.join(d.value for d in rec.disqualifiers) or 'not eligible'})"
+                for r, rec in ineligible
+            )
+            raise TrainingEligibilityError(
+                f"round(s) not training-eligible: {detail}"
+            )
     grid = grid if grid is not None else decision_grid()
     result = RealDatasetResult(feature_set=feature_set.name)
 

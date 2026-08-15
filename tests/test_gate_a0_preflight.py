@@ -51,6 +51,26 @@ from tests.test_real_projection import (
 FS = FeatureSet("gate_a0", base=("z_gap",))
 
 
+def eligible(*round_ids: str) -> dict:
+    """A clean eligibility verdict for each round.
+
+    Gate A.0.1 item 4 made this map mandatory for the REAL builder, so tests
+    that are about the DATASET rather than about eligibility have to state
+    plainly that the rounds passed - which is the point: there is no longer
+    a way to build real training data without saying so.
+    """
+    return {
+        rid: build(
+            rid, label_status="CONFIRMED", reconstructed_outcome="UP",
+            reported_outcome="UP", declared_agrees=True,
+            metrics={"dropped_events": 0, "parse_failures": 0},
+            round_integrity_mismatches=0, rule_text_status="VERIFIED_TRUE",
+            projection_verified=True,
+        )
+        for rid in round_ids
+    }
+
+
 # =================== item 1: three independent gates ======================
 
 def test_confirmed_label_alone_does_not_make_a_round_trainable():
@@ -71,7 +91,7 @@ def test_confirmed_label_alone_does_not_make_a_round_trainable():
 
 
 def test_training_eligible_is_the_conjunction_of_all_three():
-    def rec(label=True, data=True, proj=True) -> RoundEligibility:
+    def rec(label=True, data=True, proj=True, verified=True) -> RoundEligibility:
         return build(
             "r",
             label_status="CONFIRMED" if label else "UNRESOLVED",
@@ -80,12 +100,15 @@ def test_training_eligible_is_the_conjunction_of_all_three():
             metrics={"dropped_events": 0 if data else 3, "parse_failures": 0},
             round_integrity_mismatches=0,
             projection_problems=[] if proj else [Disqualifier.PROJECTION_FAILED],
+            projection_verified=verified,
         )
 
     assert rec().training_eligible is True
     assert rec(label=False).training_eligible is False
     assert rec(data=False).training_eligible is False
     assert rec(proj=False).training_eligible is False
+    # Gate A.0.1 item 3: an unrun projection is not a passing one.
+    assert rec(verified=False).training_eligible is False
 
 
 def test_every_data_quality_failure_is_reported_separately():
@@ -132,17 +155,21 @@ def test_summary_reports_the_five_counts_separately():
         build("a", label_status="CONFIRMED", reconstructed_outcome="UP",
               reported_outcome="UP", declared_agrees=True,
               metrics={"dropped_events": 0, "parse_failures": 0},
-              round_integrity_mismatches=0),
+              round_integrity_mismatches=0, projection_verified=True,
+              rule_text_status="VERIFIED_TRUE"),
         build("b", label_status="CONFIRMED", reconstructed_outcome="UP",
               reported_outcome="UP", declared_agrees=True,
               metrics={"dropped_events": 0, "parse_failures": 0},
-              round_integrity_mismatches=1),
+              round_integrity_mismatches=1, projection_verified=True,
+              rule_text_status="VERIFIED_TRUE"),
     ]
     s = summarize(records)
     assert s == {
-        "captured": 2, "label_valid": 2, "data_training_grade": 1,
+        "captured": 2, "label_valid": 2, "rule_text_verified": 2,
+        "data_training_grade": 1, "projection_preconditions_valid": 2,
         "projection_valid": 2, "training_eligible": 1,
         "disqualifiers_by_reason": {"book_integrity_mismatch": 1},
+        "rule_text_by_status": {"VERIFIED_TRUE": 2},
         "eligible_round_ids": ["a"],
     }
 
@@ -203,7 +230,10 @@ def test_an_ineligible_round_never_reaches_the_model_dataset(tmp_path):
     out = new_out(tmp_path)
     res = project_round(raw, ROUND, out)
     assert res.label is None
-    ds = build_real_examples(out, [l for l in [res.label] if l], FeatureConfig(), FS)
+    ds = build_real_examples(
+        out, [l for l in [res.label] if l], FeatureConfig(), FS,
+        eligibility=eligible(ROUND),
+    )
     assert ds.examples == []
 
 
@@ -301,7 +331,8 @@ def test_event_rate_inflation_cannot_increase_the_example_count(tmp_path):
     quiet = make_capture(quiet_dir, n=300)
     out_q = new_out(quiet_dir)
     res_q = project_round(quiet, ROUND, out_q)
-    ds_q = build_real_examples(out_q, [res_q.label], FeatureConfig(), FS)
+    ds_q = build_real_examples(out_q, [res_q.label], FeatureConfig(), FS,
+                               eligibility=eligible(ROUND))
 
     # the same round plus 100k additional intermediate book deltas
     busy = make_capture(busy_dir, n=300)
@@ -319,7 +350,8 @@ def test_event_rate_inflation_cannot_increase_the_example_count(tmp_path):
     busy.write_batch(_realistic_recv(flood))
     out_b = new_out(busy_dir)
     res_b = project_round(busy, ROUND, out_b)
-    ds_b = build_real_examples(out_b, [res_b.label], FeatureConfig(), FS)
+    ds_b = build_real_examples(out_b, [res_b.label], FeatureConfig(), FS,
+                               eligibility=eligible(ROUND))
 
     assert res_b.counts["BOOK_DELTA"] > res_q.counts["BOOK_DELTA"] + 90_000, (
         "the flood must really have reached the projection"
@@ -374,7 +406,8 @@ def test_each_round_contributes_equal_total_weight(tmp_path):
     raw = make_capture(tmp_path, n=400)
     out = new_out(tmp_path)
     res = project_round(raw, ROUND, out)
-    ds = build_real_examples(out, [res.label], FeatureConfig(), FS)
+    ds = build_real_examples(out, [res.label], FeatureConfig(), FS,
+                             eligibility=eligible(ROUND))
     assert ds.examples
     assert ds.total_weight(ROUND) == pytest.approx(1.0)
     assert all(e.weight == pytest.approx(1.0 / len(ds.examples)) for e in ds.examples)

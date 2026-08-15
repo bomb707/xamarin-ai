@@ -10,6 +10,12 @@ import json
 from dataclasses import dataclass
 
 from xamarinbot.eligibility import Disqualifier, RoundEligibility, build, summarize
+from xamarinbot.realtime.attribution import (
+    AttributionSummary,
+    FailureAttribution,
+    RoundWindow,
+)
+from xamarinbot.realtime.label import RuleTextStatus, verify_rule_text
 from xamarinbot.realtime.raw_events import Topic
 from xamarinbot.realtime.raw_store import RawEventStore
 
@@ -36,11 +42,12 @@ def round_integrity_mismatches(raw: RawEventStore, round_id: str) -> list[str]:
 
 
 def capture_records_parse_failure_events(raw: RawEventStore) -> bool:
-    """Whether this capture is new enough to timestamp its parse failures.
+    """Whether this capture recorded any structured failure at all.
 
-    Captures recorded before Gate A.0 only have a session counter, so a
-    failure cannot be attributed to a round and the conservative
-    session-wide rule applies to all of them.
+    Kept as a diagnostic only. Gate A.0.1 item 1: this must NOT be the
+    switch that turns off the session-wide fallback - see
+    `attribution_summary`. One recorded failure says nothing about the
+    others.
     """
     return any(
         e.event_type == "parse_failure"
@@ -48,11 +55,63 @@ def capture_records_parse_failure_events(raw: RawEventStore) -> bool:
     )
 
 
-def round_parse_failures(raw: RawEventStore, round_id: str) -> int:
-    """Parse failures recorded while THIS round was the active one."""
-    return sum(
-        1 for e in raw.events(round_id=round_id, topics=[Topic.RECORDER_CONTROL])
-        if e.event_type == "parse_failure"
+def round_windows(raw: RawEventStore) -> list[RoundWindow]:
+    """Every round's required recording interval, from the capture itself."""
+    out = []
+    for rid in raw.round_ids():
+        row = raw.get_round(rid) or {}
+        if row.get("start_ts_ns") is None or row.get("end_ts_ns") is None:
+            continue
+        out.append(RoundWindow(
+            round_id=rid,
+            condition_id=row.get("condition_id"),
+            up_token_id=row.get("up_token_id"),
+            down_token_id=row.get("down_token_id"),
+            start_ts_ns=int(row["start_ts_ns"]),
+            end_ts_ns=int(row["end_ts_ns"]),
+        ))
+    return out
+
+
+def attribution_summary(raw: RawEventStore) -> AttributionSummary:
+    """How this capture's parse failures map onto its rounds.
+
+    The session counter is the ground truth for HOW MANY failures happened;
+    the control events are the record of WHICH markets each one damaged. The
+    two are compared rather than one being trusted: a capture whose counter
+    exceeds its records has failures nobody can place, and per-round
+    attribution is then not available at all.
+    """
+    attributions = []
+    for e in raw.events(topics=[Topic.RECORDER_CONTROL]):
+        if e.event_type != "parse_failure":
+            continue
+        attributions.append(FailureAttribution.from_payload(e.payload))
+
+    session_total = 0
+    seen_sessions = set()
+    for res in raw.round_results():
+        blob = res.get("metrics_json")
+        if not blob:
+            continue
+        try:
+            metrics = json.loads(blob)
+        except json.JSONDecodeError:
+            continue
+        m = metrics.get("session_metrics") or metrics
+        # Every round in one recorder session carries the SAME session
+        # counters, so summing them would multiply the failure count by the
+        # round count. Take each distinct session once.
+        key = (m.get("session_id"), m.get("events_received"), m.get("parse_failures"))
+        if key in seen_sessions:
+            continue
+        seen_sessions.add(key)
+        session_total += int(m.get("parse_failures") or 0)
+
+    return AttributionSummary(
+        attributions=tuple(attributions),
+        session_failure_count=session_total,
+        all_round_ids=tuple(raw.round_ids()),
     )
 
 
@@ -124,6 +183,58 @@ def _derive_label_status(fields: dict) -> str:
     return "CONFIRMED"
 
 
+def rule_text_status(raw: RawEventStore, round_id: str) -> RuleTextStatus:
+    """Item 2: RE-DERIVE the rule-text verdict from the market metadata the
+    capture persisted, rather than reading whatever the recorder wrote.
+
+    Legacy captures recorded `rule_text_agrees=None` for every round -
+    because nothing passed the text into `reconstruct_label`, not because
+    the text was absent. It IS present: `rounds.resolution_source` and
+    `rounds.description` were persisted at DISCOVERED all along. Reading the
+    persisted verdict would therefore inherit the bug; recomputing it from
+    the stored text is what "revalidate" means.
+    """
+    row = raw.get_round(round_id) or {}
+    kind = row.get("settlement_kind")
+    if not kind:
+        return RuleTextStatus.SOURCE_TEXT_UNAVAILABLE
+    window = row.get("twap_window_s")
+    return verify_rule_text(
+        kind,
+        int(window) if window is not None else None,
+        row.get("resolution_source"),
+        row.get("description"),
+    )
+
+
+def verify_projection(raw: RawEventStore, round_id: str) -> tuple[bool, str | None]:
+    """Item 3: actually PROJECT the round and report whether it succeeded.
+
+    `projection_problems` below is a cheap screen over the round row. It
+    cannot see a malformed book frame, a settlement topic with no usable
+    observation at the boundary after time filtering, a payload the feature
+    engine's contract rejects, or any of the other ways a real capture
+    breaks halfway through. `projection_valid=True` therefore did not mean
+    "this round can be projected" - it meant "nothing obvious forbids it".
+
+    For Gate-A eligibility the projection is run for real, into a throwaway
+    in-memory store. The exception text is returned verbatim; nothing is
+    suppressed.
+    """
+    from xamarinbot.events.store import EventStore
+    from xamarinbot.provenance import DataProvenance
+    from xamarinbot.replay.projection import project_round
+
+    out = EventStore(":memory:", provenance=DataProvenance.REAL_REPLAY)
+    try:
+        project_round(raw, round_id, out)
+        return True, None
+    except Exception as exc:  # noqa: BLE001 - the reason is the product here
+        return False, f"{type(exc).__name__}: {exc}"[:400]
+    finally:
+        out.close()
+
+
 def projection_problems(raw: RawEventStore, round_id: str) -> list[Disqualifier]:
     """Whether this round can be projected at all, checked WITHOUT running the
     (expensive) projection: the same preconditions `project_round` enforces."""
@@ -163,33 +274,59 @@ def projection_problems(raw: RawEventStore, round_id: str) -> list[Disqualifier]
     return out
 
 
-def evaluate_round(raw: RawEventStore, round_id: str) -> RoundEligibility:
+def evaluate_round(
+    raw: RawEventStore,
+    round_id: str,
+    *,
+    verify_projection_run: bool = True,
+    attribution: AttributionSummary | None = None,
+) -> RoundEligibility:
+    """One round's full Gate-A verdict.
+
+    `verify_projection_run=False` skips item 3's real projection, which is
+    the expensive part (~180k events per round). It is a diagnostic mode
+    only: the resulting record has `projection_verified=False` and is
+    therefore NOT training-eligible whatever else it passes, so a fast run
+    can never be mistaken for a gate.
+    """
     labels = label_fields(raw, round_id)
     mismatches = round_integrity_mismatches(raw, round_id)
     detail = {}
     if mismatches:
         detail[Disqualifier.BOOK_INTEGRITY_MISMATCH.value] = "; ".join(mismatches[:2])
-    if labels["rule_text_agrees"] is False:
+
+    rule_status = rule_text_status(raw, round_id)
+    if rule_status is RuleTextStatus.VERIFIED_FALSE:
         detail[Disqualifier.RULE_TEXT_DISAGREES.value] = (
-            "the market's structured settlement config contradicts its own rule text"
+            "the market's own text does not corroborate the settlement basis its "
+            "structured configuration declares"
         )
+
     metrics = session_metrics(raw, round_id)
-    # If the capture timestamps its parse failures, attribute them to the
-    # round they actually happened in; otherwise fall back to the
-    # session-wide counter, which condemns the whole batch.
-    # A capture with zero session parse failures needs no attribution at all.
-    if metrics is not None and not metrics.get("parse_failures"):
-        pass
-    elif metrics is not None and capture_records_parse_failure_events(raw):
-        metrics = dict(metrics, parse_failures=round_parse_failures(raw, round_id))
-        detail["parse_failure_attribution"] = "per-round (timestamped events present)"
-    elif metrics is not None and metrics.get("parse_failures"):
-        detail["parse_failure_attribution"] = (
-            "session-wide: this capture predates timestamped parse-failure events, so "
-            "the failure cannot be attributed to a round and every round in the batch "
-            "is disqualified"
-        )
-    record = build(
+    summary = attribution if attribution is not None else attribution_summary(raw)
+    affected = summary.affected_rounds()
+    parse_failure_count = affected.get(round_id, 0)
+    if metrics is not None and (summary.session_failure_count or summary.recorded_count):
+        detail["parse_failure_attribution"] = summary.reason()
+        if parse_failure_count:
+            detail["parse_failures_affecting_this_round"] = str(parse_failure_count)
+
+    problems = projection_problems(raw, round_id)
+    projected_ok, projection_error = True, None
+    if verify_projection_run:
+        # Only run the real projection when the screen has not already ruled
+        # the round out - projecting a round with no settlement rule would
+        # just re-raise what the screen already reported, at 180k events of
+        # cost per round.
+        if problems:
+            projected_ok = False
+            projection_error = None
+        else:
+            projected_ok, projection_error = verify_projection(raw, round_id)
+            if projection_error:
+                detail[Disqualifier.PROJECTION_FAILED.value] = projection_error
+
+    return build(
         round_id,
         label_status=labels["label_status"],
         reconstructed_outcome=labels["reconstructed_outcome"],
@@ -197,23 +334,31 @@ def evaluate_round(raw: RawEventStore, round_id: str) -> RoundEligibility:
         declared_agrees=labels["declared_agrees"],
         metrics=metrics,
         round_integrity_mismatches=len(mismatches),
-        projection_problems=projection_problems(raw, round_id),
+        projection_problems=problems,
         detail=detail,
+        rule_text_status=rule_status.value,
+        projection_error=projection_error,
+        projection_verified=verify_projection_run and projected_ok,
+        recorder_generation=raw.recorder_identity().recorder_generation,
+        parse_failure_count=parse_failure_count,
     )
-    if labels["rule_text_agrees"] is False:
-        record = RoundEligibility(
-            round_id=record.round_id,
-            label_valid=False,
-            data_valid=record.data_valid,
-            projection_valid=record.projection_valid,
-            disqualifiers=record.disqualifiers + (Disqualifier.RULE_TEXT_DISAGREES,),
-            detail=record.detail,
+
+
+def evaluate_capture(
+    raw: RawEventStore, *, verify_projection_run: bool = True
+) -> list[RoundEligibility]:
+    # One attribution pass per capture, not per round: it reads every
+    # control event and every round result, and the answer is a property of
+    # the capture as a whole.
+    summary = attribution_summary(raw)
+    return [
+        evaluate_round(
+            raw, rid,
+            verify_projection_run=verify_projection_run,
+            attribution=summary,
         )
-    return record
-
-
-def evaluate_capture(raw: RawEventStore) -> list[RoundEligibility]:
-    return [evaluate_round(raw, rid) for rid in raw.round_ids()]
+        for rid in raw.round_ids()
+    ]
 
 
 @dataclass(frozen=True)
@@ -234,8 +379,10 @@ class PreflightReport:
             "",
             f"  captured rounds              {c['captured']}",
             f"  label CONFIRMED (valid)      {c['label_valid']}",
+            f"  rule-text VERIFIED_TRUE      {c.get('rule_text_verified', 0)}",
             f"  data-quality clean           {c['data_training_grade']}",
-            f"  projection valid             {c['projection_valid']}",
+            f"  projection preconditions ok  {c.get('projection_preconditions_valid', 0)}",
+            f"  ACTUAL projection valid      {c['projection_valid']}",
             f"  FINAL training eligible      {c['training_eligible']}",
             "",
             "  DISQUALIFICATION REASONS BY CATEGORY",
@@ -251,6 +398,6 @@ class PreflightReport:
         return "\n".join(lines)
 
 
-def preflight(raw: RawEventStore) -> PreflightReport:
-    records = evaluate_capture(raw)
+def preflight(raw: RawEventStore, *, verify_projection_run: bool = True) -> PreflightReport:
+    records = evaluate_capture(raw, verify_projection_run=verify_projection_run)
     return PreflightReport(counts=summarize(records), records=records)

@@ -28,7 +28,14 @@ import time
 import uuid
 from dataclasses import dataclass, field, replace
 
+from xamarinbot.realtime.attribution import (
+    CONNECTION_CONTEXTS,
+    RoundWindow,
+    Stream,
+    attribute_failure,
+)
 from xamarinbot.realtime.clob_ws import PolymarketMarketStream
+from xamarinbot.realtime.identity import RecorderIdentity
 from xamarinbot.realtime.counterfactual import MakerCounterfactualTracker
 from xamarinbot.realtime.discovery import (
     MarketDiscovery,
@@ -110,6 +117,7 @@ class RealRecorderService:
         discovery: MarketDiscovery | None = None,
         session_id: str | None = None,
         log=print,
+        identity: RecorderIdentity | None = None,
     ):
         self.cfg = cfg or ServiceConfig()
         self.store = store
@@ -128,10 +136,19 @@ class RealRecorderService:
         self._clob_builder = RawEventBuilder(session_id=f"{self.session_id}-clob")
         self._rtds_builder = RawEventBuilder(session_id=f"{self.session_id}-rtds")
 
+        # Item 6: stamp WHICH CODE is producing this capture, before a single
+        # event is written. A capture with no identity row is a
+        # LEGACY_RECORDER capture and is reported separately rather than
+        # pooled with post-fix data.
+        self.identity = identity or RecorderIdentity.capture()
+        for stream_session in (f"{self.session_id}-clob", f"{self.session_id}-rtds"):
+            self.store.upsert_session_meta(stream_session, self.identity)
+        self.store.upsert_session_meta(self.session_id, self.identity)
+
         self.rtds = RTDSClient(
             builder=self._rtds_builder,
             on_raw_event=self.recorder.submit,
-            on_parse_failure=self._on_parse_failure,
+            on_parse_failure=self._on_rtds_parse_failure,
             on_reconnect=lambda gen: self.metrics.record_reconnect(),
             on_observation=self._on_observation,
         )
@@ -141,36 +158,70 @@ class RealRecorderService:
 
     # ------------------------------------------------------------- hooks
 
-    def _on_parse_failure(self, raw, exc) -> None:
-        """Count the failure AND persist when it happened.
+    def round_windows(self) -> list[RoundWindow]:
+        """Every round's REQUIRED recording interval, for attribution."""
+        lc = self.cfg.lifecycle
+        return [
+            RoundWindow(
+                round_id=c.metadata.round_id,
+                condition_id=c.metadata.condition_id,
+                up_token_id=c.metadata.up_token_id,
+                down_token_id=c.metadata.down_token_id,
+                start_ts_ns=int(c.metadata.start_ts * 1e9),
+                end_ts_ns=int(c.metadata.end_ts * 1e9),
+                pre_round_lead_ns=int(lc.pre_round_lead_s * 1e9),
+                post_round_tail_ns=int(lc.post_round_tail_s * 1e9),
+            )
+            for c in self.captures.values()
+        ]
 
-        Gate A.0 item 1 makes `data_valid` depend on parse failures, but the
-        recorder only ever incremented a session counter - so a single bad
-        frame disqualified every round in the batch, because nothing recorded
-        which round was live at the time. Writing a timestamped control event
-        lets eligibility attribute the failure to the round whose window
-        contains it, instead of condemning its seven neighbours.
+    def _on_clob_parse_failure(self, raw, exc) -> None:
+        self._on_parse_failure(raw, exc, Stream.CLOB)
+
+    def _on_rtds_parse_failure(self, raw, exc) -> None:
+        self._on_parse_failure(raw, exc, Stream.RTDS)
+
+    def _on_parse_failure(self, raw, exc, stream: Stream = Stream.UNKNOWN) -> None:
+        """Count the failure AND persist WHICH MARKETS it damaged.
+
+        Gate A.0 wrote a timestamped record but tagged it with whichever
+        round was ACTIVE, which is a guess rather than attribution - and a
+        guess that is confidently wrong for exactly the failures that matter
+        most: a bootstrap for a FUTURE round's token, a connection-wide
+        outage, or a gap in the global reference stream. See
+        `realtime/attribution.py`; the rule is that a failure which cannot be
+        placed is recorded as UNATTRIBUTED and widens rather than narrows.
         """
         self.metrics.record_parse_failure()
-        self._log(f"[parse-failure] {type(exc).__name__}: {exc}")
-        active = next(
-            (c.metadata.round_id for c in self.captures.values()
-             if c.lifecycle.state is RoundState.ACTIVE),
-            None,
-        )
+        self._log(f"[parse-failure] {stream.value}: {type(exc).__name__}: {exc}")
         try:
+            attribution = attribute_failure(
+                stream=stream,
+                failure_kind=str(raw) if str(raw) in CONNECTION_CONTEXTS else type(exc).__name__,
+                recv_timestamp_ns=time.time_ns(),
+                raw=str(raw),
+                windows=self.round_windows(),
+            )
+            payload = dict(
+                attribution.as_payload(),
+                error_type=type(exc).__name__,
+                error=str(exc)[:400],
+            )
+            # `round_id` on the raw row stays a single column, so it carries
+            # the sole affected round when there is exactly one and NULL
+            # otherwise. `affected_round_ids` in the payload is the truth;
+            # the column is an index convenience and is never read as the
+            # attribution.
+            sole = (attribution.affected_round_ids[0]
+                    if len(attribution.affected_round_ids) == 1 else None)
             self.recorder.submit(self._clob_builder.build(
-                Topic.RECORDER_CONTROL, "parse_failure",
-                {
-                    "error_type": type(exc).__name__,
-                    "error": str(exc)[:400],
-                    "raw_excerpt": str(raw)[:200],
-                    "active_round_id": active,
-                },
-                round_id=active,
+                Topic.RECORDER_CONTROL, "parse_failure", payload, round_id=sole,
             ))
         except Exception:
-            # Recording the failure must never itself break the reader.
+            # Recording the failure must never itself break the reader. The
+            # session counter above already incremented, so a failure lost
+            # here becomes an UNRECORDED failure and forces the conservative
+            # session-wide fallback rather than disappearing.
             pass
 
     def _on_market_event(self, event: RawEvent) -> None:
@@ -358,7 +409,7 @@ class RealRecorderService:
                 side_for_token=side_map,
                 round_for_token=round_map,
                 condition_for_token=cond_map,
-                on_parse_failure=self._on_parse_failure,
+                on_parse_failure=self._on_clob_parse_failure,
                 on_reconnect=lambda gen: self.metrics.record_reconnect(),
                 on_resnapshot=lambda tid: self.metrics.record_resnapshot(),
             )

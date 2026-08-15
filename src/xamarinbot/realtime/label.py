@@ -92,6 +92,50 @@ _RULE_TEXT_MARKERS = {
 }
 
 
+class RuleTextStatus(str, Enum):
+    """The outcome of cross-checking a market's free text against its
+    structured settlement configuration (Gate A.0.1 item 2).
+
+    The distinction that matters is between "we checked and it agreed" and
+    "we never checked". Gate A.0 conflated them: `rule_text_agrees=None`
+    meant both, so a legacy index full of nulls looked like a clean bill of
+    health when in fact the check had simply never run.
+
+    `SOURCE_TEXT_UNAVAILABLE` is reserved for markets that persisted NO text
+    at all. If text exists, the check must reach a verdict - a market whose
+    own description does not corroborate the settlement basis we intend to
+    reconstruct its label from is not a market we can label confidently.
+    """
+
+    VERIFIED_TRUE = "VERIFIED_TRUE"
+    VERIFIED_FALSE = "VERIFIED_FALSE"
+    SOURCE_TEXT_UNAVAILABLE = "SOURCE_TEXT_UNAVAILABLE"
+
+    @property
+    def blocks_training(self) -> bool:
+        return self is RuleTextStatus.VERIFIED_FALSE
+
+
+def verify_rule_text(
+    settlement_kind: str, twap_window_s: int | None, *texts: str | None
+) -> RuleTextStatus:
+    """Item 2: an explicit, three-valued verdict instead of a tri-state bool.
+
+    Text present but silent about the settlement basis resolves to
+    VERIFIED_FALSE rather than "unknown". That is a deliberate tightening:
+    the label is reconstructed from a specific price series, and a market
+    that never names that series has not corroborated it. Failing closed
+    costs rounds; failing open costs a label that is wrong in a way nothing
+    downstream can detect.
+    """
+    if not any(t for t in texts):
+        return RuleTextStatus.SOURCE_TEXT_UNAVAILABLE
+    agrees = declared_basis_matches_rule_text(settlement_kind, twap_window_s, *texts)
+    if agrees is True:
+        return RuleTextStatus.VERIFIED_TRUE
+    return RuleTextStatus.VERIFIED_FALSE
+
+
 def declared_basis_matches_rule_text(
     settlement_kind: str, twap_window_s: int | None, *texts: str | None
 ) -> bool | None:
