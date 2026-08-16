@@ -184,10 +184,25 @@ class RTDSClient:
         self._on_parse_failure = on_parse_failure or (lambda raw, exc: None)
         self._on_reconnect = on_reconnect or (lambda gen: None)
         self._on_observation = on_observation or (lambda obs: None)
-        #: Gate A.0.2 item 1: RTDS outages as INTERVALS. A stall opens a gap
-        #: at the last observation actually received; the first valid BTC
-        #: observation after the reconnect closes it.
-        self.gaps = StreamGapTracker(Stream.RTDS, on_gap=on_data_gap)
+        #: Gate A.0.2.1 items 1-3: one gap tracker PER REQUIRED BTC SERIES.
+        #:
+        #: A.0.2 kept a single tracker for the whole socket, and the socket
+        #: is deliberately UNFILTERED - filtered subscriptions do not
+        #: deliver, so every asset the venue publishes arrives here. ETH and
+        #: SOL ticks at 20/s therefore kept the aggregate liveness mark
+        #: perfectly fresh while every BTC observation could be gone.
+        #:
+        #: The strategy does not consume "the RTDS socket"; it consumes four
+        #: independent series, and reconstructs the label from one specific
+        #: one of them. A TWAP-60 blackout with the other three healthy is
+        #: invisible in the aggregate and fatal to the label.
+        self.topic_gaps: dict[str, StreamGapTracker] = {
+            t: StreamGapTracker(
+                Stream.RTDS, on_gap=on_data_gap,
+                wire_topic=t, expected_symbol=self._symbols.get(t),
+            )
+            for t in self._topics
+        }
 
         self._latest: dict[str, ReferenceObservation] = {}
         self._history: dict[str, list[ReferenceObservation]] = {t: [] for t in self._topics}
@@ -246,6 +261,7 @@ class RTDSClient:
                     backoff = 1.0
                     last_ping = time.monotonic()
                     last_data = time.monotonic()
+                    self.mark_connected()
                     while not self._stop.is_set():
                         try:
                             raw = ws.recv(timeout=1.0)
@@ -255,33 +271,49 @@ class RTDSClient:
                             ws.send("PING")
                             last_ping = time.monotonic()
                         if raw:
-                            # PONG counts as liveness for the socket, but not
-                            # as DATA - a server that answers pings while
-                            # having silently dropped our subscriptions is
-                            # exactly the failure this watchdog exists for.
+                            # SOCKET liveness only. A PONG does not count,
+                            # and neither an ETH tick nor a BTC tick tells us
+                            # anything here beyond "the connection carries
+                            # bytes". Which BTC SERIES are alive is tracked
+                            # entirely separately, in `topic_gaps`.
                             if raw not in ("PONG", "pong"):
                                 last_data = time.monotonic()
                             self.handle_message(raw)
+                        # Gate A.0.2.1 items 1 and 3: two SEPARATE questions.
+                        #
+                        # (a) Is any required BTC series stale? Checked per
+                        #     topic, against that topic's own last valid
+                        #     observation. This does NOT drop the socket: a
+                        #     TWAP-60 outage while the other three publish
+                        #     normally is a data-quality event, and
+                        #     reconnecting would interrupt three healthy
+                        #     feeds to chase one sick one.
+                        self._check_topic_liveness()
+
+                        # (b) Is the SOCKET dead? That is the only condition
+                        #     that justifies dropping the connection. Note
+                        #     that unrelated-asset traffic legitimately
+                        #     answers this question and legitimately does
+                        #     NOT answer (a) - which is precisely the
+                        #     conflation A.0.2.1 removes.
                         if time.monotonic() - last_data > self._stall_timeout:
                             silent_for = time.monotonic() - last_data
-                            # Gate A.0.2 item 1: open a real INTERVAL. The
-                            # outage began at the last observation actually
-                            # received, which is `silent_for` seconds ago -
-                            # not now, when the watchdog happened to notice.
-                            self.gaps.begin("stream_stalled")
+                            for tracker in self.topic_gaps.values():
+                                tracker.begin("stream_stalled")
                             self._emit(self._builder.build(
                                 Topic.RECORDER_CONTROL, "stream_stalled",
                                 {
                                     "stream": "rtds",
+                                    "scope": "socket",
                                     "silent_for_s": silent_for,
                                     "stall_timeout_s": self._stall_timeout,
                                 },
                                 round_id=self.current_round_id,
                             ))
                             # Break out to the reconnect path rather than
-                            # sitting on a dead socket. The gap stays OPEN
-                            # and is closed by the first valid BTC
-                            # observation on the new connection.
+                            # sitting on a dead socket. Each topic's gap
+                            # stays OPEN and is closed independently by that
+                            # series' own first valid observation.
                             break
             except Exception as exc:
                 if self._stop.is_set():
@@ -289,6 +321,53 @@ class RTDSClient:
                 self._on_parse_failure("rtds_connection", exc)
                 time.sleep(backoff)
                 backoff = min(backoff * 2, 30.0)
+
+    def _check_topic_liveness(self, now_ns: int | None = None) -> list[str]:
+        """Open a gap for every required BTC series that has gone stale.
+
+        Gate A.0.2.1 item 3: the freshness question is asked per topic,
+        against `now - last_valid_recv[topic]`, and NEVER against
+        `now - last_any_socket_message`. Returns the topics found stale so
+        the caller (and tests) can see which.
+
+        A series that has not published since the connection opened is not
+        yet stale - `mark_connected` sets the reference point, so a fresh
+        socket does not immediately declare four outages.
+        """
+        now = now_ns if now_ns is not None else time.time_ns()
+        timeout_ns = int(self._stall_timeout * 1e9)
+        stale: list[str] = []
+        for wire_topic, tracker in self.topic_gaps.items():
+            if tracker.last_data_ns is None or tracker.open_gap is not None:
+                continue
+            if now - tracker.last_data_ns > timeout_ns:
+                tracker.begin("topic_stalled", detected_ns=now)
+                stale.append(wire_topic)
+                self._emit(self._builder.build(
+                    Topic.RECORDER_CONTROL, "topic_stalled",
+                    {
+                        "stream": "rtds",
+                        "scope": "topic",
+                        "wire_topic": wire_topic,
+                        "expected_symbol": self._symbols.get(wire_topic),
+                        "silent_for_s": (now - tracker.last_data_ns) / 1e9,
+                        "stall_timeout_s": self._stall_timeout,
+                    },
+                    round_id=self.current_round_id,
+                ))
+        return stale
+
+    def mark_connected(self, at_ns: int | None = None) -> None:
+        """Set every topic's freshness reference to now.
+
+        Called when a connection is established. Without it, a series that
+        is simply slow to publish after a reconnect would be reported stale
+        against a reference point from before the outage.
+        """
+        now = at_ns if at_ns is not None else time.time_ns()
+        for tracker in self.topic_gaps.values():
+            if tracker.last_data_ns is None:
+                tracker.last_data_ns = now
 
     # ------------------------------------------------------------ routing
 
@@ -364,11 +443,14 @@ class RTDSClient:
             self._emit(ev)
             return ev
 
-        # Gate A.0.2 item 1: THIS is what ends an RTDS outage - a parsed,
-        # wanted BTC observation with a usable value. Not the reconnect
-        # (which only proves a socket opened), and not a PONG. Any open gap
-        # is closed at this observation's own receive timestamp.
-        self.gaps.note_data(ev.recv_wall_timestamp_ns)
+        # Gate A.0.2.1 item 2: only THIS series' gap may close. A parsed,
+        # wanted BTC observation on `wire_topic` proves that series is
+        # alive and says nothing whatever about the other three - a Binance
+        # tick is not evidence that TWAP-60 is publishing, and neither is a
+        # reconnect (which only proves a socket opened) or a PONG.
+        tracker = self.topic_gaps.get(wire_topic)
+        if tracker is not None:
+            tracker.note_data(ev.recv_wall_timestamp_ns)
 
         window = payload.get("window_s")
         obs = ReferenceObservation(

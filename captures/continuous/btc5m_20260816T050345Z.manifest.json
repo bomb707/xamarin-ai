@@ -1,0 +1,13 @@
+{
+  "capture_db": "btc5m_20260816T050345Z.db",
+  "batch": 8,
+  "written_at": 1786860117.0086093,
+  "recorder_code_sha": "7a8494eb6ed38f1d839640236901acf6208bfd4b",
+  "recorder_code_dirty": false,
+  "process_pid": 2757481,
+  "process_started_at": 1786832581.6182501,
+  "python_version": "3.12.3",
+  "recorder_schema_version": 3,
+  "recorder_generation": "POST_A0_2_RECORDER",
+  "host": "157-90-182-161.ptr"
+}

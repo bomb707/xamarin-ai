@@ -35,20 +35,30 @@ from pathlib import Path
 #:   3  Gate A.0.2                structured `data_gap` events with measured
 #:                                outage intervals; feed stalls inside the
 #:                                eligibility gate
+#:   4  Gate A.0.2.1              PER-TOPIC BTC continuity: `topic_stalled`
+#:                                events, `wire_topic`/`expected_symbol` on
+#:                                every gap, socket liveness separated from
+#:                                required-data liveness
 #:
 #: A v2 capture is not merely older: its stalls were recorded as
-#: zero-duration points outside the gate, so its data-quality verdicts are
-#: not comparable with a v3 capture's until it is reprocessed.
-RECORDER_SCHEMA_VERSION = 3
+#: zero-duration points outside the gate. A v3 capture tracked continuity at
+#: the SOCKET, which the unfiltered subscription made blind to a single BTC
+#: series going dark. Neither is comparable with a v4 capture until
+#: reprocessed - which the offline per-topic audit does for all of them.
+RECORDER_SCHEMA_VERSION = 4
 
 #: Captures with no session identity at all. They were written by a process
 #: that predates this module, so their generation is known only negatively.
 LEGACY_RECORDER = "LEGACY_RECORDER"
 POST_A0_1_RECORDER = "POST_A0_1_RECORDER"
 POST_A0_2_RECORDER = "POST_A0_2_RECORDER"
+NEW_PER_TOPIC_RECORDER = "NEW_PER_TOPIC_RECORDER"
 
 #: The generation a capture belongs to, by the schema it was written with.
-GENERATION_BY_SCHEMA = {1: LEGACY_RECORDER, 2: POST_A0_1_RECORDER, 3: POST_A0_2_RECORDER}
+GENERATION_BY_SCHEMA = {
+    1: LEGACY_RECORDER, 2: POST_A0_1_RECORDER, 3: POST_A0_2_RECORDER,
+    4: NEW_PER_TOPIC_RECORDER,
+}
 
 
 #: The paths whose state decides whether the LOADED CODE is a commit.

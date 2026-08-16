@@ -48,6 +48,12 @@ class Disqualifier(str, Enum):
     # --- recorder / market-data quality ---
     DROPPED_EVENTS = "dropped_events"
     PARSE_FAILURES = "parse_failures"
+    #: Gate A.0.2.1 item 7: a FEED OUTAGE - observations that never arrived.
+    #: Distinct from a parse failure, where a frame arrived and could not be
+    #: read. A.0.2 routed gaps through the parse-failure counter, so most
+    #: excluded rounds reported `parse_failures` when in fact nothing had
+    #: failed to parse; the reason a round was dropped was unreadable.
+    DATA_GAP = "data_gap"
     BOOK_INTEGRITY_MISMATCH = "book_integrity_mismatch"
     NO_RECORDER_METRICS = "no_recorder_metrics"
 
@@ -69,6 +75,7 @@ LABEL_DISQUALIFIERS = frozenset({
 })
 DATA_DISQUALIFIERS = frozenset({
     Disqualifier.DROPPED_EVENTS, Disqualifier.PARSE_FAILURES,
+    Disqualifier.DATA_GAP,
     Disqualifier.BOOK_INTEGRITY_MISMATCH, Disqualifier.NO_RECORDER_METRICS,
 })
 PROJECTION_DISQUALIFIERS = frozenset({
@@ -191,6 +198,7 @@ def evaluate_label(
 def evaluate_data_quality(
     metrics: dict | None,
     round_integrity_mismatches: int,
+    data_gaps: int = 0,
 ) -> list[Disqualifier]:
     """Item 1's `data_valid` predicate.
 
@@ -204,11 +212,17 @@ def evaluate_data_quality(
     out: list[Disqualifier] = []
     if metrics is None:
         out.append(Disqualifier.NO_RECORDER_METRICS)
+        # A capture with no metrics could also have had gaps; the gap count
+        # is measured from the raw log, not from metrics, so it still counts.
+        if data_gaps:
+            out.append(Disqualifier.DATA_GAP)
         return out
     if metrics.get("dropped_events"):
         out.append(Disqualifier.DROPPED_EVENTS)
     if metrics.get("parse_failures"):
         out.append(Disqualifier.PARSE_FAILURES)
+    if data_gaps:
+        out.append(Disqualifier.DATA_GAP)
     if round_integrity_mismatches:
         out.append(Disqualifier.BOOK_INTEGRITY_MISMATCH)
     return out
@@ -230,6 +244,7 @@ def build(
     projection_verified: bool = False,
     recorder_generation: str | None = None,
     parse_failure_count: int | None = None,
+    data_gap_count: int = 0,
 ) -> RoundEligibility:
     label_bad = evaluate_label(
         label_status, reconstructed_outcome, reported_outcome, declared_agrees,
@@ -241,7 +256,7 @@ def build(
         # report but must not also be applied, or an attributed failure would
         # be counted twice and a clean round condemned by its neighbours'.
         metrics = dict(metrics, parse_failures=parse_failure_count)
-    data_bad = evaluate_data_quality(metrics, round_integrity_mismatches)
+    data_bad = evaluate_data_quality(metrics, round_integrity_mismatches, data_gap_count)
     precondition_bad = list(projection_problems or ())
     proj_bad = list(precondition_bad)
     if projection_error is not None and Disqualifier.PROJECTION_FAILED not in proj_bad:

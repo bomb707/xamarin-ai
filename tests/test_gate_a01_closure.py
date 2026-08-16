@@ -45,6 +45,7 @@ from xamarinbot.realtime.identity import (
     LEGACY_RECORDER,
     POST_A0_1_RECORDER,
     POST_A0_2_RECORDER,
+    NEW_PER_TOPIC_RECORDER,
     RECORDER_SCHEMA_VERSION,
     RecorderIdentity,
     legacy_identity,
@@ -602,7 +603,7 @@ def test_the_recorder_identity_carries_the_loaded_git_sha():
     identity = RecorderIdentity.capture()
     assert identity.recorder_code_sha, "a git checkout must yield a SHA"
     assert len(identity.recorder_code_sha) == 40
-    assert identity.recorder_generation == POST_A0_2_RECORDER
+    assert identity.recorder_generation == NEW_PER_TOPIC_RECORDER
     assert identity.recorder_schema_version == RECORDER_SCHEMA_VERSION
 
 
@@ -643,7 +644,7 @@ def test_a_capture_round_trips_its_recorder_identity(tmp_path):
     assert back.recorder_code_sha == identity.recorder_code_sha
     assert back.process_pid == identity.process_pid
     assert back.process_started_at == pytest.approx(identity.process_started_at)
-    assert back.recorder_generation == POST_A0_2_RECORDER
+    assert back.recorder_generation == NEW_PER_TOPIC_RECORDER
     raw.close()
 
 
@@ -669,7 +670,7 @@ def test_legacy_and_post_fix_rounds_are_labelled_in_eligibility(tmp_path):
     ).recorder_generation == LEGACY_RECORDER
     assert evaluate_round(
         fixed, ROUND, verify_projection_run=False
-    ).recorder_generation == POST_A0_2_RECORDER
+    ).recorder_generation == NEW_PER_TOPIC_RECORDER
 
 
 def test_legacy_identity_is_explicit_rather_than_none():
@@ -698,7 +699,7 @@ def test_index_rows_carry_the_recorder_code_sha(tmp_path, monkeypatch):
     row = raw_index_row(mod, db, tmp_path, monkeypatch)
     assert row["recorder_code_sha"] == identity.recorder_code_sha
     assert row["recorder_process_pid"] == identity.process_pid
-    assert row["recorder_generation"] == POST_A0_2_RECORDER
+    assert row["recorder_generation"] == NEW_PER_TOPIC_RECORDER
     assert row["recorder_schema_version"] == RECORDER_SCHEMA_VERSION
 
 

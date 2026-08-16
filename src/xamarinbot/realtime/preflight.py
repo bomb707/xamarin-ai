@@ -89,7 +89,7 @@ _STREAM_DATA_TOPICS = {
 
 
 def reconstruct_gap_interval(
-    raw: RawEventStore, stream: str, at_ns: int
+    raw: RawEventStore, stream: str, at_ns: int, wire_topic: str | None = None
 ) -> tuple[int, int]:
     """The TRUE outage interval around a control event, from the data itself.
 
@@ -105,7 +105,17 @@ def reconstruct_gap_interval(
     measurement, not an estimate - which is what makes legacy captures
     revalidatable rather than merely re-judged.
     """
-    topics = _STREAM_DATA_TOPICS.get(stream, list(_STREAM_DATA_TOPICS["rtds"]))
+    if wire_topic:
+        # Gate A.0.2.1: a per-topic stall is bounded by THAT series' own
+        # observations. Using the aggregate RTDS traffic would close the
+        # outage on a Binance tick while TWAP-60 was still dark.
+        from xamarinbot.realtime.continuity import REQUIRED_TOPICS
+
+        topics = [REQUIRED_TOPICS[wire_topic]] if wire_topic in REQUIRED_TOPICS else []
+    else:
+        topics = _STREAM_DATA_TOPICS.get(stream, list(_STREAM_DATA_TOPICS["rtds"]))
+    if not topics:
+        return at_ns, at_ns
     before = raw.last_recv_before(topics, at_ns)
     after = raw.first_recv_after(topics, at_ns)
     return (before if before is not None else at_ns,
@@ -150,14 +160,23 @@ def structured_failure_events(raw: RawEventStore) -> list[FailureAttribution]:
             out.append(FailureAttribution.from_payload(payload, e.event_type))
             continue
 
-        # Legacy stall/reconnect: reconstruct rather than discard.
+        # Legacy stall/reconnect, or a per-topic stall: reconstruct rather
+        # than discard. A `topic_stalled` event already names its series, so
+        # its interval is reconstructed from THAT series' observations
+        # rather than from the aggregate RTDS traffic.
         stream = payload.get("stream") or ("clob" if e.event_type == "reconnect" else "rtds")
+        wire_topic = payload.get("wire_topic")
         at_ns = e.recv_wall_timestamp_ns
-        start_ns, end_ns = reconstruct_gap_interval(raw, str(stream), at_ns)
+        start_ns, end_ns = reconstruct_gap_interval(
+            raw, str(stream), at_ns, wire_topic=wire_topic,
+        )
         if end_ns - start_ns <= MATERIAL_GAP_NS:
             continue
         norm = "rtds" if str(stream).startswith("rtds") else "clob"
-        seen = covered.setdefault(norm, [])
+        # Keyed by (stream, SERIES): two different BTC topics stalling over
+        # the same interval are two outages, not one, and merging them would
+        # undo exactly the distinction A.0.2.1 exists to make.
+        seen = covered.setdefault(f"{norm}:{wire_topic or ''}", [])
         if any(start_ns <= s_end and end_ns >= s_start for s_start, s_end in seen):
             continue
         seen.append((start_ns, end_ns))
@@ -167,11 +186,30 @@ def structured_failure_events(raw: RawEventStore) -> list[FailureAttribution]:
             last_data_ns=start_ns,
             detected_ns=at_ns,
             recovered_ns=end_ns,
+            wire_topic=wire_topic,
+            expected_symbol=payload.get("expected_symbol"),
         )
         out.append(dataclasses.replace(
             attribute_gap(gap, windows), source_event_type=e.event_type,
         ))
     return out
+
+
+#: Per-capture cache for the offline per-topic audit. It reads four full
+#: topic timelines (~12k observations per capture), which is cheap once and
+#: wasteful once per round.
+_TOPIC_GAP_CACHE: dict[int, dict[str, list[str]]] = {}
+
+
+def topic_gap_labels(raw: RawEventStore, round_id: str) -> list[str]:
+    """Which required BTC series had a missing-observation gap overlapping
+    this round's window (Gate A.0.2.1 item 5)."""
+    from xamarinbot.realtime.continuity import rounds_affected_by_topic_gaps
+
+    key = id(raw)
+    if key not in _TOPIC_GAP_CACHE:
+        _TOPIC_GAP_CACHE[key] = rounds_affected_by_topic_gaps(raw)
+    return sorted(_TOPIC_GAP_CACHE[key].get(round_id, []))
 
 
 def attribution_summary(raw: RawEventStore) -> AttributionSummary:
@@ -410,12 +448,35 @@ def evaluate_round(
 
     metrics = session_metrics(raw, round_id)
     summary = attribution if attribution is not None else attribution_summary(raw)
-    affected = summary.affected_rounds()
-    parse_failure_count = affected.get(round_id, 0)
+    # Item 7: parse failures and feed outages are DIFFERENT failures and are
+    # counted separately, so an excluded round says which one it suffered.
+    parse_by_round, gaps_by_round = summary.affected_rounds_by_kind()
+    parse_failure_count = parse_by_round.get(round_id, 0)
+    data_gap_count = gaps_by_round.get(round_id, 0)
     if metrics is not None and (summary.session_failure_count or summary.recorded_count):
         detail["parse_failure_attribution"] = summary.reason()
         if parse_failure_count:
             detail["parse_failures_affecting_this_round"] = str(parse_failure_count)
+    if data_gap_count:
+        detail[Disqualifier.DATA_GAP.value] = (
+            f"{data_gap_count} feed outage(s): "
+            + ", ".join(summary.gap_topics_for_round(round_id))
+        )
+
+    # Item 5: the offline per-topic audit finds outages the live watchdog
+    # structurally cannot - a series that stalls for 12 seconds never
+    # reaches a 30-second stall timeout, and before A.0.2.1 a series that
+    # stalled while other assets kept the socket busy was never checked at
+    # all. Applied to every capture, so pre-A.0.2.1 data is revalidated
+    # rather than trusted.
+    topic_gaps = topic_gap_labels(raw, round_id)
+    if topic_gaps:
+        data_gap_count += len(topic_gaps)
+        existing = detail.get(Disqualifier.DATA_GAP.value, "")
+        detail[Disqualifier.DATA_GAP.value] = (
+            (existing + "; " if existing else "")
+            + "offline per-topic audit: " + ", ".join(topic_gaps)
+        )
 
     problems = projection_problems(raw, round_id)
     projected_ok, projection_error = True, None
@@ -447,6 +508,7 @@ def evaluate_round(
         projection_verified=verify_projection_run and projected_ok,
         recorder_generation=raw.recorder_identity().recorder_generation,
         parse_failure_count=parse_failure_count,
+        data_gap_count=data_gap_count,
     )
 
 

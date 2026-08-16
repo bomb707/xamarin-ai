@@ -175,14 +175,15 @@ def test_the_real_rtds_client_opens_a_gap_when_its_watchdog_fires():
                         on_raw_event=lambda e: None,
                         on_data_gap=gaps.append)
     clock = FakeClock(START_NS)
-    client.gaps._clock = clock
+    tracker = client.topic_gaps["crypto_prices_twap_sixty"]
+    tracker._clock = clock
 
     client.handle_message(_rtds_frame("crypto_prices_twap_sixty", 1000, 63000.0))
-    assert client.gaps.last_data_ns is not None, "a real frame must mark liveness"
+    assert tracker.last_data_ns is not None, "a real frame must mark liveness"
 
     clock.advance_s(30)
-    client.gaps.begin("stream_stalled")       # exactly what the watchdog does
-    assert client.gaps.open_gap is not None
+    tracker.begin("stream_stalled")           # exactly what the watchdog does
+    assert tracker.open_gap is not None
     assert gaps == [], "an open gap is not published until data resumes"
 
 
@@ -194,13 +195,15 @@ def test_the_real_rtds_client_closes_the_gap_on_the_first_resumed_observation():
                         on_raw_event=events.append,
                         on_data_gap=gaps.append)
 
+    tracker = client.topic_gaps["crypto_prices_twap_sixty"]
     client.handle_message(_rtds_frame("crypto_prices_twap_sixty", 1000, 63000.0))
-    client.gaps.begin("stream_stalled")
+    tracker.begin("stream_stalled")
     client.handle_message(_rtds_frame("crypto_prices_twap_sixty", 38_000, 63010.0))
 
     assert len(gaps) == 1
     assert gaps[0].stream == "rtds"
-    assert client.gaps.open_gap is None
+    assert gaps[0].wire_topic == "crypto_prices_twap_sixty"
+    assert tracker.open_gap is None
     # The interval's ends are the OBSERVATIONS' own receive timestamps -
     # deliberately not a clock the test controls, because in production the
     # gap must be bounded by when data really arrived, not by when anything
@@ -216,12 +219,13 @@ def test_a_pong_does_not_close_an_rtds_gap():
     client = RTDSClient(builder=RawEventBuilder(session_id="t"),
                         on_raw_event=lambda e: None,
                         on_data_gap=gaps.append)
-    client.gaps._clock = FakeClock(START_NS)
+    tracker = client.topic_gaps["crypto_prices_twap_sixty"]
+    tracker._clock = FakeClock(START_NS)
     client.handle_message(_rtds_frame("crypto_prices_twap_sixty", 1000, 63000.0))
-    client.gaps.begin("stream_stalled")
+    tracker.begin("stream_stalled")
     client.handle_message("PONG")
     assert gaps == [], "a PONG is liveness for the socket, not data"
-    assert client.gaps.open_gap is not None
+    assert tracker.open_gap is not None
 
 
 def test_a_non_btc_tick_does_not_close_an_rtds_gap():
@@ -229,9 +233,10 @@ def test_a_non_btc_tick_does_not_close_an_rtds_gap():
     client = RTDSClient(builder=RawEventBuilder(session_id="t"),
                         on_raw_event=lambda e: None,
                         on_data_gap=gaps.append)
-    client.gaps._clock = FakeClock(START_NS)
+    tracker = client.topic_gaps["crypto_prices_twap_sixty"]
+    tracker._clock = FakeClock(START_NS)
     client.handle_message(_rtds_frame("crypto_prices_twap_sixty", 1000, 63000.0))
-    client.gaps.begin("stream_stalled")
+    tracker.begin("stream_stalled")
     client.handle_message(json.dumps({
         "topic": "crypto_prices", "type": "update", "timestamp": 2000,
         "payload": {"symbol": "ethusdt", "timestamp": 2000, "value": 3000.0},
@@ -335,7 +340,10 @@ def test_a_gap_makes_the_affected_round_data_invalid(tmp_path):
     rec = evaluate_round(raw, ROUND, verify_projection_run=False)
     assert rec.data_valid is False
     assert rec.training_eligible is False
-    assert Disqualifier.PARSE_FAILURES in rec.data_disqualifiers
+    # Gate A.0.2.1 item 7: a feed outage is a DATA_GAP, not a parse failure.
+    # Nothing failed to parse here - observations never arrived.
+    assert Disqualifier.DATA_GAP in rec.data_disqualifiers
+    assert Disqualifier.PARSE_FAILURES not in rec.data_disqualifiers
 
 
 def test_a_gap_that_misses_the_round_leaves_it_valid(tmp_path):
@@ -611,11 +619,14 @@ def test_the_schema_bump_distinguishes_a01_from_a02_captures():
         RecorderIdentity,
     )
 
-    assert RECORDER_SCHEMA_VERSION == 3
-    assert ATTRIBUTION_SCHEMA_VERSION == 2
+    assert RECORDER_SCHEMA_VERSION == 4
+    assert ATTRIBUTION_SCHEMA_VERSION == 3
     assert GENERATION_BY_SCHEMA[2] == POST_A0_1_RECORDER
     assert GENERATION_BY_SCHEMA[3] == POST_A0_2_RECORDER
-    assert RecorderIdentity.capture().recorder_generation == POST_A0_2_RECORDER
+    from xamarinbot.realtime.identity import NEW_PER_TOPIC_RECORDER
+
+    assert GENERATION_BY_SCHEMA[4] == NEW_PER_TOPIC_RECORDER
+    assert RecorderIdentity.capture().recorder_generation == NEW_PER_TOPIC_RECORDER
 
 
 def test_an_a01_capture_still_reads_back_as_its_own_generation(tmp_path):

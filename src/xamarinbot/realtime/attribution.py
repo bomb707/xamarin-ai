@@ -67,8 +67,9 @@ class Stream(str, Enum):
 
 #: Bumped when the persisted attribution payload changes shape.
 #: 1 = Gate A.0.1 (point failures); 2 = Gate A.0.2 (measured outage
-#: intervals, `data_gap` events).
-ATTRIBUTION_SCHEMA_VERSION = 2
+#: intervals, `data_gap` events); 3 = Gate A.0.2.1 (per-topic:
+#: `wire_topic` and `expected_symbol` name the series that went dark).
+ATTRIBUTION_SCHEMA_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -125,6 +126,9 @@ class FailureAttribution:
     interval_start_ns: int | None = None
     interval_end_ns: int | None = None
     detail: str = ""
+    #: Gate A.0.2.1 item 4: the specific BTC series, for RTDS gaps.
+    wire_topic: str | None = None
+    expected_symbol: str | None = None
     #: Which control event this came from (`parse_failure`, `data_gap`, or a
     #: legacy `stream_stalled`/`reconnect` reconstructed after the fact).
     #: Needed so completeness compares like with like - unrecorded PARSE
@@ -136,6 +140,16 @@ class FailureAttribution:
     @property
     def is_trustworthy(self) -> bool:
         return self.attribution_status.is_trustworthy
+
+    @property
+    def is_gap(self) -> bool:
+        """A missing-observation OUTAGE rather than an unreadable frame."""
+        return (
+            self.source_event_type in ("data_gap", "stream_stalled", "reconnect",
+                                       "topic_stalled")
+            or self.failure_kind in ("stream_stalled", "connection_gap",
+                                     "resync_gap", "reconnect", "topic_stalled")
+        )
 
     def as_payload(self) -> dict:
         return {
@@ -151,6 +165,8 @@ class FailureAttribution:
             "interval_start_ns": self.interval_start_ns,
             "interval_end_ns": self.interval_end_ns,
             "detail": self.detail,
+            "wire_topic": self.wire_topic,
+            "expected_symbol": self.expected_symbol,
         }
 
     @classmethod
@@ -184,6 +200,8 @@ class FailureAttribution:
             interval_start_ns=payload.get("interval_start_ns"),
             interval_end_ns=payload.get("interval_end_ns"),
             detail=payload.get("detail") or "",
+            wire_topic=payload.get("wire_topic"),
+            expected_symbol=payload.get("expected_symbol"),
             source_event_type=source_event_type,
         )
 
@@ -202,6 +220,7 @@ CONNECTION_CONTEXTS = frozenset({"ws_connection", "rtds_connection"})
 #: Gate A.0.2 item 2: these are intervals, not points.
 CONNECTION_SCOPED_KINDS = CONNECTION_CONTEXTS | frozenset({
     "stream_stalled", "connection_gap", "resync_gap", "reconnect",
+    "topic_stalled",
 })
 
 #: Control-event types that carry a structured data-quality failure.
@@ -209,7 +228,7 @@ CONNECTION_SCOPED_KINDS = CONNECTION_CONTEXTS | frozenset({
 #: `parse_failure` - an RTDS outage is a data loss whether or not any frame
 #: failed to parse.
 FAILURE_EVENT_TYPES = frozenset({
-    "parse_failure", "data_gap", "stream_stalled", "reconnect",
+    "parse_failure", "data_gap", "stream_stalled", "reconnect", "topic_stalled",
 })
 
 #: How long a feed must be silent before observations were CERTAINLY lost.
@@ -421,6 +440,13 @@ class StreamGap:
     detected_ns: int
     #: When usable data resumed. `None` while the gap is still open.
     recovered_ns: int | None = None
+    #: Gate A.0.2.1 item 4: WHICH series went dark. RTDS carries four
+    #: independent BTC feeds and the strategy depends on each separately, so
+    #: "the RTDS socket had an outage" is not a usable statement - a TWAP-60
+    #: blackout with the other three healthy is invisible in the aggregate
+    #: and fatal to the label.
+    wire_topic: str | None = None
+    expected_symbol: str | None = None
 
     @property
     def duration_ns(self) -> int:
@@ -461,8 +487,15 @@ class StreamGapTracker:
     only when usable data has genuinely resumed.
     """
 
-    def __init__(self, stream: Stream | str, on_gap=None, clock=None):
+    def __init__(self, stream: Stream | str, on_gap=None, clock=None,
+                 wire_topic: str | None = None, expected_symbol: str | None = None):
         self.stream = stream.value if isinstance(stream, Stream) else str(stream)
+        #: Gate A.0.2.1 items 2-3: one tracker per REQUIRED SERIES, not one
+        #: per socket. `note_data` on this tracker may close only THIS
+        #: series' gap - a Binance tick is not evidence that TWAP-60 is
+        #: alive, and an ETH tick is not evidence that anything BTC is.
+        self.wire_topic = wire_topic
+        self.expected_symbol = expected_symbol
         self._on_gap = on_gap or (lambda gap: None)
         self._clock = clock or (lambda: __import__("time").time_ns())
         self.last_data_ns: int | None = None
@@ -489,6 +522,7 @@ class StreamGapTracker:
             stream=self.stream, failure_kind=failure_kind,
             last_data_ns=self.last_data_ns if self.last_data_ns is not None else now,
             detected_ns=now,
+            wire_topic=self.wire_topic, expected_symbol=self.expected_symbol,
         )
         return self.open_gap
 
@@ -512,15 +546,21 @@ class StreamGapTracker:
 
 def attribute_gap(gap: StreamGap, windows: list[RoundWindow]) -> FailureAttribution:
     """Place a completed outage against the rounds it damaged."""
+    import dataclasses
+
     end = gap.recovered_ns if gap.recovered_ns is not None else gap.detected_ns
-    return attribute_failure(
-        stream=gap.stream,
-        failure_kind=gap.failure_kind,
-        recv_timestamp_ns=gap.detected_ns,
-        raw=gap.failure_kind,
-        windows=windows,
-        interval_start_ns=gap.last_data_ns,
-        interval_end_ns=end,
+    return dataclasses.replace(
+        attribute_failure(
+            stream=gap.stream,
+            failure_kind=gap.failure_kind,
+            recv_timestamp_ns=gap.detected_ns,
+            raw=gap.failure_kind,
+            windows=windows,
+            interval_start_ns=gap.last_data_ns,
+            interval_end_ns=end,
+        ),
+        wire_topic=gap.wire_topic,
+        expected_symbol=gap.expected_symbol,
     )
 
 
@@ -585,6 +625,49 @@ class AttributionSummary:
             for rid in a.affected_round_ids:
                 counts[rid] = counts.get(rid, 0) + 1
         return counts
+
+    def affected_rounds_by_kind(self) -> tuple[dict[str, int], dict[str, int]]:
+        """`(parse_failures_per_round, data_gaps_per_round)`.
+
+        Gate A.0.2.1 item 7. A.0.2 folded both into one count injected
+        through `parse_failure_count`, so a round excluded for a 32-second
+        TWAP-60 blackout reported `parse_failures` - when nothing had failed
+        to parse. The boolean verdict was right and the reason was
+        unreadable, which is the difference between knowing the dataset is
+        small and knowing why.
+        """
+        parse: dict[str, int] = {}
+        gaps: dict[str, int] = {}
+        if not self.is_complete:
+            # Unplaceable failures fall on everything; they are counted as
+            # parse failures because that is what the session counter that
+            # revealed them was counting.
+            n = self.unrecorded_count + len(self.untrustworthy)
+            for rid in self.all_round_ids:
+                parse[rid] = n
+            for a in self.attributions:
+                if a.is_trustworthy:
+                    target = gaps if a.is_gap else parse
+                    for rid in a.affected_round_ids:
+                        target[rid] = target.get(rid, 0) + 1
+            return parse, gaps
+        for a in self.attributions:
+            target = gaps if a.is_gap else parse
+            for rid in a.affected_round_ids:
+                target[rid] = target.get(rid, 0) + 1
+        return parse, gaps
+
+    def gap_topics_for_round(self, round_id: str) -> list[str]:
+        """`["rtds:crypto_prices_twap_sixty", "clob", ...]` - which feeds
+        actually went dark for this round (item 7's diagnostic detail)."""
+        out = []
+        for a in self.attributions:
+            if not a.is_gap or round_id not in a.affected_round_ids:
+                continue
+            label = f"{a.stream}:{a.wire_topic}" if a.wire_topic else a.stream
+            if label not in out:
+                out.append(label)
+        return sorted(out)
 
     def by_status(self) -> dict[str, int]:
         out: dict[str, int] = {s.value: 0 for s in AttributionStatus}
