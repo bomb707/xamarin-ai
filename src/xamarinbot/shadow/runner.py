@@ -98,6 +98,8 @@ _LEGACY_FEED_FOR_EVENT: dict[EventType, FeedKind] = {
 SYNTHETIC_REPLAY_FRESHNESS_POLICY = FreshnessPolicy(
     max_age_s={
         FeedKind.BOOK: 6.0,
+        FeedKind.BOOK_UP: 6.0,
+        FeedKind.BOOK_DOWN: 6.0,
         FeedKind.CHAINLINK_TWAP_60: 2.0,
         FeedKind.BINANCE: 2.0,
     },
@@ -118,10 +120,15 @@ SYNTHETIC_REPLAY_FRESHNESS_POLICY = FreshnessPolicy(
 REAL_REPLAY_FRESHNESS_POLICY = FreshnessPolicy(
     max_age_s={
         FeedKind.BOOK: 2.0,
+        FeedKind.BOOK_UP: 2.0,
+        FeedKind.BOOK_DOWN: 2.0,
         FeedKind.CHAINLINK_TWAP_60: 5.0,
         FeedKind.BINANCE: 5.0,
     },
-    required=frozenset({FeedKind.BOOK, FeedKind.CHAINLINK_TWAP_60, FeedKind.BINANCE}),
+    # Both sides required: a candidate is priced from ONE side's book, and
+    # neither side may be certified fresh by the other's activity.
+    required=frozenset({FeedKind.BOOK_UP, FeedKind.BOOK_DOWN,
+                        FeedKind.CHAINLINK_TWAP_60, FeedKind.BINANCE}),
 )
 
 
@@ -137,6 +144,29 @@ def freshness_policy_for(provenance: DataProvenance) -> FreshnessPolicy:
         if provenance.is_real
         else SYNTHETIC_REPLAY_FRESHNESS_POLICY
     )
+
+
+def _side_of(event) -> str | None:
+    return (event.payload or {}).get("side")
+
+
+def feed_for_event(event) -> FeedKind | None:
+    """Which freshness feed an event refreshes.
+
+    Gate-A hardening: a book event refreshes ONLY its own side. The UP and
+    DOWN books are separate order books that the controller prices separate
+    candidates from, so a burst of UP deltas says nothing about whether the
+    DOWN book is current.
+    """
+    kind = _LEGACY_FEED_FOR_EVENT.get(event.event_type)
+    if kind is not FeedKind.BOOK:
+        return kind
+    side = _side_of(event)
+    if side == "UP":
+        return FeedKind.BOOK_UP
+    if side == "DOWN":
+        return FeedKind.BOOK_DOWN
+    return FeedKind.BOOK
 
 
 def freshness_from_events(
@@ -156,13 +186,19 @@ def freshness_from_events(
     """
     latest: dict[FeedKind, float | None] = {}
     for e in causal_events:
-        kind = _LEGACY_FEED_FOR_EVENT.get(e.event_type)
+        kind = feed_for_event(e)
         if kind is None:
             continue
         source_ts = e.source_ts if e.source_ts is not None else e.recv_ts
-        current = latest.get(kind)
-        if current is None or source_ts > current:
-            latest[kind] = source_ts
+        for target in ({kind, FeedKind.BOOK}
+                       if kind in (FeedKind.BOOK_UP, FeedKind.BOOK_DOWN)
+                       else {kind}):
+            # The aggregate BOOK age is still maintained, for the policies
+            # that predate per-side tracking - but it is the SIDE ages that
+            # gate a real decision.
+            current = latest.get(target)
+            if current is None or source_ts > current:
+                latest[target] = source_ts
     return evaluate_freshness(decision_ts, latest, policy)
 
 

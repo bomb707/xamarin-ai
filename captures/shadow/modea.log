@@ -10,3 +10,7 @@ LIVE REAL-MARKET SHADOW - STRATEGY V0 - PAPER ONLY
 ==============================================================================
 
 [shadow] MODE A batch 1 starting at 20260816T095641Z
+[live-shadow] btc-updown-5m-1786874700 shadow-finalized: 81 decisions, 0 pending taker(s) drained, pnl=UNKNOWN, blocked {'MODEL_UNAVAILABLE': 81, 'INVALID_FEATURES:STALE_TWAP': 1, 'INVALID_FEATURES:STALE_BOOK': 4}
+[live-shadow] btc-updown-5m-1786875000 shadow-finalized: 86 decisions, 0 pending taker(s) drained, pnl=UNKNOWN, blocked {'MODEL_UNAVAILABLE': 86}
+[live-shadow] btc-updown-5m-1786875300 shadow-finalized: 86 decisions, 0 pending taker(s) drained, pnl=UNKNOWN, blocked {'MODEL_UNAVAILABLE': 86}
+[live-shadow] btc-updown-5m-1786875600 shadow-finalized: 86 decisions, 0 pending taker(s) drained, pnl=UNKNOWN, blocked {'MODEL_UNAVAILABLE': 86}

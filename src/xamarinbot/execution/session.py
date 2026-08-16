@@ -53,6 +53,16 @@ from xamarinbot.supervisor.supervisor import OrderSupervisor
 from xamarinbot.supervisor.types import SupervisorActionType, TrackedOrder
 
 
+def _purpose_name(purpose) -> str | None:
+    return getattr(purpose, "value", None) or (str(purpose) if purpose else None)
+
+
+def _pf(p) -> dict:
+    return {"U": p.U, "D": p.D, "C": p.C}
+
+
+
+
 @dataclass
 class TradingSession:
     """Owns confirmed `PortfolioState`, the taker order queue, open maker
@@ -90,6 +100,13 @@ class TradingSession:
     queue: TakerOrderQueue = field(init=False)
     supervisor: OrderSupervisor = field(init=False)
     _order_seq: int = field(default=0, init=False)
+    #: Read-only lifecycle observer, `(kind: str, payload: dict) -> None`.
+    #: Called at the authoritative points where an order is submitted or a
+    #: fill is applied, so a journal can reconstruct the EXACT trade instead
+    #: of inferring price and fee from a portfolio delta. Purely
+    #: observational: it is never consulted, and an exception in it must not
+    #: reach the execution path.
+    on_execution: object = None
 
     def __post_init__(self) -> None:
         # Phase 12C.2 item 1: the market is the single source of truth for
@@ -106,6 +123,39 @@ class TradingSession:
         self.queue = TakerOrderQueue(self.sim)
         sup_cfg = self.supervisor_cfg or SupervisorConfig(g_min=self.cfg.g_min, edge_min=self.cfg.edge_min)
         self.supervisor = OrderSupervisor(sup_cfg)
+
+    def _emit_execution(self, kind: str, payload: dict) -> None:
+        if self.on_execution is None:
+            return
+        try:
+            self.on_execution(kind, payload)
+        except Exception:
+            # Observation must never break execution.
+            pass
+
+    def _emit_fill(self, order_id, purpose, side, submit_ts, matched_ts,
+                   requested, limit_price, taker_result) -> None:
+        """The exact trade, from the authority that produced it.
+
+        Price, fee and slippage come from the `ExecutionSimulator` result -
+        never re-derived from a portfolio delta, which cannot separate price
+        from fee and cannot see a zero-fill at all.
+        """
+        walk = taker_result.walk
+        self._emit_execution("FILLED" if walk.filled_shares > 0 else "NO_FILL", {
+            "order_id": order_id, "purpose": _purpose_name(purpose),
+            "side": side.value, "role": "TAKER",
+            "submit_ts": submit_ts, "matched_ts": matched_ts,
+            "requested_shares": requested,
+            "filled_shares": walk.filled_shares,
+            "max_execution_price": limit_price,
+            "avg_execution_price": walk.avg_price,
+            "fee": walk.total_fee,
+            "slippage": (None if (walk.filled_shares <= 0 or limit_price is None)
+                         else walk.avg_price - limit_price),
+            "partial": 0 < walk.filled_shares < requested,
+            "portfolio_before": _pf(self.portfolio),
+        })
 
     def _next_order_id(self) -> str:
         self._order_seq += 1
@@ -128,6 +178,15 @@ class TradingSession:
         mirroring every prior caller's own `_book_at` helper."""
         for pending, taker_result in self.queue.resolve_ready(now_ts, book_at_fn):
             if taker_result.walk.filled_shares > 0:
+                self._emit_execution("TAKER_MATCHED", {
+                    "order_id": pending.order_state.order_id,
+                    "matched_ts": pending.matched_ts,
+                    "now_ts": now_ts,
+                })
+                self._emit_fill(
+                    pending.order_state.order_id, None, pending.side,
+                    pending.submit_ts, pending.matched_ts,
+                    pending.requested_shares, pending.limit_price, taker_result)
                 self.portfolio = apply_fill(
                     self.portfolio,
                     Fill(pending.side, taker_result.walk.avg_price, taker_result.walk.filled_shares, LiquidityRole.TAKER, taker_result.walk.total_fee),
@@ -280,9 +339,27 @@ class TradingSession:
             self.n_attempts += 1
             limit_price = chosen.max_execution_price if chosen.max_execution_price is not None else chosen.price
             asks = book_up.asks if chosen.side is Side.UP else book_down.asks
-            pending = self.queue.try_submit(self._next_order_id(), chosen.side, chosen.qty, limit_price, asks, decision_ts)
+            order_id = self._next_order_id()
+            pending = self.queue.try_submit(order_id, chosen.side, chosen.qty, limit_price, asks, decision_ts)
+            if pending is not None:
+                self._emit_execution("ORDER_SUBMITTED", {
+                    "order_id": order_id, "purpose": _purpose_name(chosen.purpose),
+                    "side": chosen.side.value, "role": "TAKER", "mode": "FAK",
+                    "submit_ts": decision_ts,
+                    "requested_shares": chosen.qty,
+                    "max_execution_price": limit_price,
+                    "was_delayed": bool(pending.was_delayed),
+                    "matched_ts": pending.matched_ts,
+                })
+                if pending.was_delayed:
+                    self._emit_execution("PENDING_DELAY", {
+                        "order_id": order_id, "submit_ts": decision_ts,
+                        "matched_ts": pending.matched_ts,
+                    })
             if pending is not None and not pending.was_delayed:
                 taker_result = self.sim.resolve_taker(pending)
+                self._emit_fill(order_id, chosen.purpose, chosen.side, decision_ts,
+                                decision_ts, chosen.qty, limit_price, taker_result)
                 if taker_result.walk.filled_shares > 0:
                     self.portfolio = apply_fill(self.portfolio, Fill(chosen.side, taker_result.walk.avg_price, taker_result.walk.filled_shares, LiquidityRole.TAKER, taker_result.walk.total_fee))
                     self.n_actions += 1

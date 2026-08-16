@@ -143,6 +143,20 @@ class ExecutionObserver:
         self.journal = journal
         self.round_id = round_id
 
+    def attach(self, session) -> None:
+        """Subscribe to the session's AUTHORITATIVE lifecycle callbacks.
+
+        These carry the exact order id, price, fee and quantity from the
+        execution simulator itself. The state diff below stays as a
+        portfolio-level cross-check, but it can never substitute for this:
+        an immediate FAK leaves the pending count at zero on both sides, so
+        a diff-only observer cannot even see that an order existed.
+        """
+        session.on_execution = self._on_session_event
+
+    def _on_session_event(self, kind: str, payload: dict) -> None:
+        self.journal.write_execution_event(self.round_id, kind, payload)
+
     def _state(self, session) -> dict:
         return {
             "portfolio": _portfolio_snapshot(session),
@@ -317,6 +331,7 @@ class LiveShadowService:
             controller=controller,
             execution=ExecutionObserver(self.journal, m.round_id),
         )
+        shadow.execution.attach(session)
         self.rounds[m.round_id] = shadow
         self.journal.write_round_opened(shadow, self.manifest, self.svc.store.db_path)
         return shadow
@@ -570,14 +585,14 @@ class LiveShadowService:
             c.advance_to(at_ts)
             return ReplayBookFeed(c).get_snapshot(round_id, side)
 
-        pending_before = len(getattr(shadow.session.queue, "pending", ()) or ())
+        pending_before = len(getattr(shadow.session.queue, "_pending", ()) or ())
         # Resolve as of the round's close: a taker submitted at t=270 with a
         # 250ms delay matches at 270.250, which is inside the round.
         shadow.execution.observe(
             shadow.session, shadow.metadata.end_ts, "drain_pending_takers",
             lambda: shadow.session.resolve_ready_takers(
                 shadow.metadata.end_ts, book_at))
-        pending_after = len(getattr(shadow.session.queue, "pending", ()) or ())
+        pending_after = len(getattr(shadow.session.queue, "_pending", ()) or ())
         return max(0, pending_before - pending_after)
 
     def _on_resolved(self, capture) -> None:

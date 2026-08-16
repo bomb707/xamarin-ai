@@ -36,7 +36,17 @@ from enum import Enum
 
 
 class FeedKind(str, Enum):
+    #: Aggregate book kind, retained for the replay policies that predate
+    #: per-side tracking.
     BOOK = "book"
+    #: Gate-A hardening: the controller consumes the UP and DOWN books
+    #: INDEPENDENTLY, and a candidate on one side is priced entirely from
+    #: that side's book. Collapsing them into one `BOOK` age meant a fresh
+    #: UP book could make a stale DOWN book look fresh, and vice versa - so
+    #: a DOWN order could be sized against a book that had not updated in
+    #: eight seconds while the freshness view reported everything healthy.
+    BOOK_UP = "book_up"
+    BOOK_DOWN = "book_down"
     CHAINLINK_REFERENCE = "chainlink_reference"
     CHAINLINK_TWAP_30 = "chainlink_twap_30"
     CHAINLINK_TWAP_60 = "chainlink_twap_60"
