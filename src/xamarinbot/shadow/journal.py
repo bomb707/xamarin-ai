@@ -153,9 +153,12 @@ class ShadowJournal:
             "candidates": [_jsonable(c) for c in (getattr(decision, "candidates", None) or [])],
             "chosen": _jsonable(chosen) if chosen is not None else None,
             "blocked_reason": blocked_reason,
-            # provenance linkage to the raw log
-            "raw_seq_first": shadow.raw_seq_first,
-            "raw_seq_last": shadow.raw_seq_last,
+            # provenance linkage to the raw log. Per SESSION, because each
+            # stream's builder owns its own sequence counter.
+            "raw_seq_by_session": {k: list(v) for k, v
+                                   in shadow.raw_seq_by_session.items()},
+            "raw_recv_first_ns": shadow.raw_recv_first_ns,
+            "raw_recv_last_ns": shadow.raw_recv_last_ns,
         }
         self._write("decision", shadow.round_id, decision_ts, payload)
 
@@ -210,8 +213,10 @@ class ShadowJournal:
             "missed_deadlines": shadow.missed_deadlines,
             "projected_events": dict(shadow.projector.counts),
             "projection_skipped": dict(shadow.projector.skipped),
-            "raw_seq_first": shadow.raw_seq_first,
-            "raw_seq_last": shadow.raw_seq_last,
+            "raw_seq_by_session": {k: list(v) for k, v
+                                   in shadow.raw_seq_by_session.items()},
+            "raw_recv_first_ns": shadow.raw_recv_first_ns,
+            "raw_recv_last_ns": shadow.raw_recv_last_ns,
             "strategy_version": manifest.strategy_version,
             "config_hash": manifest.config_hash,
             "model_version": manifest.model_version,

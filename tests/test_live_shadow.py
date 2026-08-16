@@ -367,7 +367,8 @@ def _fake_shadow(round_id=ROUND):
         session=session, p0=63000.0, fired={15.0}, decisions=1,
         blocked={}, missed_deadlines=0,
         projector=types.SimpleNamespace(counts={"TWAP": 3}, skipped={}),
-        raw_seq_first=1, raw_seq_last=99,
+        raw_seq_by_session={"cap-clob": (1, 99), "cap-rtds": (1, 40)},
+        raw_recv_first_ns=START_NS, raw_recv_last_ns=START_NS + 300_000_000_000,
     )
 
 
@@ -441,13 +442,36 @@ def test_the_linkage_row_maps_a_decision_back_to_its_raw_capture(tmp_path):
     j.close()
 
 
-def test_the_decision_record_carries_the_raw_event_range(tmp_path):
+def test_the_decision_record_carries_a_per_stream_raw_event_range(tmp_path):
+    """Each stream's builder owns its own sequence counter - the CLOB and
+    RTDS readers both start at 1. A single min/max across them is not a
+    range: the first live run reported `123041..6006`, which describes
+    nothing. Ranges are per session, plus globally-comparable wall bounds."""
     j = ShadowJournal(str(tmp_path / "j.db"))
     j.write_decision(_fake_shadow(), 1015.0, 15.0, None, None, None, None,
                      manifest=_manifest())
     row = j.read("decision")[0]
-    assert row["raw_seq_first"] == 1 and row["raw_seq_last"] == 99
+    assert row["raw_seq_by_session"] == {"cap-clob": [1, 99], "cap-rtds": [1, 40]}
+    assert row["raw_recv_first_ns"] < row["raw_recv_last_ns"]
     j.close()
+
+
+def test_a_per_session_range_is_never_inverted():
+    """The defect the live run exposed, at the source."""
+    import types as _t
+
+    from xamarinbot.shadow.live import LiveRoundShadow
+
+    s = LiveRoundShadow(round_id=ROUND, metadata=None, store=None,
+                        projector=None, session=None, regime=None)
+    for session_id, seq in (("clob", 5), ("clob", 2), ("rtds", 900), ("clob", 9)):
+        s.note_raw(_t.SimpleNamespace(
+            session_id=session_id, recorder_sequence=seq,
+            recv_wall_timestamp_ns=START_NS + seq))
+    assert s.raw_seq_by_session == {"clob": (2, 9), "rtds": (900, 900)}
+    for lo, hi in s.raw_seq_by_session.values():
+        assert lo <= hi
+    j = None
 
 
 def test_settlement_pnl_is_identified_when_no_maker_is_outstanding(tmp_path):
@@ -612,4 +636,5 @@ def test_draining_projects_buffered_events_into_the_round():
         round_id=meta.round_id, source_timestamp_ns=int(1010 * 1e9)))
     assert s._drain_inbox() == 1
     assert shadow.projector.counts.get("TWAP") == 1
-    assert shadow.raw_seq_first is not None
+    assert shadow.raw_seq_by_session, 'the raw range must be recorded per stream'
+    assert shadow.raw_recv_first_ns is not None

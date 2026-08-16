@@ -82,10 +82,30 @@ class LiveRoundShadow:
     blocked: dict = field(default_factory=dict)
     missed_deadlines: int = 0
     settled: bool = False
-    #: Raw recorder sequence range this round's decisions were made from,
-    #: for provenance linkage (audit item 13).
-    raw_seq_first: int | None = None
-    raw_seq_last: int | None = None
+    #: Provenance linkage (audit item 13): the raw event range this round's
+    #: decisions were made from.
+    #:
+    #: Recorded PER SESSION, because each stream's builder owns its own
+    #: sequence counter - the CLOB and RTDS readers both start at 1. A
+    #: single min/max across them is not a range at all: the first live run
+    #: reported `123041..6006`, which describes nothing.
+    raw_seq_by_session: dict = field(default_factory=dict)
+    #: Wall-clock bounds, which ARE globally comparable across streams.
+    raw_recv_first_ns: int | None = None
+    raw_recv_last_ns: int | None = None
+
+    def note_raw(self, event) -> None:
+        lo, hi = self.raw_seq_by_session.get(event.session_id, (None, None))
+        seq = event.recorder_sequence
+        self.raw_seq_by_session[event.session_id] = (
+            seq if lo is None else min(lo, seq),
+            seq if hi is None else max(hi, seq),
+        )
+        recv = event.recv_wall_timestamp_ns
+        if self.raw_recv_first_ns is None or recv < self.raw_recv_first_ns:
+            self.raw_recv_first_ns = recv
+        if self.raw_recv_last_ns is None or recv > self.raw_recv_last_ns:
+            self.raw_recv_last_ns = recv
 
     def note_block(self, reason: str) -> None:
         self.blocked[reason] = self.blocked.get(reason, 0) + 1
@@ -218,9 +238,7 @@ class LiveShadowService:
                 if shadow.settled:
                     continue
                 if shadow.projector.apply(event):
-                    if shadow.raw_seq_first is None:
-                        shadow.raw_seq_first = event.recorder_sequence
-                    shadow.raw_seq_last = event.recorder_sequence
+                    shadow.note_raw(event)
         return n
 
     def _on_tick(self, captures, now: float) -> None:
@@ -417,7 +435,10 @@ class LiveShadowService:
                     "missed_deadlines": s.missed_deadlines,
                     "settled": s.settled,
                     "projected": dict(s.projector.counts),
-                    "raw_seq_range": [s.raw_seq_first, s.raw_seq_last],
+                    "raw_seq_by_session": {
+                        k: list(v) for k, v in s.raw_seq_by_session.items()
+                    },
+                    "raw_recv_range_ns": [s.raw_recv_first_ns, s.raw_recv_last_ns],
                 }
                 for rid, s in self.rounds.items()
             },

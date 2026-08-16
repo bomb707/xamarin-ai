@@ -1,0 +1,79 @@
+{
+  "strategy_version": "STRATEGY_V0",
+  "config_hash": "a5583e982ba61905",
+  "model_version": "NONE:no_gate_a_model_frozen",
+  "rounds": {
+    "btc-updown-5m-1786864500": {
+      "decisions": 77,
+      "grid_points_fired": 86,
+      "blocked": {
+        "MODEL_UNAVAILABLE": 77,
+        "INVALID_FEATURES:STALE_SPOT": 9
+      },
+      "missed_deadlines": 0,
+      "settled": true,
+      "projected": {
+        "MARKET_CONFIG": 1,
+        "TWAP": 749,
+        "SPOT": 780,
+        "BOOK_DELTA": 204910,
+        "BOOK_SNAPSHOT": 2798
+      },
+      "raw_seq_range": [
+        781,
+        3811
+      ]
+    },
+    "btc-updown-5m-1786864800": {
+      "decisions": 82,
+      "grid_points_fired": 86,
+      "blocked": {
+        "MODEL_UNAVAILABLE": 82,
+        "INVALID_FEATURES:STALE_BOOK": 4
+      },
+      "missed_deadlines": 0,
+      "settled": true,
+      "projected": {
+        "MARKET_CONFIG": 1,
+        "SPOT": 780,
+        "BOOK_DELTA": 160774,
+        "TWAP": 746,
+        "BOOK_SNAPSHOT": 1816
+      },
+      "raw_seq_range": [
+        1946,
+        4969
+      ]
+    },
+    "btc-updown-5m-1786865100": {
+      "decisions": 76,
+      "grid_points_fired": 86,
+      "blocked": {
+        "MODEL_UNAVAILABLE": 76,
+        "INVALID_FEATURES:STALE_TWAP": 1,
+        "INVALID_FEATURES:STALE_SPOT": 9
+      },
+      "missed_deadlines": 0,
+      "settled": true,
+      "projected": {
+        "MARKET_CONFIG": 1,
+        "BOOK_DELTA": 210694,
+        "TWAP": 742,
+        "SPOT": 779,
+        "BOOK_SNAPSHOT": 3476
+      },
+      "raw_seq_range": [
+        123041,
+        6006
+      ]
+    }
+  },
+  "counts": {
+    "decision": 258,
+    "round_opened": 3,
+    "settlement": 3,
+    "strategy_manifest": 1
+  },
+  "journal_db": "captures/shadow/shadow_journal_20260816T070432Z.db",
+  "raw_capture_db": "captures/shadow/shadow_raw_20260816T070432Z.db"
+}

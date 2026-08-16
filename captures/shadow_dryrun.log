@@ -1,34 +1,177 @@
 ==============================================================================
 LIVE REAL-MARKET SHADOW - STRATEGY V0 - PAPER ONLY
   No private key. No authenticated client. No order is ever sent.
-  code sha     445413c2dcfa2ce8705c3e7a169aa203b1a0aef3
-  pid          3234342   started 20260816T070242Z
+  code sha     0df680a253c69c7ac2bcd69238e3ed9cd0a700bf
+  pid          3236914   started 20260816T070432Z
   rounds       3
-  raw capture  captures/shadow/shadow_raw_20260816T070242Z.db
-  journal      captures/shadow/shadow_journal_20260816T070242Z.db
+  raw capture  captures/shadow/shadow_raw_20260816T070432Z.db
+  journal      captures/shadow/shadow_journal_20260816T070432Z.db
   model        NONE:no_gate_a_model_frozen
 ==============================================================================
 [shadow] strategy STRATEGY_V0 config_hash=a5583e982ba61905 grid=86 points (15s..270s)
-[btc-updown-5m-1786864200] metadata warning: gamma startDate (2026-08-15T07:18:43.460894Z) is the row-creation time, 85877s before the true round start; not used as the round start
 [btc-updown-5m-1786864500] metadata warning: gamma startDate (2026-08-15T07:23:13.85261Z) is the row-creation time, 85906s before the true round start; not used as the round start
 [btc-updown-5m-1786864800] metadata warning: gamma startDate (2026-08-15T07:28:42.847965Z) is the row-creation time, 85877s before the true round start; not used as the round start
-[service] 1786864200=DISCOVERED, 1786864500=DISCOVERED, 1786864800=DISCOVERED | events rx=3 persisted=3 queue=0 dropped=0 reconnects=0
-[btc-updown-5m-1786864200] DISCOVERED -> PRE_ROUND
-[live-observer] event hook failed:
-Traceback (most recent call last):
-  File "/home/hr/xamarin-ai/src/xamarinbot/realtime/service.py", line 287, in _submit
-    self.on_live_event(event)
-  File "/home/hr/xamarin-ai/src/xamarinbot/shadow/live.py", line 198, in _on_live_event
-    if shadow.projector.apply(event):
-       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/hr/xamarin-ai/src/xamarinbot/shadow/live_projection.py", line 153, in apply
-    self._emit(EventType.SPOT, source_ns, recv_ns,
-  File "/home/hr/xamarin-ai/src/xamarinbot/shadow/live_projection.py", line 67, in _emit
-    self.store.append(
-  File "/home/hr/xamarin-ai/src/xamarinbot/events/store.py", line 108, in append
-    cur = self._conn.execute(
-          ^^^^^^^^^^^^^^^^^^^
-sqlite3.ProgrammingError: SQLite objects created in a thread can only be used in that same thread. The object was created in thread id 138254616076416 and this is thread id 138254585493184.
+[btc-updown-5m-1786865100] metadata warning: gamma startDate (2026-08-15T07:33:41.515618Z) is the row-creation time, 85878s before the true round start; not used as the round start
+[service] 1786864500=DISCOVERED, 1786864800=DISCOVERED, 1786865100=DISCOVERED | events rx=3 persisted=3 queue=0 dropped=0 reconnects=0
+[service] 1786864500=DISCOVERED, 1786864800=DISCOVERED, 1786865100=DISCOVERED | events rx=765 persisted=765 queue=0 dropped=0 reconnects=0
+[service] 1786864500=DISCOVERED, 1786864800=DISCOVERED, 1786865100=DISCOVERED | events rx=1571 persisted=1571 queue=0 dropped=0 reconnects=0
+[service] 1786864500=DISCOVERED, 1786864800=DISCOVERED, 1786865100=DISCOVERED | events rx=2347 persisted=2347 queue=0 dropped=0 reconnects=0
+[service] 1786864500=DISCOVERED, 1786864800=DISCOVERED, 1786865100=DISCOVERED | events rx=3179 persisted=3179 queue=0 dropped=0 reconnects=0
+[service] 1786864500=DISCOVERED, 1786864800=DISCOVERED, 1786865100=DISCOVERED | events rx=3942 persisted=3938 queue=0 dropped=0 reconnects=0
+[service] 1786864500=DISCOVERED, 1786864800=DISCOVERED, 1786865100=DISCOVERED | events rx=4705 persisted=4701 queue=0 dropped=0 reconnects=0
+[btc-updown-5m-1786864500] DISCOVERED -> PRE_ROUND
+[service] 1786864500=PRE_ROUND, 1786864800=DISCOVERED, 1786865100=DISCOVERED | events rx=5489 persisted=5485 queue=0 dropped=0 reconnects=0
+[service] 1786864500=PRE_ROUND, 1786864800=DISCOVERED, 1786865100=DISCOVERED | events rx=6333 persisted=6329 queue=0 dropped=0 reconnects=0
+[service] 1786864500=PRE_ROUND, 1786864800=DISCOVERED, 1786865100=DISCOVERED | events rx=7201 persisted=7197 queue=0 dropped=0 reconnects=0
+[service] 1786864500=PRE_ROUND, 1786864800=DISCOVERED, 1786865100=DISCOVERED | events rx=7999 persisted=7995 queue=0 dropped=0 reconnects=0
+[service] 1786864500=PRE_ROUND, 1786864800=DISCOVERED, 1786865100=DISCOVERED | events rx=9052 persisted=9048 queue=0 dropped=0 reconnects=0
+[service] 1786864500=PRE_ROUND, 1786864800=DISCOVERED, 1786865100=DISCOVERED | events rx=10563 persisted=10559 queue=0 dropped=0 reconnects=0
+[service] 1786864500=PRE_ROUND, 1786864800=DISCOVERED, 1786865100=DISCOVERED | events rx=11415 persisted=11411 queue=0 dropped=0 reconnects=0
+[service] 1786864500=PRE_ROUND, 1786864800=DISCOVERED, 1786865100=DISCOVERED | events rx=12632 persisted=12628 queue=0 dropped=0 reconnects=0
+[service] 1786864500=PRE_ROUND, 1786864800=DISCOVERED, 1786865100=DISCOVERED | events rx=13550 persisted=13544 queue=0 dropped=0 reconnects=0
+[service] 1786864500=PRE_ROUND, 1786864800=DISCOVERED, 1786865100=DISCOVERED | events rx=14678 persisted=14672 queue=0 dropped=0 reconnects=0
+[btc-updown-5m-1786864800] DISCOVERED -> PRE_ROUND
+[service] 1786864500=PRE_ROUND, 1786864800=PRE_ROUND, 1786865100=DISCOVERED | events rx=15467 persisted=15461 queue=0 dropped=0 reconnects=0
+[service] 1786864500=PRE_ROUND, 1786864800=PRE_ROUND, 1786865100=DISCOVERED | events rx=15705 persisted=15699 queue=0 dropped=0 reconnects=0
+[service] 1786864500=PRE_ROUND, 1786864800=PRE_ROUND, 1786865100=DISCOVERED | events rx=16413 persisted=16395 queue=0 dropped=0 reconnects=0
+[service] 1786864500=PRE_ROUND, 1786864800=PRE_ROUND, 1786865100=DISCOVERED | events rx=16849 persisted=16809 queue=0 dropped=0 reconnects=0
+[btc-updown-5m-1786864500] PRE_ROUND -> ACTIVE
+[service] 1786864500=ACTIVE, 1786864800=PRE_ROUND, 1786865100=DISCOVERED | events rx=21303 persisted=21247 queue=0 dropped=0 reconnects=0
+[service] 1786864500=ACTIVE, 1786864800=PRE_ROUND, 1786865100=DISCOVERED | events rx=37696 persisted=37615 queue=1 dropped=0 reconnects=0
+[service] 1786864500=ACTIVE, 1786864800=PRE_ROUND, 1786865100=DISCOVERED | events rx=53918 persisted=53742 queue=0 dropped=0 reconnects=0
+[data-gap] rtds topic_stalled: 31.0s of missing observations
+[data-gap] rtds topic_stalled: 31.0s of missing observations
+[data-gap] rtds topic_stalled: 31.1s of missing observations
+[data-gap] rtds topic_stalled: 31.3s of missing observations
+[service] 1786864500=ACTIVE, 1786864800=PRE_ROUND, 1786865100=DISCOVERED | events rx=73189 persisted=72926 queue=1 dropped=0 reconnects=1
+[service] 1786864500=ACTIVE, 1786864800=PRE_ROUND, 1786865100=DISCOVERED | events rx=92075 persisted=91705 queue=0 dropped=0 reconnects=1
+[service] 1786864500=ACTIVE, 1786864800=PRE_ROUND, 1786865100=DISCOVERED | events rx=110802 persisted=110307 queue=1 dropped=0 reconnects=1
+[btc-updown-5m-1786865100] DISCOVERED -> PRE_ROUND
+[service] 1786864500=ACTIVE, 1786864800=PRE_ROUND, 1786865100=PRE_ROUND | events rx=129800 persisted=129214 queue=0 dropped=0 reconnects=1
+[service] 1786864500=ACTIVE, 1786864800=PRE_ROUND, 1786865100=PRE_ROUND | events rx=150033 persisted=149348 queue=1 dropped=0 reconnects=1
+[service] 1786864500=ACTIVE, 1786864800=PRE_ROUND, 1786865100=PRE_ROUND | events rx=183501 persisted=181670 queue=321 dropped=0 reconnects=1
+[service] 1786864500=ACTIVE, 1786864800=PRE_ROUND, 1786865100=PRE_ROUND | events rx=217406 persisted=216244 queue=0 dropped=0 reconnects=1
+[btc-updown-5m-1786864500] ACTIVE -> ENDED
+[btc-updown-5m-1786864800] PRE_ROUND -> ACTIVE
+[service] 1786864500=ENDED, 1786864800=ACTIVE, 1786865100=PRE_ROUND | events rx=236611 persisted=235417 queue=0 dropped=0 reconnects=1
+[service] 1786864500=ENDED, 1786864800=ACTIVE, 1786865100=PRE_ROUND | events rx=259178 persisted=257917 queue=0 dropped=0 reconnects=1
+[service] 1786864500=ENDED, 1786864800=ACTIVE, 1786865100=PRE_ROUND | events rx=276796 persisted=275435 queue=30 dropped=0 reconnects=1
+[btc-updown-5m-1786864500] ENDED -> FINALIZED
+[live-shadow] btc-updown-5m-1786864500 settled: 77 decisions, blocked {'MODEL_UNAVAILABLE': 77, 'INVALID_FEATURES:STALE_SPOT': 9}
+[service] 1786864500=FINALIZED, 1786864800=ACTIVE, 1786865100=PRE_ROUND | events rx=300792 persisted=299334 queue=0 dropped=0 reconnects=1
+[service] 1786864500=FINALIZED, 1786864800=ACTIVE, 1786865100=PRE_ROUND | events rx=323182 persisted=321594 queue=0 dropped=0 reconnects=1
+[service] 1786864500=FINALIZED, 1786864800=ACTIVE, 1786865100=PRE_ROUND | events rx=344079 persisted=342314 queue=1 dropped=0 reconnects=1
+[service] 1786864500=FINALIZED, 1786864800=ACTIVE, 1786865100=PRE_ROUND | events rx=361292 persisted=359474 queue=8 dropped=0 reconnects=1
+[service] 1786864500=FINALIZED, 1786864800=ACTIVE, 1786865100=PRE_ROUND | events rx=374846 persisted=373022 queue=0 dropped=0 reconnects=1
+[service] 1786864500=FINALIZED, 1786864800=ACTIVE, 1786865100=PRE_ROUND | events rx=386946 persisted=385096 queue=2 dropped=0 reconnects=1
+[service] 1786864500=FINALIZED, 1786864800=ACTIVE, 1786865100=PRE_ROUND | events rx=394465 persisted=392585 queue=0 dropped=0 reconnects=1
+[btc-updown-5m-1786864800] ACTIVE -> ENDED
+[btc-updown-5m-1786865100] PRE_ROUND -> ACTIVE
+[service] 1786864500=FINALIZED, 1786864800=ENDED, 1786865100=ACTIVE | events rx=408172 persisted=406273 queue=0 dropped=0 reconnects=1
+[service] 1786864500=FINALIZED, 1786864800=ENDED, 1786865100=ACTIVE | events rx=428394 persisted=426397 queue=0 dropped=0 reconnects=1
+[service] 1786864500=FINALIZED, 1786864800=ENDED, 1786865100=ACTIVE | events rx=446854 persisted=444809 queue=0 dropped=0 reconnects=1
+[btc-updown-5m-1786864800] ENDED -> FINALIZED
+[live-shadow] btc-updown-5m-1786864800 settled: 82 decisions, blocked {'MODEL_UNAVAILABLE': 82, 'INVALID_FEATURES:STALE_BOOK': 4}
+[service] 1786864500=FINALIZED, 1786864800=FINALIZED, 1786865100=ACTIVE | events rx=459607 persisted=457553 queue=0 dropped=0 reconnects=1
+[service] 1786864500=FINALIZED, 1786864800=FINALIZED, 1786865100=ACTIVE | events rx=476553 persisted=474457 queue=0 dropped=0 reconnects=2
+[data-gap] rtds topic_stalled: 31.3s of missing observations
+[data-gap] rtds topic_stalled: 31.9s of missing observations
+[data-gap] rtds topic_stalled: 32.5s of missing observations
+[data-gap] rtds topic_stalled: 31.4s of missing observations
+[service] 1786864500=FINALIZED, 1786864800=FINALIZED, 1786865100=ACTIVE | events rx=504509 persisted=500969 queue=790 dropped=0 reconnects=2
+[service] 1786864500=FINALIZED, 1786864800=FINALIZED, 1786865100=ACTIVE | events rx=524581 persisted=522153 queue=0 dropped=0 reconnects=2
+[service] 1786864500=FINALIZED, 1786864800=FINALIZED, 1786865100=ACTIVE | events rx=556032 persisted=551950 queue=898 dropped=0 reconnects=2
+[service] 1786864500=FINALIZED, 1786864800=FINALIZED, 1786865100=ACTIVE | events rx=609852 persisted=605732 queue=694 dropped=0 reconnects=2
+[btc-updown-5m-1786865100] ACTIVE -> ENDED
+[service] 1786864500=FINALIZED, 1786864800=FINALIZED, 1786865100=ENDED | events rx=618188 persisted=615250 queue=0 dropped=0 reconnects=2
+[service] 1786864500=FINALIZED, 1786864800=FINALIZED, 1786865100=ENDED | events rx=619521 persisted=616581 queue=0 dropped=0 reconnects=2
+[service] 1786864500=FINALIZED, 1786864800=FINALIZED, 1786865100=ENDED | events rx=620905 persisted=617960 queue=0 dropped=0 reconnects=2
+[btc-updown-5m-1786865100] ENDED -> FINALIZED
+[live-shadow] btc-updown-5m-1786865100 settled: 76 decisions, blocked {'MODEL_UNAVAILABLE': 76, 'INVALID_FEATURES:STALE_TWAP': 1, 'INVALID_FEATURES:STALE_SPOT': 9}
+[resolve] 3 round(s) awaiting the venue's resolution
+[resolve] btc-updown-5m-1786864500 -> DOWN (gamma_outcome_prices); declared_agrees=True reference_agrees=True
+[resolve] btc-updown-5m-1786864800 -> UP (gamma_outcome_prices); declared_agrees=True reference_agrees=True
+[resolve] btc-updown-5m-1786865100 -> DOWN (gamma_outcome_prices); declared_agrees=True reference_agrees=True
 
-[service] 1786864200=PRE_ROUND, 1786864500=DISCOVERED, 1786864800=DISCOVERED | events rx=790 persisted=790 queue=0 dropped=0 reconnects=0
-[service] 1786864200=PRE_ROUND, 1786864500=DISCOVERED, 1786864800=DISCOVERED | events rx=1645 persisted=1645 queue=0 dropped=0 reconnects=0
+==============================================================================
+SHADOW SUMMARY
+{
+  "strategy_version": "STRATEGY_V0",
+  "config_hash": "a5583e982ba61905",
+  "model_version": "NONE:no_gate_a_model_frozen",
+  "rounds": {
+    "btc-updown-5m-1786864500": {
+      "decisions": 77,
+      "grid_points_fired": 86,
+      "blocked": {
+        "MODEL_UNAVAILABLE": 77,
+        "INVALID_FEATURES:STALE_SPOT": 9
+      },
+      "missed_deadlines": 0,
+      "settled": true,
+      "projected": {
+        "MARKET_CONFIG": 1,
+        "TWAP": 749,
+        "SPOT": 780,
+        "BOOK_DELTA": 204910,
+        "BOOK_SNAPSHOT": 2798
+      },
+      "raw_seq_range": [
+        781,
+        3811
+      ]
+    },
+    "btc-updown-5m-1786864800": {
+      "decisions": 82,
+      "grid_points_fired": 86,
+      "blocked": {
+        "MODEL_UNAVAILABLE": 82,
+        "INVALID_FEATURES:STALE_BOOK": 4
+      },
+      "missed_deadlines": 0,
+      "settled": true,
+      "projected": {
+        "MARKET_CONFIG": 1,
+        "SPOT": 780,
+        "BOOK_DELTA": 160774,
+        "TWAP": 746,
+        "BOOK_SNAPSHOT": 1816
+      },
+      "raw_seq_range": [
+        1946,
+        4969
+      ]
+    },
+    "btc-updown-5m-1786865100": {
+      "decisions": 76,
+      "grid_points_fired": 86,
+      "blocked": {
+        "MODEL_UNAVAILABLE": 76,
+        "INVALID_FEATURES:STALE_TWAP": 1,
+        "INVALID_FEATURES:STALE_SPOT": 9
+      },
+      "missed_deadlines": 0,
+      "settled": true,
+      "projected": {
+        "MARKET_CONFIG": 1,
+        "BOOK_DELTA": 210694,
+        "TWAP": 742,
+        "SPOT": 779,
+        "BOOK_SNAPSHOT": 3476
+      },
+      "raw_seq_range": [
+        123041,
+        6006
+      ]
+    }
+  },
+  "counts": {
+    "decision": 258,
+    "round_opened": 3,
+    "settlement": 3,
+    "strategy_manifest": 1
+  },
+  "journal_db": "captures/shadow/shadow_journal_20260816T070432Z.db",
+  "raw_capture_db": "captures/shadow/shadow_raw_20260816T070432Z.db"
+}
+==============================================================================
