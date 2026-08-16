@@ -55,3 +55,8 @@
 [sidecarB] GAP crypto_prices_chainlink topic_stalled 31.4s
 [sidecarB] GAP crypto_prices_twap_sixty topic_stalled 31.4s
 [sidecarB] GAP crypto_prices topic_stalled 32.3s
+[sidecarB] RECONNECT generation=12
+[sidecarB] GAP crypto_prices_twap_thirty topic_stalled 31.6s
+[sidecarB] GAP crypto_prices_twap_sixty topic_stalled 31.7s
+[sidecarB] GAP crypto_prices_chainlink topic_stalled 32.3s
+[sidecarB] GAP crypto_prices topic_stalled 32.1s
