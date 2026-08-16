@@ -148,7 +148,7 @@ class RealRecorderService:
 
         self.rtds = RTDSClient(
             builder=self._rtds_builder,
-            on_raw_event=self.recorder.submit,
+            on_raw_event=self._submit,
             on_parse_failure=self._on_rtds_parse_failure,
             on_data_gap=self._on_data_gap,
             on_reconnect=lambda gen: self.metrics.record_reconnect(),
@@ -157,6 +157,13 @@ class RealRecorderService:
         self.stream: PolymarketMarketStream | None = None
         self.captures: dict[str, RoundCapture] = {}
         self._last_integrity_check = 0.0
+        #: Readiness audit item 4: optional live observers, so a shadow
+        #: strategy can consume the SAME event stream the recorder persists
+        #: rather than waiting for the capture to be finished and replayed.
+        #: Both are called on the recorder's own thread; neither may raise.
+        self.on_live_event = None      # (RawEvent) -> None
+        self.on_tick = None            # (list[RoundCapture], now: float) -> None
+        self.on_round_finalized = None  # (RoundCapture) -> None
 
     # ------------------------------------------------------------- hooks
 
@@ -267,6 +274,21 @@ class RealRecorderService:
             # session-wide fallback rather than disappearing.
             pass
 
+    def _submit(self, event: RawEvent) -> None:
+        """Persist, and hand the same event to any live observer.
+
+        The observer sees it BEFORE it is batched to disk, which is what
+        makes a live strategy causal: it acts on wire arrival, not on the
+        writer's flush cadence.
+        """
+        self.recorder.submit(event)
+        if self.on_live_event is not None:
+            try:
+                self.on_live_event(event)
+            except Exception:
+                # A shadow-side failure must never damage the capture.
+                self._log("[live-observer] error while consuming event")
+
     def _on_market_event(self, event: RawEvent) -> None:
         """Every CLOB event goes to the recorder AND to the maker
         counterfactual tracker (item 11).
@@ -276,7 +298,7 @@ class RealRecorderService:
         actually have experienced - rather than a separate, subtly different
         view reconstructed afterwards.
         """
-        self.recorder.submit(event)
+        self._submit(event)
         if not self.quotes.open_quotes or event.token_id is None:
             return
         ts = (
@@ -493,6 +515,11 @@ class RealRecorderService:
                 for capture in captures:
                     self._tick_round(capture, now)
                 self._update_reference_round_tag(now)
+                if self.on_tick is not None:
+                    try:
+                        self.on_tick(captures, now)
+                    except Exception:
+                        self._log("[live-observer] error in tick hook")
                 self._maybe_check_integrity(now)
                 if now - last_state_log >= 30.0:
                     self._log_progress(captures, now)
@@ -822,6 +849,11 @@ class RealRecorderService:
         capture.finalized_at = now
         capture.lifecycle.transition_to(RoundState.FINALIZED, now)
         self.store.upsert_round(m.as_row(self.session_id, RoundState.FINALIZED.value))
+        if self.on_round_finalized is not None:
+            try:
+                self.on_round_finalized(capture)
+            except Exception:
+                self._log("[live-observer] error in finalize hook")
 
     def _force_finalize(self, capture: RoundCapture, now: float) -> None:
         """Finalize a round from whatever state it is in, for an
