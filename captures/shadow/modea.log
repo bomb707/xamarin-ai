@@ -14,3 +14,22 @@ LIVE REAL-MARKET SHADOW - STRATEGY V0 - PAPER ONLY
 [live-shadow] btc-updown-5m-1786875000 shadow-finalized: 86 decisions, 0 pending taker(s) drained, pnl=UNKNOWN, blocked {'MODEL_UNAVAILABLE': 86}
 [live-shadow] btc-updown-5m-1786875300 shadow-finalized: 86 decisions, 0 pending taker(s) drained, pnl=UNKNOWN, blocked {'MODEL_UNAVAILABLE': 86}
 [live-shadow] btc-updown-5m-1786875600 shadow-finalized: 86 decisions, 0 pending taker(s) drained, pnl=UNKNOWN, blocked {'MODEL_UNAVAILABLE': 86}
+[live-shadow] btc-updown-5m-1786875900 shadow-finalized: 75 decisions, 0 pending taker(s) drained, pnl=UNKNOWN, blocked {'MODEL_UNAVAILABLE': 75, 'INVALID_FEATURES:STALE_SPOT': 9, 'INVALID_FEATURES:STALE_BOOK': 2}
+[live-shadow] btc-updown-5m-1786876200 shadow-finalized: 86 decisions, 0 pending taker(s) drained, pnl=UNKNOWN, blocked {'MODEL_UNAVAILABLE': 86}
+[live-shadow] btc-updown-5m-1786876500 shadow-finalized: 86 decisions, 0 pending taker(s) drained, pnl=UNKNOWN, blocked {'MODEL_UNAVAILABLE': 86}
+[live-shadow] btc-updown-5m-1786876800 shadow-finalized: 86 decisions, 0 pending taker(s) drained, pnl=UNKNOWN, blocked {'MODEL_UNAVAILABLE': 86}
+[live-shadow] btc-updown-5m-1786874700 venue-resolved: outcome=UP pnl=0.0 (IDENTIFIED)
+[live-shadow] btc-updown-5m-1786875000 venue-resolved: outcome=UP pnl=0.0 (IDENTIFIED)
+[live-shadow] btc-updown-5m-1786875300 venue-resolved: outcome=UP pnl=0.0 (IDENTIFIED)
+[live-shadow] btc-updown-5m-1786875600 venue-resolved: outcome=UP pnl=0.0 (IDENTIFIED)
+[live-shadow] btc-updown-5m-1786875900 venue-resolved: outcome=UP pnl=0.0 (IDENTIFIED)
+[live-shadow] btc-updown-5m-1786876200 venue-resolved: outcome=DOWN pnl=0.0 (IDENTIFIED)
+[live-shadow] btc-updown-5m-1786876500 venue-resolved: outcome=UP pnl=0.0 (IDENTIFIED)
+[live-shadow] btc-updown-5m-1786876800 venue-resolved: outcome=DOWN pnl=0.0 (IDENTIFIED)
+[shadow] batch 1 done: 8 rounds (8 accumulated) -> captures/shadow/shadow_journal_20260816T095641Z.db
+
+[shadow] MODE A batch 2 starting at 20260816T105038Z
+[live-shadow] btc-updown-5m-1786878000 shadow-finalized: 77 decisions, 0 pending taker(s) drained, pnl=UNKNOWN, blocked {'MODEL_UNAVAILABLE': 77, 'INVALID_FEATURES:STALE_SPOT': 9}
+[live-shadow] btc-updown-5m-1786878300 shadow-finalized: 85 decisions, 0 pending taker(s) drained, pnl=UNKNOWN, blocked {'MODEL_UNAVAILABLE': 85, 'INVALID_FEATURES:STALE_TWAP': 1}
+[live-shadow] btc-updown-5m-1786878600 shadow-finalized: 82 decisions, 0 pending taker(s) drained, pnl=UNKNOWN, blocked {'MODEL_UNAVAILABLE': 82, 'INVALID_FEATURES:STALE_BOOK': 4}
+[live-shadow] btc-updown-5m-1786878900 shadow-finalized: 86 decisions, 0 pending taker(s) drained, pnl=UNKNOWN, blocked {'MODEL_UNAVAILABLE': 86}

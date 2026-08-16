@@ -149,3 +149,49 @@ CONTINUOUS REAL BTC 5-MINUTE CAPTURE
 [continuous] batch 5 starting at 20260816T095128Z
 
 [continuous] signal 15 received - finishing the current batch, then stopping. Send again to abort immediately.
+[continuous] batch 5 done in 54.9 min: 8 rounds (8 labelled), 1.55 GB -> btc5m_20260816T095128Z.db; 40 rounds accumulated
+
+[continuous] stopped after 5 batch(es), 40 rounds accumulated this session.
+==============================================================================
+CONTINUOUS CAPTURE STATUS
+==============================================================================
+  captured                     178
+  label CONFIRMED (valid)      170
+  rule-text VERIFIED_TRUE      178
+  data-quality clean           40
+  projection preconditions ok  178
+  ACTUAL projection valid      178
+  FINAL training eligible      38
+
+  BY RECORDER GENERATION
+    LEGACY_RECORDER            64 rounds, 13 eligible  sha unknown
+    NEW_PER_TOPIC_RECORDER     42 rounds, 15 eligible  sha 3e3e5993726b
+    POST_A0_1_RECORDER          8 rounds, 0 eligible  sha 8f875de7574f
+    POST_A0_2_RECORDER         64 rounds, 10 eligible  sha 7a8494eb6ed3
+
+  DISQUALIFICATION REASONS BY CATEGORY
+    data_gap                                    94
+    parse_failures                              81
+    book_integrity_mismatch                     20
+    label_unresolved                             8
+    reconstruction_disagrees                     8
+    no_reconstructed_outcome                     6
+    no_reported_outcome                          2
+
+  chronological span     20260815T141000Z -> 20260816T104000Z (20.5h)
+  capture files          22  (35.5 GB)
+  index                  captures/continuous/INDEX.jsonl
+
+  GATE A READINESS (chronological TRAIN -> CALIBRATE -> FREEZE -> TEST)
+     100 training-eligible rounds  [###########                   ] 38/100
+     200 training-eligible rounds  [#####                         ] 38/200
+     500 training-eligible rounds  [##                            ] 38/500
+
+  NOTE: consecutive five-minute rounds are NOT automatically
+  independent - they are non-overlapping, which is a weaker property.
+  BTC volatility and book depth persist across round boundaries, so
+  Gate A must use block bootstrap and report effective sample size
+  rather than treating each round as an IID observation.
+
+  No q model may be fitted from this data until the approval gate.
+==============================================================================
