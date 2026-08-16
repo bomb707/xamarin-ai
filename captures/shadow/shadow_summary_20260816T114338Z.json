@@ -1,0 +1,277 @@
+{
+  "strategy_version": "PLACEHOLDER_OPERATIONAL_V0",
+  "config_hash": "6a72d125faecc546",
+  "model_version": "NONE:no_gate_a_model_frozen",
+  "rounds": {
+    "btc-updown-5m-1786881300": {
+      "decisions": 84,
+      "grid_points_fired": 86,
+      "blocked": {
+        "MODEL_UNAVAILABLE": 84,
+        "INVALID_FEATURES:STALE_BOOK": 2
+      },
+      "missed_deadlines": 0,
+      "shadow_finalized": true,
+      "venue_resolved": true,
+      "pnl_identified": true,
+      "projected": {
+        "MARKET_CONFIG": 5,
+        "TWAP": 768,
+        "SPOT": 811,
+        "BOOK_DELTA": 143276,
+        "BOOK_SNAPSHOT": 1780
+      },
+      "raw_seq_by_session": {
+        "cap-1786880618-84773b89-rtds": [
+          1005,
+          4115
+        ],
+        "cap-1786880618-84773b89-clob": [
+          6418,
+          240706
+        ]
+      },
+      "raw_recv_range_ns": [
+        1786880880145760686,
+        1786881690476206481
+      ]
+    },
+    "btc-updown-5m-1786881600": {
+      "decisions": 85,
+      "grid_points_fired": 86,
+      "blocked": {
+        "MODEL_UNAVAILABLE": 85,
+        "INVALID_FEATURES:STALE_TWAP": 1
+      },
+      "missed_deadlines": 0,
+      "shadow_finalized": true,
+      "venue_resolved": true,
+      "pnl_identified": true,
+      "projected": {
+        "MARKET_CONFIG": 5,
+        "TWAP": 773,
+        "SPOT": 810,
+        "BOOK_DELTA": 181542,
+        "BOOK_SNAPSHOT": 2104
+      },
+      "raw_seq_by_session": {
+        "cap-1786880618-84773b89-rtds": [
+          2171,
+          5294
+        ],
+        "cap-1786880618-84773b89-clob": [
+          15991,
+          457834
+        ]
+      },
+      "raw_recv_range_ns": [
+        1786881180029302840,
+        1786881990504861558
+      ]
+    },
+    "btc-updown-5m-1786881900": {
+      "decisions": 83,
+      "grid_points_fired": 86,
+      "blocked": {
+        "MODEL_UNAVAILABLE": 83,
+        "INVALID_FEATURES:STALE_BOOK": 3
+      },
+      "missed_deadlines": 0,
+      "shadow_finalized": true,
+      "venue_resolved": true,
+      "pnl_identified": true,
+      "projected": {
+        "MARKET_CONFIG": 5,
+        "BOOK_DELTA": 180842,
+        "SPOT": 752,
+        "TWAP": 719,
+        "BOOK_SNAPSHOT": 2092
+      },
+      "raw_seq_by_session": {
+        "cap-1786880618-84773b89-clob": [
+          131560,
+          621813
+        ],
+        "cap-1786880618-84773b89-rtds": [
+          3324,
+          6238
+        ]
+      },
+      "raw_recv_range_ns": [
+        1786881480121341955,
+        1786882290445079754
+      ]
+    },
+    "btc-updown-5m-1786882200": {
+      "decisions": 75,
+      "grid_points_fired": 86,
+      "blocked": {
+        "INVALID_FEATURES:STALE_SPOT": 11,
+        "MODEL_UNAVAILABLE": 75
+      },
+      "missed_deadlines": 0,
+      "shadow_finalized": true,
+      "venue_resolved": true,
+      "pnl_identified": true,
+      "projected": {
+        "MARKET_CONFIG": 1,
+        "SPOT": 748,
+        "TWAP": 717,
+        "BOOK_DELTA": 229162,
+        "BOOK_SNAPSHOT": 2936
+      },
+      "raw_seq_by_session": {
+        "cap-1786880618-84773b89-rtds": [
+          4472,
+          7385
+        ],
+        "cap-1786880618-84773b89-clob": [
+          306171,
+          882216
+        ]
+      },
+      "raw_recv_range_ns": [
+        1786881780302979183,
+        1786882590558858212
+      ]
+    },
+    "btc-updown-5m-1786882500": {
+      "decisions": 86,
+      "grid_points_fired": 86,
+      "blocked": {
+        "MODEL_UNAVAILABLE": 86
+      },
+      "missed_deadlines": 0,
+      "shadow_finalized": true,
+      "venue_resolved": true,
+      "pnl_identified": true,
+      "projected": {
+        "MARKET_CONFIG": 5,
+        "SPOT": 752,
+        "BOOK_DELTA": 182924,
+        "TWAP": 724,
+        "BOOK_SNAPSHOT": 2038
+      },
+      "raw_seq_by_session": {
+        "cap-1786880618-84773b89-rtds": [
+          5624,
+          8562
+        ],
+        "cap-1786880618-84773b89-clob": [
+          516574,
+          1058753
+        ]
+      },
+      "raw_recv_range_ns": [
+        1786882077556321642,
+        1786882890670336416
+      ]
+    },
+    "btc-updown-5m-1786882800": {
+      "decisions": 86,
+      "grid_points_fired": 86,
+      "blocked": {
+        "MODEL_UNAVAILABLE": 86
+      },
+      "missed_deadlines": 0,
+      "shadow_finalized": true,
+      "venue_resolved": true,
+      "pnl_identified": true,
+      "projected": {
+        "MARKET_CONFIG": 1,
+        "BOOK_DELTA": 219558,
+        "SPOT": 811,
+        "TWAP": 770,
+        "BOOK_SNAPSHOT": 3222
+      },
+      "raw_seq_by_session": {
+        "cap-1786880618-84773b89-clob": [
+          691583,
+          1289821
+        ],
+        "cap-1786880618-84773b89-rtds": [
+          6580,
+          9704
+        ]
+      },
+      "raw_recv_range_ns": [
+        1786882379828689812,
+        1786883190414739020
+      ]
+    },
+    "btc-updown-5m-1786883100": {
+      "decisions": 86,
+      "grid_points_fired": 86,
+      "blocked": {
+        "MODEL_UNAVAILABLE": 86
+      },
+      "missed_deadlines": 0,
+      "shadow_finalized": true,
+      "venue_resolved": true,
+      "pnl_identified": true,
+      "projected": {
+        "MARKET_CONFIG": 5,
+        "SPOT": 811,
+        "TWAP": 768,
+        "BOOK_DELTA": 247232,
+        "BOOK_SNAPSHOT": 3246
+      },
+      "raw_seq_by_session": {
+        "cap-1786880618-84773b89-rtds": [
+          7740,
+          10857
+        ],
+        "cap-1786880618-84773b89-clob": [
+          944619,
+          1556195
+        ]
+      },
+      "raw_recv_range_ns": [
+        1786882680458487488,
+        1786883490422601554
+      ]
+    },
+    "btc-updown-5m-1786883400": {
+      "decisions": 72,
+      "grid_points_fired": 86,
+      "blocked": {
+        "MODEL_UNAVAILABLE": 72,
+        "INVALID_FEATURES:STALE_BOOK": 14
+      },
+      "missed_deadlines": 0,
+      "shadow_finalized": true,
+      "venue_resolved": true,
+      "pnl_identified": true,
+      "projected": {
+        "MARKET_CONFIG": 5,
+        "BOOK_DELTA": 131028,
+        "SPOT": 810,
+        "TWAP": 760,
+        "BOOK_SNAPSHOT": 2120
+      },
+      "raw_seq_by_session": {
+        "cap-1786880618-84773b89-clob": [
+          1117301,
+          1629071
+        ],
+        "cap-1786880618-84773b89-rtds": [
+          8903,
+          11993
+        ]
+      },
+      "raw_recv_range_ns": [
+        1786882979811953554,
+        1786883790506771067
+      ]
+    }
+  },
+  "counts": {
+    "decision": 688,
+    "final_resolution": 8,
+    "round_opened": 8,
+    "settlement": 8,
+    "strategy_manifest": 1
+  },
+  "journal_db": "captures/shadow/shadow_journal_20260816T114338Z.db",
+  "raw_capture_db": "captures/shadow/shadow_raw_20260816T114338Z.db"
+}
