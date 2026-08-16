@@ -1,0 +1,12 @@
+==============================================================================
+LIVE REAL-MARKET SHADOW - STRATEGY V0 - PAPER ONLY
+  No private key. No authenticated client. No order is ever sent.
+  code sha     49e7b01450d0ee0da0ff822b1e9513cf525dc40a
+  pid          3354283   started 20260816T095641Z
+  rounds       8
+  raw capture  captures/shadow/shadow_raw_20260816T095641Z.db
+  journal      captures/shadow/shadow_journal_20260816T095641Z.db
+  model        NONE:no_gate_a_model_frozen
+==============================================================================
+
+[shadow] MODE A batch 1 starting at 20260816T095641Z

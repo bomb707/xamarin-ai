@@ -147,3 +147,5 @@ CONTINUOUS REAL BTC 5-MINUTE CAPTURE
 [continuous] batch 4 done in 55.1 min: 8 rounds (8 labelled), 1.69 GB -> btc5m_20260816T085624Z.db; 32 rounds accumulated
 
 [continuous] batch 5 starting at 20260816T095128Z
+
+[continuous] signal 15 received - finishing the current batch, then stopping. Send again to abort immediately.
