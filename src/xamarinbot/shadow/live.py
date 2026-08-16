@@ -56,6 +56,7 @@ from xamarinbot.regime.config import RegimeConfig
 from xamarinbot.regime.matrix import ActionPermissionMatrix, classify_seed_action
 from xamarinbot.replay.feeds import ReplayBookFeed, ReplayCursor, market_config_from_payload
 from xamarinbot.shadow.journal import ShadowJournal
+from xamarinbot.shadow.runner import freshness_from_events, freshness_policy_for
 from xamarinbot.shadow.live_projection import LiveProjector
 from xamarinbot.shadow.manifest import (
     NO_REAL_MODEL,
@@ -76,12 +77,20 @@ class LiveRoundShadow:
     projector: LiveProjector
     session: TradingSession
     regime: RegimeClassifier
+    controller: object = None
+    execution: object = None
     p0: float | None = None
     fired: set = field(default_factory=set)
     decisions: int = 0
     blocked: dict = field(default_factory=dict)
     missed_deadlines: int = 0
-    settled: bool = False
+    #: Item E: three DIFFERENT states. `shadow_finalized` means the
+    #: strategy loop is done; `venue_resolved` means the outcome arrived;
+    #: `pnl_identified` means the two plus unambiguous maker truth. A single
+    #: `settled` flag conflated all three and made an UNKNOWN PnL look final.
+    shadow_finalized: bool = False
+    venue_resolved: bool = False
+    pnl_identified: bool = False
     #: Provenance linkage (audit item 13): the raw event range this round's
     #: decisions were made from.
     #:
@@ -111,6 +120,84 @@ class LiveRoundShadow:
         self.blocked[reason] = self.blocked.get(reason, 0) + 1
 
 
+def _portfolio_snapshot(session) -> dict:
+    p = session.portfolio
+    view = session.risk_view()
+    return {
+        "U": p.U, "D": p.D, "C": p.C,
+        "Pi_U": p.U - p.C, "Pi_D": p.D - p.C,
+        "G": getattr(view, "G", None), "R": getattr(view, "R", None),
+    }
+
+
+class ExecutionObserver:
+    """Records the paper order lifecycle by OBSERVING the session (item F).
+
+    Deliberately not a reimplementation: `TradingSession` owns every
+    execution decision, and this wraps calls to it, diffing the state before
+    and after. Duplicating the fill logic to get better events would create
+    a second source of truth for what the bot did.
+    """
+
+    def __init__(self, journal, round_id: str):
+        self.journal = journal
+        self.round_id = round_id
+
+    def _state(self, session) -> dict:
+        return {
+            "portfolio": _portfolio_snapshot(session),
+            "open_makers": set(session.supervisor.open_order_ids()),
+            "pending_takers": len(getattr(session.queue, "pending", ()) or ()),
+            "maker_placed": session.n_maker_placed,
+            "maker_filled": session.n_maker_expired_filled,
+            "maker_unfilled": session.n_maker_expired_unfilled,
+            "maker_unresolved": session.n_maker_expired_unresolved,
+        }
+
+    def observe(self, session, ts: float, operation: str, fn):
+        before = self._state(session)
+        result = fn()
+        after = self._state(session)
+        for kind, payload in self._diff(before, after, ts, operation):
+            self.journal.write_execution_event(self.round_id, kind, payload)
+        return result
+
+    def _diff(self, before: dict, after: dict, ts: float, operation: str):
+        base = {
+            "ts": ts, "operation": operation,
+            "portfolio_before": before["portfolio"],
+            "portfolio_after": after["portfolio"],
+        }
+        opened = after["open_makers"] - before["open_makers"]
+        closed = before["open_makers"] - after["open_makers"]
+        for oid in sorted(opened):
+            yield "MAKER_OPEN", dict(base, order_id=oid)
+        for oid in sorted(closed):
+            yield "MAKER_CLOSED", dict(base, order_id=oid)
+
+        if after["pending_takers"] > before["pending_takers"]:
+            yield "ORDER_SUBMITTED", dict(
+                base, role="TAKER", pending_delay=True,
+                pending=after["pending_takers"])
+        elif after["pending_takers"] < before["pending_takers"]:
+            yield "TAKER_MATCHED", dict(
+                base, role="TAKER",
+                resolved=before["pending_takers"] - after["pending_takers"])
+
+        if after["portfolio"] != before["portfolio"]:
+            yield "FILLED", dict(
+                base,
+                d_U=after["portfolio"]["U"] - before["portfolio"]["U"],
+                d_D=after["portfolio"]["D"] - before["portfolio"]["D"],
+                d_C=after["portfolio"]["C"] - before["portfolio"]["C"],
+            )
+        for key, kind in (("maker_filled", "MAKER_EXPIRED_FILLED"),
+                          ("maker_unfilled", "MAKER_EXPIRED_UNFILLED"),
+                          ("maker_unresolved", "UNRESOLVED_MAKER")):
+            if after[key] > before[key]:
+                yield kind, dict(base, count=after[key] - before[key])
+
+
 class LiveShadowService:
     """Rides `RealRecorderService`'s live feeds and runs Strategy V0 on
     paper, on the frozen strategy clock."""
@@ -130,6 +217,7 @@ class LiveShadowService:
         decision_deadline_ms: float = 50.0,
         freshness_policy: FreshnessPolicy | None = None,
         log=print,
+        clock=None,
     ):
         self.svc = recorder_service
         self.journal = journal
@@ -141,8 +229,14 @@ class LiveShadowService:
         self.feature_set = feature_set
         self.model_version = model_version
         self.decision_deadline_ms = decision_deadline_ms
-        self.freshness_policy = freshness_policy
+        self.freshness_policy = freshness_policy or freshness_policy_for(
+            DataProvenance.REAL_LIVE)
         self._log = log
+        #: Wall clock, injectable so a test can drive a synthetic timeline.
+        #: In production this is the real clock, and metadata is fetched at
+        #: DISCOVERED - well before the round opens - so MARKET_CONFIG is
+        #: causally visible at every decision point.
+        self._clock = clock or time.time
         self.grid = decision_grid()
         self.manifest = build_manifest(
             self.feature_cfg, self.one_step_cfg, self.regime_cfg, self.exec_cfg,
@@ -165,6 +259,7 @@ class LiveShadowService:
         recorder_service.on_live_event = self._on_live_event
         recorder_service.on_tick = self._on_tick
         recorder_service.on_round_finalized = self._on_finalized
+        recorder_service.on_round_resolved = self._on_resolved
 
         self.journal.write_manifest(self.manifest)
 
@@ -189,7 +284,7 @@ class LiveShadowService:
 
         store = EventStore(":memory:", provenance=DataProvenance.REAL_LIVE)
         projector = LiveProjector(store, m.round_id, settlement_topic)
-        projector.emit_market_config(m, int(time.time() * 1e9))
+        projector.emit_market_config(m, int(self._clock() * 1e9))
 
         # The round's executable parameters come from the MARKET_CONFIG we
         # just emitted, i.e. from the market's own metadata - never from a
@@ -211,9 +306,16 @@ class LiveShadowService:
             cfg=self.one_step_cfg,
             constraints=constraints,
         )
+        # Item B: the controller needs the round's RECONCILED execution
+        # state, not just the strategy config. Built once per round, from
+        # the same fee schedule and taker delay the session uses, so the
+        # candidate economics and the paper fills cannot disagree.
+        controller = OneStepController(self.one_step_cfg, exec_cfg, fee_cfg)
         shadow = LiveRoundShadow(
             round_id=m.round_id, metadata=m, store=store, projector=projector,
             session=session, regime=RegimeClassifier(round_id=m.round_id),
+            controller=controller,
+            execution=ExecutionObserver(self.journal, m.round_id),
         )
         self.rounds[m.round_id] = shadow
         self.journal.write_round_opened(shadow, self.manifest, self.svc.store.db_path)
@@ -235,7 +337,7 @@ class LiveShadowService:
                 break
             n += 1
             for shadow in self.rounds.values():
-                if shadow.settled:
+                if shadow.shadow_finalized:
                     continue
                 if shadow.projector.apply(event):
                     shadow.note_raw(event)
@@ -253,7 +355,7 @@ class LiveShadowService:
         self._drain_inbox()
         for capture in captures:
             shadow = self.rounds.get(capture.metadata.round_id)
-            if shadow is None or shadow.settled:
+            if shadow is None or shadow.shadow_finalized:
                 continue
             self._fire_due_decisions(shadow, now)
 
@@ -337,7 +439,9 @@ class LiveShadowService:
 
         # Exchange truth first: a pending taker's fill is decided by the real
         # matching engine at its own matched_ts, regardless of our freshness.
-        shadow.session.resolve_ready_takers(decision_ts, book_at)
+        shadow.execution.observe(
+            shadow.session, decision_ts, "resolve_ready_takers",
+            lambda: shadow.session.resolve_ready_takers(decision_ts, book_at))
 
         p0 = self._p0(shadow)
         if p0 is None:
@@ -360,6 +464,11 @@ class LiveShadowService:
                 lateness_ms=lateness_ms, manifest=self.manifest,
             )
             return
+
+        # Item C: the REAL per-feed freshness view, from real source
+        # timestamps and the real-market budgets - never `is_fresh=True`.
+        freshness = freshness_from_events(causal, decision_ts, self.freshness_policy)
+        is_fresh = freshness.is_fresh
 
         snapshot = shadow.regime.observe(fv)
         book_up = book_feed.get_snapshot(shadow.round_id, Side.UP)
@@ -385,12 +494,31 @@ class LiveShadowService:
 
         q = self.model.predict_proba(vec)
         permitted = ActionPermissionMatrix.permitted_actions(classify_seed_action(snapshot.state))
-        shadow.session.review_open_orders(
-            decision_ts, snapshot.state, q, book_up, book_down, fv.tau, True,
-        )
-        decision = shadow.session and OneStepController(self.one_step_cfg).decide(
+        # Resting orders are reviewed with the REAL freshness flag: a stale
+        # view is what triggers the supervisor's FEED_STALE cancel, so
+        # passing True would leave orders resting on data we do not have.
+        shadow.execution.observe(
+            shadow.session, decision_ts, "review_open_orders",
+            lambda: shadow.session.review_open_orders(
+                decision_ts, snapshot.state, q, book_up, book_down, fv.tau, is_fresh))
+        if not is_fresh:
+            # No NEW alpha while a required input is stale. Recorded
+            # explicitly rather than looking like a WAIT chosen on economics.
+            shadow.note_block(DecisionBlockReason.FEED_STALE.value)
+            self.journal.write_decision(
+                shadow, decision_ts, t, fv, q, snapshot, None,
+                blocked_reason=DecisionBlockReason.FEED_STALE.value,
+                freshness_reason=freshness.reason,
+                elapsed_ms=(time.perf_counter() - t0) * 1000.0,
+                lateness_ms=lateness_ms, manifest=self.manifest,
+                constraints=constraints,
+            )
+            shadow.decisions += 1
+            return
+
+        decision = shadow.controller.decide(
             shadow.round_id, decision_ts, shadow.session.portfolio, q, permitted,
-            book_up, book_down, constraints, True,
+            book_up, book_down, constraints, is_fresh,
             tau=fv.tau, sigma=fv.realized_vol, risk_view=shadow.session.risk_view(),
         )
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
@@ -403,21 +531,71 @@ class LiveShadowService:
             shadow, decision_ts, t, fv, q, snapshot, decision,
             chosen=chosen, elapsed_ms=elapsed_ms, lateness_ms=lateness_ms,
             missed_deadline=missed, manifest=self.manifest, constraints=constraints,
+            freshness_reason=freshness.reason,
         )
-        shadow.session.dispatch(chosen, decision_ts, snapshot.state, q, book_up, book_down)
+        shadow.execution.observe(
+            shadow.session, decision_ts, "dispatch",
+            lambda: shadow.session.dispatch(
+                chosen, decision_ts, snapshot.state, q, book_up, book_down))
         shadow.decisions += 1
 
     # ---------------------------------------------------------- settlement
 
     def _on_finalized(self, capture) -> None:
         shadow = self.rounds.get(capture.metadata.round_id)
-        if shadow is None or shadow.settled:
+        if shadow is None or shadow.shadow_finalized:
             return
-        shadow.settled = True
-        self.journal.write_settlement(shadow, capture, self.manifest)
+        # Item G: no NEW alpha after t=270, but existing pending takers are
+        # not new decisions - they must still resolve against the real book
+        # at their own matched_ts, or a fill submitted at the last grid
+        # point would silently vanish from the portfolio.
+        drained = self._drain_pending_execution(shadow, capture)
+        shadow.shadow_finalized = True
+        result = self.journal.write_settlement(shadow, capture, self.manifest)
+        shadow.venue_resolved = result.get("venue_resolved", False)
+        shadow.pnl_identified = result.get("pnl_identified", False)
         self._log(
-            f"[live-shadow] {shadow.round_id} settled: {shadow.decisions} decisions, "
-            f"blocked {dict(shadow.blocked)}"
+            f"[live-shadow] {shadow.round_id} shadow-finalized: {shadow.decisions} "
+            f"decisions, {drained} pending taker(s) drained, "
+            f"pnl={result.get('paper_pnl_status')}, blocked {dict(shadow.blocked)}"
+        )
+
+    def _drain_pending_execution(self, shadow: LiveRoundShadow, capture) -> int:
+        """Resolve every pending paper taker through round close (item G)."""
+        self._drain_inbox()
+        events = shadow.store.all_events(shadow.round_id)
+
+        def book_at(round_id, side, at_ts):
+            c = ReplayCursor(shadow.store, round_id, preloaded=events)
+            c.advance_to(at_ts)
+            return ReplayBookFeed(c).get_snapshot(round_id, side)
+
+        pending_before = len(getattr(shadow.session.queue, "pending", ()) or ())
+        # Resolve as of the round's close: a taker submitted at t=270 with a
+        # 250ms delay matches at 270.250, which is inside the round.
+        shadow.execution.observe(
+            shadow.session, shadow.metadata.end_ts, "drain_pending_takers",
+            lambda: shadow.session.resolve_ready_takers(
+                shadow.metadata.end_ts, book_at))
+        pending_after = len(getattr(shadow.session.queue, "pending", ()) or ())
+        return max(0, pending_before - pending_after)
+
+    def _on_resolved(self, capture) -> None:
+        """Item E: the venue published, minutes after the shadow loop ended.
+
+        An initially UNKNOWN PnL becomes IDENTIFIED here - which is the whole
+        point of separating the three states.
+        """
+        shadow = self.rounds.get(capture.metadata.round_id)
+        if shadow is None:
+            return
+        result = self.journal.write_final_resolution(shadow, capture, self.manifest)
+        shadow.venue_resolved = True
+        shadow.pnl_identified = result.get("pnl_identified", False)
+        self._log(
+            f"[live-shadow] {shadow.round_id} venue-resolved: "
+            f"outcome={result.get('reported_outcome')} "
+            f"pnl={result.get('paper_pnl')} ({result.get('paper_pnl_status')})"
         )
 
     # ------------------------------------------------------------ summary
@@ -433,7 +611,9 @@ class LiveShadowService:
                     "grid_points_fired": len(s.fired),
                     "blocked": dict(s.blocked),
                     "missed_deadlines": s.missed_deadlines,
-                    "settled": s.settled,
+                    "shadow_finalized": s.shadow_finalized,
+                    "venue_resolved": s.venue_resolved,
+                    "pnl_identified": s.pnl_identified,
                     "projected": dict(s.projector.counts),
                     "raw_seq_by_session": {
                         k: list(v) for k, v in s.raw_seq_by_session.items()

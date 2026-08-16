@@ -164,6 +164,10 @@ class RealRecorderService:
         self.on_live_event = None      # (RawEvent) -> None
         self.on_tick = None            # (list[RoundCapture], now: float) -> None
         self.on_round_finalized = None  # (RoundCapture) -> None
+        #: Item E: the venue publishes minutes AFTER the shadow loop
+        #: finalizes, so "shadow finalized" and "venue resolved" are
+        #: different events and need different notifications.
+        self.on_round_resolved = None   # (RoundCapture) -> None
 
     # ------------------------------------------------------------- hooks
 
@@ -675,6 +679,16 @@ class RealRecorderService:
         ))
         return reported_outcome_from_clob(clob)
 
+    def _notify_resolved(self, capture: RoundCapture) -> None:
+        if self.on_round_resolved is None:
+            return
+        try:
+            self.on_round_resolved(capture)
+        except Exception:
+            import traceback
+
+            self._log("[live-observer] resolve hook failed:\n" + traceback.format_exc())
+
     def _apply_resolution(self, capture: RoundCapture) -> None:
         """Re-run the comparison now that the venue's outcome is known, and
         rewrite this round's result row."""
@@ -705,6 +719,7 @@ class RealRecorderService:
             "notes": "; ".join(capture.notes) or None,
         })
         self.recorder.flush()
+        self._notify_resolved(capture)
 
     def _try_capture_resolution(self, capture: RoundCapture, now: float) -> None:
         if capture.reported_outcome is not None:

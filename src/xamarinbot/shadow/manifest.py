@@ -30,7 +30,11 @@ from xamarinbot.model.features import FeatureSet
 from xamarinbot.optimizer.config import OneStepConfig
 from xamarinbot.regime.config import RegimeConfig
 
-STRATEGY_VERSION = "STRATEGY_V0"
+#: Item H: this is NOT a validated trading baseline. The parameters come
+#: from a synthetic demo and were chosen to produce visible activity. The
+#: name says so, so no report can quietly call it a profitability V0.
+#: A scientifically defensible Strategy V0 will be frozen separately.
+STRATEGY_VERSION = "PLACEHOLDER_OPERATIONAL_V0"
 
 #: The decision cadence, in seconds after the round opens. Identical to
 #: `model/real_dataset.decision_grid` - the training grid and the live

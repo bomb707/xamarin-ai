@@ -110,7 +110,7 @@ class ShadowJournal:
         *, chosen=None, blocked_reason: str | None = None,
         invalid_reason: str | None = None, elapsed_ms: float = 0.0,
         lateness_ms: float = 0.0, missed_deadline: bool = False,
-        manifest=None, constraints=None,
+        manifest=None, constraints=None, freshness_reason: str | None = None,
     ) -> None:
         """One complete decision record.
 
@@ -141,6 +141,7 @@ class ShadowJournal:
             # features / model / regime
             "features": _jsonable(fv) if fv is not None else None,
             "invalid_reason": invalid_reason,
+            "freshness_reason": freshness_reason,
             "q": q,
             "regime_state": getattr(getattr(regime, "state", None), "value", None),
             "regime_seed_action": getattr(getattr(regime, "seed_action", None), "value", None),
@@ -169,7 +170,57 @@ class ShadowJournal:
             "error": str(exc)[:500],
         })
 
-    def write_settlement(self, shadow, capture, manifest) -> None:
+    def _pnl(self, shadow, capture) -> dict:
+        """The shared settlement arithmetic, used by both the shadow-final
+        record and the later venue-resolution record (item E)."""
+        p = shadow.session.portfolio
+        rec = capture.reconstruction
+        reported = capture.reported_outcome.value if capture.reported_outcome else None
+        reconstructed = (rec.declared.outcome.value
+                         if rec is not None and rec.declared.outcome else None)
+        unresolved = int(getattr(shadow.session, "n_maker_expired_unresolved", 0) or 0)
+        open_makers = len(list(shadow.session.supervisor.open_order_ids()))
+
+        pnl, status = None, "UNKNOWN"
+        if reported == "UP":
+            pnl, status = p.U - p.C, "IDENTIFIED"
+        elif reported == "DOWN":
+            pnl, status = p.D - p.C, "IDENTIFIED"
+        if unresolved or open_makers:
+            # Item 8: counting an unresolved maker as unfilled would be an
+            # assumption dressed as a measurement.
+            pnl, status = None, "NOT_IDENTIFIABLE_UNRESOLVED_MAKER"
+        return {
+            "reported_outcome": reported,
+            "reconstructed_outcome": reconstructed,
+            "label_status": rec.status.value if rec is not None else None,
+            "outcomes_agree": (None if (reported is None or reconstructed is None)
+                               else reported == reconstructed),
+            "U": p.U, "D": p.D, "C": p.C,
+            "payout": (p.U if reported == "UP" else p.D if reported == "DOWN" else None),
+            "paper_pnl": pnl,
+            "paper_pnl_status": status,
+            "unresolved_makers": unresolved,
+            "open_makers_at_settlement": open_makers,
+            "venue_resolved": reported is not None,
+            "pnl_identified": status == "IDENTIFIED",
+        }
+
+    def write_final_resolution(self, shadow, capture, manifest) -> dict:
+        """Item E: the venue published minutes after the shadow loop ended.
+
+        Appended as its own record rather than mutating the earlier one, so
+        the sequence "PnL was UNKNOWN, then became IDENTIFIED" stays visible
+        instead of being retconned.
+        """
+        payload = dict(self._pnl(shadow, capture), round_id=shadow.round_id,
+                       strategy_version=manifest.strategy_version,
+                       config_hash=manifest.config_hash,
+                       model_version=manifest.model_version)
+        self._write("final_resolution", shadow.round_id, None, payload)
+        return payload
+
+    def write_settlement(self, shadow, capture, manifest) -> dict:
         """Final outcome and paper PnL.
 
         Maker fills on REAL data are deliberately NOT adjudicated - see
@@ -178,35 +229,11 @@ class ShadowJournal:
         the maker as unfilled, which would be an assumption dressed as a
         measurement.
         """
-        p = shadow.session.portfolio
-        rec = capture.reconstruction
-        reported = capture.reported_outcome.value if capture.reported_outcome else None
-        reconstructed = (rec.declared.outcome.value
-                         if rec is not None and rec.declared.outcome else None)
-        unresolved = int(getattr(shadow.session, "n_maker_expired_unresolved", 0) or 0)
-        open_makers = list(shadow.session.supervisor.open_order_ids())
-
-        pnl = None
-        pnl_status = "UNKNOWN"
-        if reported == "UP":
-            pnl, pnl_status = p.U - p.C, "IDENTIFIED"
-        elif reported == "DOWN":
-            pnl, pnl_status = p.D - p.C, "IDENTIFIED"
-        if unresolved or open_makers:
-            pnl_status = "NOT_IDENTIFIABLE_UNRESOLVED_MAKER"
-
-        self._write("settlement", shadow.round_id, None, {
+        verdict = self._pnl(shadow, capture)
+        payload = dict(verdict, **{
             "round_id": shadow.round_id,
-            "reported_outcome": reported,
-            "reconstructed_outcome": reconstructed,
-            "label_status": rec.status.value if rec is not None else None,
             "settlement_kind": shadow.metadata.settlement_kind,
             "p0": shadow.p0,
-            "U": p.U, "D": p.D, "C": p.C,
-            "paper_pnl": pnl,
-            "paper_pnl_status": pnl_status,
-            "unresolved_makers": unresolved,
-            "open_makers_at_settlement": len(open_makers),
             "decisions": shadow.decisions,
             "grid_points_fired": len(shadow.fired),
             "blocked": dict(shadow.blocked),
@@ -221,6 +248,19 @@ class ShadowJournal:
             "config_hash": manifest.config_hash,
             "model_version": manifest.model_version,
         })
+        self._write("settlement", shadow.round_id, None, payload)
+        return payload
+
+    # -------------------------------------------- item F: execution events
+
+    def write_execution_event(self, round_id: str, kind: str, payload: dict) -> None:
+        """One paper order-lifecycle event.
+
+        Item F: observation only. `TradingSession` owns the execution logic
+        and is not duplicated here - this records what it did.
+        """
+        self._write("execution", round_id, payload.get("ts"),
+                    dict(payload, event=kind))
 
     # ------------------------------------------------------------ readers
 

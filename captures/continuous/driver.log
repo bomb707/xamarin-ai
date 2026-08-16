@@ -144,3 +144,6 @@ CONTINUOUS REAL BTC 5-MINUTE CAPTURE
 [continuous] batch 3 done in 54.9 min: 8 rounds (8 labelled), 1.64 GB -> btc5m_20260816T080128Z.db; 24 rounds accumulated
 
 [continuous] batch 4 starting at 20260816T085624Z
+[continuous] batch 4 done in 55.1 min: 8 rounds (8 labelled), 1.69 GB -> btc5m_20260816T085624Z.db; 32 rounds accumulated
+
+[continuous] batch 5 starting at 20260816T095128Z

@@ -60,6 +60,9 @@ class LiveProjector:
         self.spot_topic = spot_topic
         self.counts: dict[str, int] = {}
         self.skipped: dict[str, int] = {}
+        #: The most recent MARKET_CONFIG payload, so a tick change can be
+        #: emitted as a complete updated config rather than a partial one.
+        self._last_market_config: dict | None = None
 
     # ------------------------------------------------------------ helpers
 
@@ -97,7 +100,7 @@ class LiveProjector:
             raise ValueError(
                 f"{self.round_id}: market reports no TWAP window; refusing to guess it"
             )
-        self._emit(EventType.MARKET_CONFIG, None, recv_ns, {
+        payload = {
             "market_id": metadata.condition_id,
             "up_token_id": metadata.up_token_id,
             "down_token_id": metadata.down_token_id,
@@ -109,7 +112,9 @@ class LiveProjector:
             "taker_delay_ms": float(metadata.taker_delay_ms or 0.0),
             "twap_window_seconds": int(twap_window),
             "settlement_kind": metadata.settlement_kind,
-        })
+        }
+        self._last_market_config = payload
+        self._emit(EventType.MARKET_CONFIG, None, recv_ns, payload)
 
     # -------------------------------------------------------------- apply
 
@@ -219,8 +224,24 @@ class LiveProjector:
             return emitted
 
         if event.event_type == "tick_size_change":
-            self._skip("tick_size_change_handled_by_market_config")
-            return False
+            # Item D: the tick is CAUSAL and DYNAMIC. The venue really does
+            # change it mid-round, and a single tick read once at round
+            # start would price every later candidate on a grid the venue
+            # had already replaced. Emitted as a NEW MARKET_CONFIG so the
+            # per-decision re-read picks it up at its own recv_ts - exactly
+            # the REAL_REPLAY semantics.
+            try:
+                new_tick = float(payload["new_tick_size"])
+            except (KeyError, TypeError, ValueError):
+                self._skip("malformed_tick_size_change")
+                return False
+            if self._last_market_config is None:
+                self._skip("tick_change_before_market_config")
+                return False
+            updated = dict(self._last_market_config, tick_size=new_tick)
+            self._last_market_config = updated
+            self._emit(EventType.MARKET_CONFIG, source_ns, recv_ns, updated)
+            return True
 
         self._skip(f"no_normalized_counterpart:{event.event_type}")
         return False
