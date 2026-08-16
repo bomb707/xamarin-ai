@@ -569,3 +569,47 @@ def test_the_live_service_dispatches_only_into_the_paper_session():
     for word in ("requests.post", "httpx.post", "post_order", "sign_order",
                  "private_key", "eip712"):
         assert word not in src
+
+
+# ============ thread safety: readers buffer, decisions drain =============
+
+def test_live_events_are_buffered_not_written_on_the_reader_thread():
+    """SQLite connections are not shareable across threads, and the feed
+    readers are separate threads from the decision loop. Buffering is what
+    makes that safe; causality is unaffected because `recv_wall_timestamp_ns`
+    is stamped when the bytes arrived, not when they are drained."""
+    import types as _t
+
+    from xamarinbot.shadow.live import LiveShadowService
+
+    svc = _t.SimpleNamespace(store=_t.SimpleNamespace(db_path="x.db"))
+    s = LiveShadowService(svc, ShadowJournal(":memory:"), model=None,
+                          feature_set=None, log=lambda *a: None)
+    b = RawEventBuilder(session_id="live")
+    ev = b.build(Topic.RTDS_TWAP_60, "update", {"payload": {"value": 1.0}},
+                 round_id=ROUND, source_timestamp_ns=START_NS)
+    s._on_live_event(ev)
+    assert len(s._inbox) == 1, "the reader thread must only enqueue"
+
+
+def test_draining_projects_buffered_events_into_the_round():
+    import types as _t
+
+    from xamarinbot.shadow.live import LiveShadowService
+
+    svc = _t.SimpleNamespace(store=_t.SimpleNamespace(db_path="x.db"))
+    s = LiveShadowService(svc, ShadowJournal(":memory:"), model=None,
+                          feature_set=None, log=lambda *a: None)
+    meta = real_metadata(start_ts=1000.0, end_ts=1300.0)
+    cap = _t.SimpleNamespace(
+        metadata=meta,
+        lifecycle=_t.SimpleNamespace(state=_t.SimpleNamespace(name="ACTIVE")),
+    )
+    shadow = s.ensure_round(cap)
+    b = RawEventBuilder(session_id="live")
+    s._on_live_event(b.build(
+        Topic.RTDS_TWAP_60, "update", {"payload": {"value": 63000.0}},
+        round_id=meta.round_id, source_timestamp_ns=int(1010 * 1e9)))
+    assert s._drain_inbox() == 1
+    assert shadow.projector.counts.get("TWAP") == 1
+    assert shadow.raw_seq_first is not None

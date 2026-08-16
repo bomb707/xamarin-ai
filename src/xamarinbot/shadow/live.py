@@ -30,6 +30,7 @@ structurally by `tests/test_import_boundaries.py`.
 from __future__ import annotations
 
 import time
+from collections import deque
 from dataclasses import dataclass, field
 
 from xamarinbot.events.store import EventStore
@@ -128,6 +129,16 @@ class LiveShadowService:
             self.feature_set, self.model_version,
         )
         self.rounds: dict[str, LiveRoundShadow] = {}
+        #: Live events arrive on the WebSocket READER threads, while the
+        #: stores and decisions live on the service-loop thread. SQLite
+        #: connections are not shareable across threads, so events are
+        #: buffered here and drained on the decision thread.
+        #:
+        #: This does not weaken causality: `recv_wall_timestamp_ns` is
+        #: stamped when the bytes arrived, not when they are drained, and
+        #: every decision gate is on that stamp. `deque.append`/`popleft`
+        #: are atomic under the GIL, so no lock is needed.
+        self._inbox: deque = deque()
 
         # Ride the recorder's own stream. Both hooks run on the recorder's
         # thread and must never raise into it.
@@ -191,14 +202,26 @@ class LiveShadowService:
     # --------------------------------------------------------- live feeds
 
     def _on_live_event(self, event) -> None:
-        """Every raw event, at wire-arrival time."""
-        for shadow in self.rounds.values():
-            if shadow.settled:
-                continue
-            if shadow.projector.apply(event):
-                if shadow.raw_seq_first is None:
-                    shadow.raw_seq_first = event.recorder_sequence
-                shadow.raw_seq_last = event.recorder_sequence
+        """Every raw event, on the reader thread. Buffer only - see `_inbox`."""
+        self._inbox.append(event)
+
+    def _drain_inbox(self) -> int:
+        """Project buffered events into their rounds, on the decision thread."""
+        n = 0
+        while True:
+            try:
+                event = self._inbox.popleft()
+            except IndexError:
+                break
+            n += 1
+            for shadow in self.rounds.values():
+                if shadow.settled:
+                    continue
+                if shadow.projector.apply(event):
+                    if shadow.raw_seq_first is None:
+                        shadow.raw_seq_first = event.recorder_sequence
+                    shadow.raw_seq_last = event.recorder_sequence
+        return n
 
     def _on_tick(self, captures, now: float) -> None:
         from xamarinbot.realtime.lifecycle import RoundState
@@ -206,7 +229,12 @@ class LiveShadowService:
         for capture in captures:
             if capture.lifecycle.state in (RoundState.DISCOVERED,):
                 continue
-            shadow = self.ensure_round(capture)
+            self.ensure_round(capture)
+        # Drain AFTER every active round exists, so an event is never
+        # discarded merely because its round had not been created yet.
+        self._drain_inbox()
+        for capture in captures:
+            shadow = self.rounds.get(capture.metadata.round_id)
             if shadow is None or shadow.settled:
                 continue
             self._fire_due_decisions(shadow, now)
