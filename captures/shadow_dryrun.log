@@ -1,0 +1,42 @@
+==============================================================================
+LIVE REAL-MARKET SHADOW - STRATEGY V0 - PAPER ONLY
+  No private key. No authenticated client. No order is ever sent.
+  code sha     fe9b23072b998d23ff2c860c9fe88a2ddc8de56b  (DIRTY)
+  pid          3224494   started 20260816T065349Z
+  rounds       3
+  raw capture  captures/shadow/shadow_raw_20260816T065349Z.db
+  journal      captures/shadow/shadow_journal_20260816T065349Z.db
+  model        NONE:no_gate_a_model_frozen
+==============================================================================
+[shadow] strategy STRATEGY_V0 config_hash=a5583e982ba61905 grid=86 points (15s..270s)
+[btc-updown-5m-1786863900] metadata warning: gamma startDate (2026-08-15T07:13:45.186084Z) is the row-creation time, 85875s before the true round start; not used as the round start
+[btc-updown-5m-1786864200] metadata warning: gamma startDate (2026-08-15T07:18:43.460894Z) is the row-creation time, 85877s before the true round start; not used as the round start
+[btc-updown-5m-1786864500] metadata warning: gamma startDate (2026-08-15T07:23:13.85261Z) is the row-creation time, 85906s before the true round start; not used as the round start
+[service] 1786863900=DISCOVERED, 1786864200=DISCOVERED, 1786864500=DISCOVERED | events rx=3 persisted=3 queue=0 dropped=0 reconnects=0
+[service] 1786863900=DISCOVERED, 1786864200=DISCOVERED, 1786864500=DISCOVERED | events rx=864 persisted=864 queue=0 dropped=0 reconnects=0
+[service] 1786863900=DISCOVERED, 1786864200=DISCOVERED, 1786864500=DISCOVERED | events rx=1618 persisted=1618 queue=0 dropped=0 reconnects=0
+[service] 1786863900=DISCOVERED, 1786864200=DISCOVERED, 1786864500=DISCOVERED | events rx=2452 persisted=2452 queue=0 dropped=0 reconnects=0
+[service] 1786863900=DISCOVERED, 1786864200=DISCOVERED, 1786864500=DISCOVERED | events rx=3217 persisted=3217 queue=0 dropped=0 reconnects=0
+[service] 1786863900=DISCOVERED, 1786864200=DISCOVERED, 1786864500=DISCOVERED | events rx=4086 persisted=4086 queue=0 dropped=0 reconnects=0
+[service] 1786863900=DISCOVERED, 1786864200=DISCOVERED, 1786864500=DISCOVERED | events rx=4832 persisted=4830 queue=0 dropped=0 reconnects=0
+[service] 1786863900=DISCOVERED, 1786864200=DISCOVERED, 1786864500=DISCOVERED | events rx=5587 persisted=5585 queue=0 dropped=0 reconnects=0
+[service] 1786863900=DISCOVERED, 1786864200=DISCOVERED, 1786864500=DISCOVERED | events rx=6294 persisted=6292 queue=0 dropped=0 reconnects=0
+[btc-updown-5m-1786863900] DISCOVERED -> PRE_ROUND
+[live-observer] tick hook failed:
+Traceback (most recent call last):
+  File "/home/hr/xamarin-ai/src/xamarinbot/realtime/service.py", line 525, in run
+    self.on_tick(captures, now)
+  File "/home/hr/xamarin-ai/src/xamarinbot/shadow/live.py", line 209, in _on_tick
+    shadow = self.ensure_round(capture)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/hr/xamarin-ai/src/xamarinbot/shadow/live.py", line 161, in ensure_round
+    projector.emit_market_config(m, int(time.time() * 1e9))
+  File "/home/hr/xamarin-ai/src/xamarinbot/shadow/live_projection.py", line 93, in emit_market_config
+    "fee_rate": metadata.fee_config.rate if metadata.fee_config else 0.0,
+                                            ^^^^^^^^^^^^^^^^^^^
+AttributeError: 'RealMarketMetadata' object has no attribute 'fee_config'
+
+[data-gap] rtds topic_stalled: 30.8s of missing observations
+[data-gap] rtds topic_stalled: 31.3s of missing observations
+[data-gap] rtds topic_stalled: 31.2s of missing observations
+[data-gap] rtds topic_stalled: 31.4s of missing observations

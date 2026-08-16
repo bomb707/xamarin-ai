@@ -56,7 +56,12 @@ from xamarinbot.regime.matrix import ActionPermissionMatrix, classify_seed_actio
 from xamarinbot.replay.feeds import ReplayBookFeed, ReplayCursor, market_config_from_payload
 from xamarinbot.shadow.journal import ShadowJournal
 from xamarinbot.shadow.live_projection import LiveProjector
-from xamarinbot.shadow.manifest import NO_REAL_MODEL, build_manifest, decision_grid
+from xamarinbot.shadow.manifest import (
+    NO_REAL_MODEL,
+    build_manifest,
+    decision_grid,
+    strategy_v0_configs,
+)
 from xamarinbot.shadow.types import DecisionBlockReason
 
 
@@ -108,7 +113,7 @@ class LiveShadowService:
         self.svc = recorder_service
         self.journal = journal
         self.feature_cfg = feature_cfg or FeatureConfig()
-        self.one_step_cfg = one_step_cfg or OneStepConfig()
+        self.one_step_cfg = one_step_cfg or strategy_v0_configs()
         self.regime_cfg = regime_cfg or RegimeConfig()
         self.exec_cfg = exec_cfg or ExecutionConfig()
         self.model = model
@@ -161,7 +166,12 @@ class LiveShadowService:
         # per-decision re-read below.
         opening = store.all_events(m.round_id)
         constraints = self._constraints_from(opening)
-        fee_cfg, exec_cfg = reconcile_execution_state(constraints, exec_cfg=self.exec_cfg)
+        # Deliberately NOT passing `self.exec_cfg`: on REAL data the market
+        # is the single source of truth for the fee schedule and taker delay,
+        # and `reconcile_execution_state` refuses a caller value that
+        # contradicts it. The strategy's declared ExecutionConfig is recorded
+        # in the manifest; the per-round ACTUAL values come from the venue.
+        fee_cfg, exec_cfg = reconcile_execution_state(constraints)
         session = TradingSession(
             round_id=m.round_id,
             portfolio=PortfolioState(),

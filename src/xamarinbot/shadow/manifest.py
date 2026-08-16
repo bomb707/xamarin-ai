@@ -158,6 +158,36 @@ def build_manifest(
     )
 
 
+def strategy_v0_configs():
+    """The concrete parameters STRATEGY_V0 runs with.
+
+    AUDIT FINDING, recorded here rather than hidden: before this manifest
+    there was no canonical strategy configuration anywhere in the codebase.
+    `OneStepConfig` has no default `g_min` at all, and every caller invented
+    its own values - the synthetic demos alone use three different sets
+    (`g_min` of -100, -100 and -200, `edge_min` of 0.0 and 0.5). "The
+    current strategy" was therefore not a well-defined object.
+
+    The values below are taken verbatim from
+    `scripts/dev_synthetic/run_synthetic_shadow_demo.py`, which is the only
+    existing precedent for a SHADOW configuration. They are adopted so that
+    STRATEGY_V0 is at least pinned and reproducible - NOT because they have
+    been validated against a real market. They were chosen to make a
+    synthetic demo produce visible activity.
+
+    Consequently these are a PLACEHOLDER pending explicit approval. Any
+    profitability claim made under this config would be a claim about
+    parameters selected for a demo, and changing them is a strategy change
+    that must be deliberate - the hash will show it.
+    """
+    return OneStepConfig(
+        g_min=-100.0,
+        spend_cap=200.0,
+        position_limit=200.0,
+        edge_min=0.0,
+    )
+
+
 #: The model that would be used if real shadow started right now.
 #:
 #: There is no Gate-A-frozen REAL model. A synthetic-trained model exists in

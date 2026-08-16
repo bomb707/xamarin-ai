@@ -123,6 +123,68 @@ def _live_store() -> EventStore:
     return EventStore(":memory:", provenance=DataProvenance.REAL_LIVE)
 
 
+def real_metadata(*, start_ts: float = 1.0, end_ts: float = 301.0,
+                  taker_delay_ms: float = 250.0, schedule_rate=0.07,
+                  twap_window_s=60):
+    """The ACTUAL `RealMarketMetadata` dataclass, not a SimpleNamespace.
+
+    A loose stand-in is why `metadata.fee_config` - a field that does not
+    exist - passed every test and then failed on the live wire. A fixture
+    that accepts any attribute cannot test an attribute contract.
+    """
+    from xamarinbot.realtime.discovery import FeeConfiguration, RealMarketMetadata
+
+    return RealMarketMetadata(
+        round_id=ROUND, market_id="m", event_id="e", condition_id="0xc",
+        question_id="q", slug=ROUND, question="Bitcoin Up or Down",
+        description="Chainlink 60-second TWAP",
+        resolution_source="https://data.chain.link/streams/btc-usd-twap-60s-streams",
+        start_ts=start_ts, end_ts=end_ts, up_token_id="u", down_token_id="d",
+        tick_size=0.01, min_order_size=5.0,
+        fees=FeeConfiguration(
+            maker_base_fee=0.0, taker_base_fee=0.0, fees_enabled=True,
+            fee_type="schedule", schedule_rate=schedule_rate,
+            schedule_exponent=None, schedule_taker_only=None,
+            schedule_rebate_rate=None, maker_rebates_fee_share_bps=None,
+            raw={"feeSchedule": {"rate": schedule_rate}},
+        ),
+        taker_delay_ms=taker_delay_ms, settlement_kind="chainlink_twap",
+        twap_window_s=twap_window_s, is_executable=True,
+        outcome_label_source="outcomes", raw_gamma={}, raw_clob={}, warnings=[],
+    )
+
+
+def test_a_market_with_no_fee_schedule_is_refused_not_defaulted():
+    """A defaulted fee silently changes every candidate's economics. The
+    offline projection refuses; the live path must refuse identically."""
+    store = _live_store()
+    proj = LiveProjector(store, ROUND, Topic.RTDS_TWAP_60)
+    with pytest.raises(ValueError, match="fee"):
+        proj.emit_market_config(real_metadata(schedule_rate=None), START_NS)
+    store.close()
+
+
+def test_a_market_with_no_twap_window_is_refused():
+    store = _live_store()
+    proj = LiveProjector(store, ROUND, Topic.RTDS_TWAP_60)
+    with pytest.raises(ValueError, match="TWAP window"):
+        proj.emit_market_config(real_metadata(twap_window_s=None), START_NS)
+    store.close()
+
+
+def test_market_config_is_built_from_the_real_metadata_dataclass():
+    """Guards the exact failure that reached the live wire: an attribute
+    that does not exist on `RealMarketMetadata`."""
+    store = _live_store()
+    proj = LiveProjector(store, ROUND, Topic.RTDS_TWAP_60)
+    proj.emit_market_config(real_metadata(), START_NS)
+    p = store.all_events(ROUND)[0].payload
+    assert p["fee_rate"] == pytest.approx(0.07)
+    assert p["taker_delay_ms"] == pytest.approx(250.0)
+    assert p["min_order_size"] == 5.0
+    store.close()
+
+
 def test_live_projection_refuses_a_synthetic_destination():
     synthetic = EventStore(":memory:", provenance=DataProvenance.SYNTHETIC_TEST)
     with pytest.raises(ValueError, match="synthetic"):
@@ -230,13 +292,7 @@ def test_the_projection_preserves_both_clocks():
 def test_market_config_carries_the_full_replay_contract():
     store = _live_store()
     proj = LiveProjector(store, ROUND, Topic.RTDS_TWAP_60)
-    meta = types.SimpleNamespace(
-        condition_id="0xc", up_token_id="u", down_token_id="d",
-        start_ts=1.0, end_ts=301.0, tick_size=0.01, min_order_size=5.0,
-        fee_config=types.SimpleNamespace(rate=0.07), taker_delay_ms=250.0,
-        twap_window_s=60, settlement_kind="chainlink_twap",
-    )
-    proj.emit_market_config(meta, START_NS)
+    proj.emit_market_config(real_metadata(), START_NS)
     from xamarinbot.replay.feeds import market_config_from_payload
 
     cfg = market_config_from_payload(store.all_events(ROUND)[0].payload)
@@ -253,13 +309,10 @@ def test_live_projection_feeds_the_real_feature_engine_directly(tmp_path):
 
     store = _live_store()
     proj = LiveProjector(store, ROUND, Topic.RTDS_TWAP_60)
-    meta = types.SimpleNamespace(
-        condition_id="0xc", up_token_id="u", down_token_id="d",
-        start_ts=1000.0, end_ts=1300.0, tick_size=0.01, min_order_size=5.0,
-        fee_config=types.SimpleNamespace(rate=0.07), taker_delay_ms=0.0,
-        twap_window_s=60, settlement_kind="chainlink_twap",
+    proj.emit_market_config(
+        real_metadata(start_ts=1000.0, end_ts=1300.0, taker_delay_ms=0.0),
+        int(990 * 1e9),
     )
-    proj.emit_market_config(meta, int(990 * 1e9))
 
     b = RawEventBuilder(session_id="live")
     import dataclasses

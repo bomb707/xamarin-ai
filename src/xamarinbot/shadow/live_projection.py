@@ -82,17 +82,32 @@ class LiveProjector:
         so its only honest timestamp is when we received it. That is also
         what makes it visible to the recv_ts gate at the right moment.
         """
+        # The fee rate comes from the market's own `feeSchedule.rate`, and a
+        # market that reports none is REFUSED rather than defaulted - exactly
+        # as `replay/projection.py` does offline. A defaulted fee silently
+        # changes every candidate's economics.
+        fee_rate = getattr(getattr(metadata, "fees", None), "schedule_rate", None)
+        if fee_rate is None:
+            raise ValueError(
+                f"{self.round_id}: market reports no fee schedule rate; refusing to "
+                "default the fee rate for a live decision"
+            )
+        twap_window = metadata.twap_window_s
+        if twap_window is None:
+            raise ValueError(
+                f"{self.round_id}: market reports no TWAP window; refusing to guess it"
+            )
         self._emit(EventType.MARKET_CONFIG, None, recv_ns, {
             "market_id": metadata.condition_id,
             "up_token_id": metadata.up_token_id,
             "down_token_id": metadata.down_token_id,
             "start_ts": metadata.start_ts,
             "end_ts": metadata.end_ts,
-            "tick_size": metadata.tick_size,
-            "min_order_size": metadata.min_order_size,
-            "fee_rate": metadata.fee_config.rate if metadata.fee_config else 0.0,
-            "taker_delay_ms": metadata.taker_delay_ms,
-            "twap_window_seconds": metadata.twap_window_s or 60,
+            "tick_size": float(metadata.tick_size),
+            "min_order_size": float(metadata.min_order_size),
+            "fee_rate": float(fee_rate),
+            "taker_delay_ms": float(metadata.taker_delay_ms or 0.0),
+            "twap_window_seconds": int(twap_window),
             "settlement_kind": metadata.settlement_kind,
         })
 

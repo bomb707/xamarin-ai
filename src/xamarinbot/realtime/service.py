@@ -286,8 +286,13 @@ class RealRecorderService:
             try:
                 self.on_live_event(event)
             except Exception:
-                # A shadow-side failure must never damage the capture.
-                self._log("[live-observer] error while consuming event")
+                # A shadow-side failure must never damage the capture - but a
+                # swallowed error with no detail is exactly how a broken
+                # observer looks healthy. Report it once, with the traceback.
+                import traceback
+
+                self._log("[live-observer] event hook failed:\n" + traceback.format_exc())
+                self.on_live_event = None
 
     def _on_market_event(self, event: RawEvent) -> None:
         """Every CLOB event goes to the recorder AND to the maker
@@ -519,7 +524,11 @@ class RealRecorderService:
                     try:
                         self.on_tick(captures, now)
                     except Exception:
-                        self._log("[live-observer] error in tick hook")
+                        import traceback
+
+                        self._log("[live-observer] tick hook failed:\n"
+                                  + traceback.format_exc())
+                        self.on_tick = None
                 self._maybe_check_integrity(now)
                 if now - last_state_log >= 30.0:
                     self._log_progress(captures, now)
@@ -853,7 +862,10 @@ class RealRecorderService:
             try:
                 self.on_round_finalized(capture)
             except Exception:
-                self._log("[live-observer] error in finalize hook")
+                import traceback
+
+                self._log("[live-observer] finalize hook failed:\n"
+                          + traceback.format_exc())
 
     def _force_finalize(self, capture: RoundCapture, now: float) -> None:
         """Finalize a round from whatever state it is in, for an
